@@ -1,0 +1,141 @@
+# CI arrives at v0.2 per SPEC §11 (Testing).
+#
+# Two gates:
+#   1. `docker build .` — proves the runtime image assembles. Would have
+#      caught PR #4's B1 (bot.py imported history.py, Dockerfile didn't
+#      COPY history.py, container crashed on boot with ModuleNotFoundError
+#      while pytest ran fine against the source tree).
+#   2. `pytest test/` — the invariant + boundary tests for v0.2a's history
+#      module and the bot.on_message message-assembly seam.
+#
+# Python matrix: 3.12 only for now (matches the baseline currently in use
+# in the fleet). Runtime image runs Python 3.13 (Dockerfile) — the docker
+# build job covers that path end-to-end.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r test-requirements.txt
+      - name: run envelope conformance vectors
+        run: pytest test/test_conformance.py -v
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: docker build -t yugo-ci .
+      # `docker build` alone doesn't execute bot.py, so a missing `COPY
+      # history.py` (PR #4 B1) slides through green. Actually invoke the
+      # image's Python and try both imports — any missing bundled module
+      # explodes here with ModuleNotFoundError.
+      #
+      # The env comes from `.env.example` via `--env-file`, NOT a curated
+      # `-e` set. Rationale: README's documented quick-start is `cp .env.example
+      # .env; docker compose up`, so `.env.example` IS the shape operators
+      # actually deploy under. Feeding it to the smoke gate turns every
+      # blank/unset/unparseable value in that file into a red CI, catching
+      # the whole class where a documented deploy path restart-loops the
+      # container on optional-env holes (e.g. blank `GUILD_ID=` crashing
+      # `int()` at import). Also implicitly proves the bundled `IDENTITY.md`
+      # is still COPY'd — persona load is fatal-at-startup per SPEC §4.5/§10.
+      - name: verify container imports under documented .env.example
+        run: |
+          docker run --rm --env-file .env.example \
+            --entrypoint python yugo-ci -c \
+            "import bot, history, fleet_bus, tools, nats; print('IMPORT OK')"
+
+      - name: verify default entrypoint dispatches both modes
+        run: |
+          set +e
+          bot_out=$(timeout 30s docker run --rm --env-file .env.example \
+            -e YUGO_MODE=bot yugo-ci 2>&1)
+          bot_code=$?
+          coord_out=$(docker run --rm --env-file .env.example \
+            -e YUGO_MODE=coordinator yugo-ci 2>&1)
+          coord_code=$?
+          set -e
+          echo "$bot_out"
+          echo "$coord_out"
+          test $bot_code -ne 0
+          echo "$bot_out" | grep -Eqi 'token|login|unauthorized|discord'
+          test $coord_code -ne 0
+          echo "$coord_out" | grep -q FLEET_BUS_USER
+
+      # v0.3a. `docker build` cannot see that `COPY fleet_bus.py` is missing
+      # (bot.py imports it, but nothing runs bot.py) — that is PR #4's B1 class
+      # of bug, one module later. The step above catches the import; this one
+      # catches the OTHER half: with the bus enabled and its token file absent,
+      # the container must ABORT naming FLEET_BUS_TOKEN_FILE, not boot deaf.
+      # Exercised in the real image because the failure is a deployment-shape
+      # failure (missing bind mount), which pytest against the source tree
+      # cannot reproduce.
+      - name: verify bus-enabled container aborts on a missing token file
+        run: |
+          set +e
+          out=$(docker run --rm --env-file .env.example \
+            -e FLEET_BUS_ENABLED=1 -e BOT_NAME=yugo \
+            --entrypoint python yugo-ci -c "import bot" 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test $code -ne 0 || { echo "expected a startup abort, got exit 0"; exit 1; }
+          echo "$out" | grep -q FLEET_BUS_TOKEN_FILE \
+            || { echo "abort message did not name FLEET_BUS_TOKEN_FILE"; exit 1; }
+
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.13 because that is what the CONTAINER runs (`FROM python:3.13-slim`),
+        # and nothing tested it. The skew is not theoretical: a lone surrogate in
+        # a docstring compiles on 3.12 and fails to marshal on 3.13, so the suite
+        # went green here while the image could not import its own module. Only
+        # the docker smoke step caught it, and that step does not run the tests.
+        # 3.12 stays because it is the floor the pins were verified against.
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r test-requirements.txt
+      # The v0.3a connection-lifecycle tests drive a REAL broker: they stop and
+      # restart it to prove reconnect-without-close, and they rely on the
+      # library's own subscription replay. Against a fake connection those
+      # assertions would be a mock talking to itself. Without this binary the
+      # whole file SKIPS — green, and proving nothing — so the install is a
+      # gate, not a nicety.
+      - name: install nats-server
+        run: |
+          curl -sSfL -o /tmp/nats-server.zip \
+            https://github.com/nats-io/nats-server/releases/download/v2.10.22/nats-server-v2.10.22-linux-amd64.zip
+          unzip -q -o /tmp/nats-server.zip -d /tmp
+          sudo install /tmp/nats-server-v2.10.22-linux-amd64/nats-server /usr/local/bin/
+          nats-server --version
+      # `-rs` prints skip reasons. A skipped lifecycle suite is indistinguishable
+      # from a passing one in the summary line, so the `nats_server` fixture
+      # FAILS instead of skipping when $CI is set — see test/nats_server.py.
+      - name: pytest
+        run: pytest test/ -v -rs

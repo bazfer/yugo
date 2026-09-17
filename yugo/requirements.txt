@@ -1,0 +1,12 @@
+# Pinned: tests call private _transform_* helpers (see
+# test/test_litellm_transforms.py); minor bump may break.
+litellm==1.98.0
+discord.py>=2.4.0
+apscheduler>=3.10.0
+pyyaml>=6.0
+# Pinned hard: upstream `main` is a monorepo rewrite, and v0.3a depends on
+# behaviour verified at THIS tag — `max_reconnect_attempts=-1` meaning
+# infinite, subscription replay on reconnect, and a permissions violation
+# invoking `error_cb` WITHOUT closing the connection.
+nats-py==2.15.0
+python-dotenv>=1.0.0

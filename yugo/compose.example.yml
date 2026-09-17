@@ -1,0 +1,63 @@
+# Copy to `compose.yml` before the first `docker compose up` — Compose does not
+# read `*.example.yml`, and `compose.yml` is gitignored so per-host mount paths
+# stay out of the repo (same split as `.env.example` → `.env`).
+services:
+  bot:
+    build: .
+    # One BOT_NAME per bot. Compose interpolates it from the same `.env` that
+    # `env_file` hands the container, so a second bot on this host is a second
+    # directory with a different BOT_NAME — not an edit to this file.
+    #
+    # Deliberately NOT repeated under `environment:`. The `:-yugo` fallback is a
+    # container-naming default only; leaking it into the container's env would
+    # give a bus-enabled bot a silent identity instead of the startup abort that
+    # names BOT_NAME (fleet_bus.load_config_from_env).
+    container_name: ${BOT_NAME:-yugo}
+    env_file: .env
+    volumes:
+      - ./persona.md:/root/persona.md:ro
+      # Tool declarations (v0.4b, SPEC §9). READ-ONLY is the control, not a
+      # nicety: the mount is what makes a capability grant tamper-proof, and
+      # it is why grants do not live in persona.md. Uncomment when the bot is
+      # granted any tool. Grammar + fail-closed rules: SPEC §9.1.
+      # - ./tools.yaml:/etc/yugo/tools.yaml:ro
+      # - ./http-credentials.yaml:/etc/yugo/http-credentials.yaml:ro
+      # Tool-call audit (v0.4a, SPEC §9). Uncomment once tools.yaml grants
+      # any tool, or the trail dies with the container. Mount the DIRECTORY,
+      # not the file. v0.4b scopes `write_file` to the workspace/ SUBDIRECTORY
+      # of this mount (`/var/lib/yugo/workspace/<BOT_NAME>`), which leaves the
+      # audit log one level above it and unreachable — do not widen that scope
+      # to /var/lib/yugo or the bot can rewrite its own audit.
+      # - ./tool-audit:/var/lib/yugo
+      # Uncomment together with FLEET_BUS_ENABLED=1 in .env. All three are
+      # required in that mode — a missing token file or manifest is a startup
+      # abort, and the audit log needs a writable mount to survive a restart.
+      # - ./token:/root/.claude/fleet-bus-token-example:ro
+      # - /path/to/fleet-manifest.yaml:/vault/infra/fleet-manifest.yaml:ro
+      # - ./fleet-bus-log.jsonl:/root/.claude/fleet-bus-log.jsonl
+    restart: unless-stopped
+    # networks:
+    #   - fleet-bus-net    # required for fleet-bus adapter (v0.3)
+
+  coordinator:
+    profiles: ["coordinator"]
+    build: .
+    container_name: yugo-coordinator
+    env_file: .env
+    environment:
+      YUGO_MODE: coordinator
+      FLEET_BUS_USER: coordinator
+      FLEET_BUS_TOKEN_FILE: /run/secrets/coordinator-token
+      TASK_STATE_PATH: /var/lib/yugo/state.sqlite
+    volumes:
+      - ./coordinator-token:/run/secrets/coordinator-token:ro
+      # Must be a local ext4/xfs/btrfs host path; overlay/NFS is refused.
+      - ./coordinator-state:/var/lib/yugo
+    restart: unless-stopped
+    stop_grace_period: 10s
+    networks:
+      - fleet-bus-net
+
+networks:
+  fleet-bus-net:
+    external: true

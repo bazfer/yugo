@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+persona.md
+token
+*.log
+.venv/
+.pytest_cache/
+compose.yml
