@@ -12,7 +12,7 @@ never touches Discord. The envelope reaches the model as the fleet-wide
 out: the answer is published back to the sender automatically, and any `<BUS
 to="...">` tag in it publishes to a THIRD party. 3d makes this adapter a
 PARTICIPANT in the baton protocol rather than a conduit for it — see the
-section below — and the vendored-schema hash gate is 3e. Nothing here touches
+section below — and the shared in-tree envelope contract is 3e. Nothing here touches
 JetStream — no durable consumers, no DeliverPolicy, no dedup store. Those
 arrive with FB-3 (see SPEC §15 "JetStream migration").
 

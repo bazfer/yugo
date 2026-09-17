@@ -243,10 +243,9 @@ def test_no_reject_code_enters_fleet_bus_without_a_row_in_the_table_above():
     the table in THIS file. It never opens `fleet-bus.ts`, so it cannot see
     drift that happens on the TypeScript side — a code renamed there stays
     green here. It was named `..._matches_ts_port`, which claimed exactly the
-    check it does not perform. The cross-language pin is the vendored-schema
-    hash gate in slice 3e; a test that parsed the plugin's `.ts` out of a
-    developer's plugin cache would skip in CI, where the file does not exist,
-    and a silently-skipped contract test reads identically to a passing one.
+    check it does not perform. Cross-language agreement is instead enforced by
+    both implementations running the shared in-tree conformance vectors; a
+    silently-skipped contract test would read identically to a passing one.
     """
     # Three codes the VALIDATOR never returns, so none has a row in the
     # table — all three belong to the delivery path, and all three exist on

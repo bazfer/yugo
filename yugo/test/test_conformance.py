@@ -1,6 +1,6 @@
 """Python conformance runner for the fleet-bus envelope v1 vectors.
 
-Runs the normative vector set in vendored/envelope.v1.vectors.json against this
+Runs the repository's normative vector set against this
 repo's ``fleet_bus.validate_envelope``. See the vector file's sibling README upstream
 (artifice-ia/fleet-bus conformance/README.md) for the contract implemented here.
 """
@@ -19,7 +19,7 @@ IMPL = "python"
 # expecting `invalid_hops_ceiling`, and those are different refusals.
 REASON_PREFIX = "yugo_"
 
-VECTORS_PATH = Path(__file__).resolve().parent.parent / "vendored" / "envelope.v1.vectors.json"
+VECTORS_PATH = Path(__file__).resolve().parents[2] / "conformance" / "envelope.v1.vectors.json"
 _SUITE = json.loads(VECTORS_PATH.read_text())
 MAX_BYTES: int = _SUITE["max_bytes"]
 ALLOWED: set[str] = set(_SUITE["allowed_from"])

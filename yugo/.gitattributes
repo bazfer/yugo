@@ -1,8 +1,0 @@
-# Vendored fleet-bus schema files are byte-hashed. Git checkout under
-# core.autocrlf=true (Windows default) would silently rewrite LF→CRLF and
-# invalidate the recorded sha256, causing `docker build` to fail with
-# `sha256sum: 'standard input': no properly formatted checksum lines found`.
-# Pin these to LF regardless of platform.
-vendored/envelope.v1.schema.json eol=lf
-vendored/FLEET_BUS_SCHEMA_SHA256  eol=lf
-vendored/FLEET_BUS_VERSION        eol=lf

@@ -3,7 +3,9 @@
 # stay out of the repo (same split as `.env.example` → `.env`).
 services:
   bot:
-    build: .
+    build:
+      context: ..
+      dockerfile: yugo/Dockerfile
     # One BOT_NAME per bot. Compose interpolates it from the same `.env` that
     # `env_file` hands the container, so a second bot on this host is a second
     # directory with a different BOT_NAME — not an edit to this file.
@@ -41,7 +43,9 @@ services:
 
   coordinator:
     profiles: ["coordinator"]
-    build: .
+    build:
+      context: ..
+      dockerfile: yugo/Dockerfile
     container_name: yugo-coordinator
     env_file: .env
     environment:
