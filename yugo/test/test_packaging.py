@@ -74,7 +74,9 @@ def test_readme_changelog_has_no_gaps_in_the_current_minor():
 
 def test_dockerfile_packages_coordinator_entrypoint_and_dependencies():
     for path in ("coordinator.py", "coordinator_main.py", "coordinator_state.py", "version.py", "entrypoint.sh"):
-        assert f"COPY {path} ." in _DOCKERFILE
+        assert f"COPY yugo/{path} ." in _DOCKERFILE
+    assert "COPY schema/envelope.v1.schema.json ./schema/envelope.v1.schema.json" in _DOCKERFILE
+    assert "COPY conformance/envelope.v1.vectors.json ./conformance/envelope.v1.vectors.json" in _DOCKERFILE
     assert 'ENTRYPOINT ["/app/entrypoint.sh"]' in _DOCKERFILE
 
 
@@ -176,5 +178,5 @@ def test_readme_clone_url_points_at_this_repo():
     runner swap). A stale clone URL is the first command in the quick start, so
     it fails before anything else can.
     """
-    assert "github.com:bazfer/yugo.git" in _README
+    assert "github.com:bazfer/yugo2.git" in _README
     assert "artifice-ia/yugo" not in _README

@@ -54,11 +54,11 @@ Codex-container is still fine when you want to stay on OpenAI. Yugo starts to ma
 
 ## Quick start
 
-Requires: Docker, Docker Compose, Bun (for the fleet-bus vendored schema hash-check).
+Requires: Docker and Docker Compose.
 
 ```bash
-git clone git@github.com:bazfer/yugo.git
-cd yugo
+git clone git@github.com:bazfer/yugo2.git
+cd yugo2/yugo
 cp .env.example .env                  # fill in DISCORD_BOT_TOKEN, MODEL, provider API key
 cp compose.example.yml compose.yml    # Compose ignores *.example.yml; the copy is gitignored
 cp IDENTITY.md persona.md             # then write your bot's persona into it

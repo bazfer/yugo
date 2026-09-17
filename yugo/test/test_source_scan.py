@@ -364,7 +364,7 @@ def test_dockerfile_copies_every_module_bot_imports():
     ]
     assert local, "no repo-local imports found in bot.py; update this guard"
     for name in local:
-        assert f"COPY {name}.py" in dockerfile, (
+        assert f"COPY yugo/{name}.py" in dockerfile, (
             f"bot.py imports the repo-local module {name!r} but the "
             f"Dockerfile has no `COPY {name}.py` — the image builds and the "
             "container dies at boot"
