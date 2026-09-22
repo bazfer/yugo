@@ -117,6 +117,9 @@ describe('durable envelope dedup', () => {
     const store = new DurableEnvelopeDedupStore(':memory:', DEFAULT_DEDUP_TTL_MS, 2_000)
     const claim = store.claim('env', 'req', 100_000)
     expect(store.complete('env', claim.owner!)).toBe(true)
+    // The SAME owner completing twice — what `AND state='pending'` buys, and
+    // the clause the owner predicate alone never exercises.
+    expect(store.complete('env', claim.owner!)).toBe(false)
     expect(store.complete('env', 'someone-else')).toBe(false)
     expect(store.release('env', 'someone-else')).toBe(false)
   })
@@ -459,6 +462,10 @@ class TestFleetBus extends FleetBus {
   handleResult(value: unknown, subject = 'fleet.vec.result'): Promise<void> {
     return this.onResult(fakeMessage(subject, value))
   }
+  /** Drive one heartbeat, to observe what the beat is wired to do. */
+  beat(): void {
+    (this as unknown as { publishHeartbeat: () => void }).publishHeartbeat()
+  }
   /** Drive the real `subscribe` loop, which no other test exercises. */
   runSubscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
     (this as unknown as { subscribe: (s: string, h: typeof handler) => void }).subscribe(subject, handler)
@@ -533,18 +540,22 @@ describe('request session injection', () => {
     // directly, so the whole renewal wiring could be deleted from FleetBus
     // with the suite still green.
     const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-renew-')), 'dedup.sqlite')
-    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000)
     const observed: boolean[] = []
     const bus = new TestFleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       // Short lease so the turn genuinely outlives it. The bus derives its
       // renewal cadence from the store, so this is all that needs setting.
-      dedupStore: new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200),
+      dedupStore: new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000),
       injectIntoSession: async () => {
-        // Six lease-lengths of work. Without renewal the lease lapses after
-        // the first and the rival takes the envelope mid-turn.
-        for (let i = 0; i < 6; i += 1) {
-          await new Promise(resolve => setTimeout(resolve, 200))
+        // Three lease-lengths of work. Without renewal the lease lapses after
+        // the first and the rival takes the envelope mid-turn. A 1s lease
+        // gives 600ms of headroom between a renewal tick and the probe; at
+        // 200ms the margin was 120ms, which a stalled event loop on a shared
+        // CI runner can eat — a fencing test that flakes reads as "renewal is
+        // broken". Three iterations keeps it inside the default timeout.
+        for (let i = 0; i < 3; i += 1) {
+          await new Promise(resolve => setTimeout(resolve, 1_000))
           observed.push(rival.claim('slow-turn', 'rival').duplicate)
         }
       },
@@ -590,6 +601,74 @@ describe('request session injection', () => {
     // though the claim was never completed.
     expect(bus.seenRequestLedgerHas('unarmed')).toBe(false)
     expect(store.count()).toBe(1)
+  })
+
+  test('a slow UNSOLICITED turn keeps a rival fenced for its whole duration', async () => {
+    // Every claim-lifecycle test targeted `onRequest`. `injectUnsolicited`
+    // takes a durable claim too and runs the same unbounded session turn, so
+    // deleting its renewal left the suite green — the exact P1 this branch
+    // exists to fix, on the route it was missed on the first time.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-unsol-')), 'dedup.sqlite')
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000)
+    const observed: boolean[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000),
+      injectIntoSession: async () => {
+        for (let i = 0; i < 3; i += 1) {
+          await new Promise(resolve => setTimeout(resolve, 1_000))
+          observed.push(rival.claim('unsolicited-slow', 'rival').duplicate)
+        }
+      },
+    }, allowlist)
+    // No outbound waiter matches, so this lands on the unsolicited path.
+    await bus.handleResult(envelope({ id: 'unsolicited-slow', to: 'vec', from: 'kat' }))
+    expect(observed.length).toBeGreaterThan(0)
+    expect(observed.every(Boolean)).toBe(true)
+  })
+
+  test('a failed unsolicited completion does not arm seenResultEnvelopes', async () => {
+    class FailingComplete extends DurableEnvelopeDedupStore {
+      override complete(): boolean { throw new Error('database is locked') }
+    }
+    const store = new FailingComplete(':memory:')
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, injectIntoSession: async () => {},
+    }, allowlist)
+    await bus.handleResult(envelope({ id: 'unsolicited-unarmed', to: 'vec', from: 'kat' }))
+    // The durable row is still pending, so the memory ledger must not claim
+    // otherwise — this is `completeClaim`'s own stated contract.
+    expect(bus.seenResultLedgerHas('unsolicited-unarmed')).toBe(false)
+    expect(store.count()).toBe(1)
+  })
+
+  test('a failed unsolicited injection releases the claim for retry', async () => {
+    const store = new DurableEnvelopeDedupStore(':memory:')
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async () => { throw new Error('session gone') },
+    }, allowlist)
+    await bus.handleResult(envelope({ id: 'unsolicited-failed', to: 'vec', from: 'kat' }))
+    expect(store.count()).toBe(0)
+  })
+
+  test('the heartbeat sweeps expired claims', async () => {
+    // The idle prune must be WIRED, not merely implemented: the store-level
+    // test calls it directly, so deleting the heartbeat call left this green.
+    const store = new DurableEnvelopeDedupStore(':memory:', 10)
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, injectIntoSession: async () => {},
+    }, allowlist)
+    for (let i = 0; i < 20; i += 1) {
+      const claim = store.claim(`stale-${i}`, `req-${i}`, 0)
+      store.complete(`stale-${i}`, claim.owner!)
+    }
+    expect(store.count()).toBe(20)
+    bus.beat()
+    expect(store.count()).toBe(0)
   })
 
   test('failed and cancelled delivery release pending claim for retry', async () => {

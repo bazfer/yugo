@@ -128,6 +128,10 @@ def test_complete_and_release_report_owner_loss(tmp_path):
     store = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=2)
     _, _, owner = store.claim("env", "req", now_s=100)
     assert store.complete("env", owner) is True
+    # The SAME owner completing twice. This is what `AND state='pending'`
+    # buys, and without it the two ports disagree: True here, False in
+    # TypeScript. The owner predicate alone never exercises the clause.
+    assert store.complete("env", owner) is False
     assert store.complete("env", "someone-else") is False
     assert store.release("env", "someone-else") is False
 
@@ -186,21 +190,24 @@ async def test_a_slow_turn_keeps_a_rival_fenced_for_its_whole_duration(tmp_path)
         "kind": "text_message", "ts": datetime.now(timezone.utc).isoformat(),
         "payload": {},
     }
-    rival = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=0.2)
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=1.0)
     observed: list[bool] = []
 
     async def slow(_envelope, _req_id):
         # Six lease-lengths of work. Without renewal the lease lapses after the
-        # first and the rival takes the envelope mid-turn.
+        # first and the rival takes the envelope mid-turn. A 1s lease gives
+        # 600ms of headroom between a renewal tick and the probe; at 200ms the
+        # margin was 120ms, which a stalled event loop on a shared CI runner
+        # can eat — a fencing test that flakes reads as "renewal is broken".
         for _ in range(6):
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1.0)
             observed.append(rival.claim("slow-turn", "rival")[0])
         return None
 
     bus = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None), on_envelope=slow)
     # Short lease so the turn genuinely outlives it; the bus derives its
     # renewal cadence from the store, so this is all that needs setting.
-    bus._dedup = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=0.2)
+    bus._dedup = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=1.0)
     await bus._on_request("fleet.vec.request", wire)
 
     assert observed, "the turn never ran"
@@ -243,3 +250,94 @@ async def test_a_completion_store_fault_does_not_reject_the_handler(tmp_path):
     bus._dedup = FailingComplete(str(path))
     # Must not raise: a rejected handler is what ends the lane.
     await bus._on_request("fleet.vec.request", wire)
+
+
+@pytest.mark.asyncio
+async def test_the_claim_is_still_pending_while_the_reply_is_published(tmp_path):
+    """Completion must happen AFTER outbound processing, not before.
+
+    Completing first means a crash between the commit and the publish leaves a
+    `completed` row with no answer sent, suppressing redelivery for the full
+    TTL — the documented at-least-once duplicate becomes a permanently lost
+    response. The real failure is a process death, so the observable assertion
+    is the row's state at publish time rather than an injected exception.
+    """
+    path = tmp_path / "dedup.sqlite"
+    config = fleet_bus.FleetBusConfig(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec", "kat"}), plugin_version="test",
+        audit_log_path=None, dedup_store_path=str(path),
+    )
+    wire = {
+        "envelope_version": 1, "id": "publish-window", "from": "kat", "to": "vec",
+        "kind": "text_message", "ts": datetime.now(timezone.utc).isoformat(),
+        "payload": {},
+    }
+    state_at_publish: list[str] = []
+
+    async def reply(_envelope, _req_id):
+        return "an answer"
+
+    bus = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None), on_envelope=reply)
+
+    async def spy(*_args, **_kwargs):
+        row = bus._dedup._db.execute(
+            "SELECT state FROM envelope_dedup_v2 WHERE envelope_id=?", ("publish-window",)
+        ).fetchone()
+        state_at_publish.append(row[0])
+
+    bus._publish_turn_output = spy
+    await bus._on_request("fleet.vec.request", wire)
+
+    assert state_at_publish == ["pending"], (
+        "the claim was completed before the reply was published — a crash in "
+        "that window loses the answer permanently"
+    )
+    settled = bus._dedup._db.execute(
+        "SELECT state FROM envelope_dedup_v2 WHERE envelope_id=?", ("publish-window",)
+    ).fetchone()
+    assert settled[0] == "completed", "the claim was never settled after publishing"
+
+
+@pytest.mark.asyncio
+async def test_the_heartbeat_sweeps_expired_claims(tmp_path):
+    """The idle prune must be WIRED, not merely implemented.
+
+    The store-level `prune_idle` test calls the store directly, so deleting
+    the call from the heartbeat left both suites green — the same shape as the
+    renewal gap found the round before.
+    """
+    path = tmp_path / "dedup.sqlite"
+    config = fleet_bus.FleetBusConfig(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec", "kat"}), plugin_version="test",
+        audit_log_path=None, dedup_store_path=str(path),
+    )
+    bus = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None))
+    bus._dedup = fleet_bus.DurableEnvelopeDedupStore(":memory:", ttl_s=10)
+    for index in range(20):
+        claim = bus._dedup.claim(f"stale-{index}", f"req-{index}", now_s=0)
+        bus._dedup.complete(f"stale-{index}", claim[2])
+    assert bus._dedup._db.execute("SELECT COUNT(*) FROM envelope_dedup_v2").fetchone()[0] == 20
+    # Drive the BEAT, not the helper. Calling `_sweep_expired_claims` directly
+    # tests the method and leaves the wiring unproven — which is exactly how
+    # the previous round's renewal fix passed while being disconnected.
+    await bus._publish_heartbeat()
+    assert bus._dedup._db.execute("SELECT COUNT(*) FROM envelope_dedup_v2").fetchone()[0] == 0
+
+
+def test_a_sweep_fault_never_stops_the_heartbeat(tmp_path):
+    """Liveness outranks cleanup: a store fault must be audited, not raised."""
+    config = fleet_bus.FleetBusConfig(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec", "kat"}), plugin_version="test",
+        audit_log_path=None, dedup_store_path=":memory:",
+    )
+    bus = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None))
+
+    class ExplodingPrune(fleet_bus.DurableEnvelopeDedupStore):
+        def prune_idle(self, now_s=None):
+            raise sqlite3.OperationalError("database is locked")
+
+    bus._dedup = ExplodingPrune(":memory:")
+    assert bus._sweep_expired_claims() == 0  # must not raise

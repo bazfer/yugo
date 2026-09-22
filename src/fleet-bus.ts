@@ -830,8 +830,15 @@ export class FleetBus {
    * Every durable operation on this path is contained per message: a SQLite
    * fault here must not reject the handler, which was the whole point of the
    * claim-fault guard. Completion is the same class of risk and was not
-   * covered. Returns whether WE completed it — a lost owner must not populate
-   * the in-memory fast paths as a successful completion.
+   * covered. Returns whether WE completed it.
+   *
+   * The two INJECTION paths gate their in-memory ledger on that return: they
+   * await an unbounded session turn between claim and complete, so owner loss
+   * is reachable and arming the ledger would drop the real owner's envelope
+   * as a duplicate. The two LEDGER-MATCHED paths deliberately arm first and
+   * ignore the return — `match.resolve` is synchronous, there is no await
+   * between claim and complete, and arming early is what makes those paths
+   * re-entrant. Do not "fix" that asymmetry without reading both.
    */
   private completeClaim(subject: string, envelopeId: string, reqId: string, owner: string): boolean {
     let won: boolean

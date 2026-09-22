@@ -1114,6 +1114,12 @@ class DurableEnvelopeDedupStore:
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        # WAL, matching the TypeScript port. Rollback-journal mode costs ~5ms
+        # per claim+complete against ~2.6ms on WAL — per inbound envelope, on
+        # the event-loop thread that also serves NATS callbacks — and lets a
+        # writer block readers file-wide, which is the regime the concurrency
+        # claim below is counting on.
+        self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS envelope_dedup_v2 ("
@@ -1539,20 +1545,30 @@ class FleetBus:
             await self._publish_heartbeat()
             await asyncio.sleep(self._config.heartbeat_interval_s)
 
-    async def _publish_heartbeat(self) -> None:
-        if self._nc is None or self._nc.is_closed:
-            return
-        # Piggyback the quiet-lane sweep on the beat, matching the TypeScript
-        # port. `prune` is otherwise only reached from `claim`, so a lane that
-        # goes silent after a burst keeps its expired rows until the next
-        # arrival. Contained: a store fault must never stop heartbeats, which
-        # are this bot's liveness signal.
+    def _sweep_expired_claims(self) -> int:
+        """Quiet-lane cleanup, driven by the heartbeat.
+
+        `prune` is otherwise only reached from `claim`, so a lane that goes
+        silent after a burst keeps its expired rows until the next arrival —
+        the backlog survives exactly when there is most capacity to clear it.
+        Contained: a store fault must never stop heartbeats, which are this
+        bot's liveness signal.
+        """
         try:
-            self._dedup.prune_idle()
+            return self._dedup.prune_idle()
         except Exception as e:  # noqa: BLE001 — liveness outranks cleanup
             self._audit.record(
                 "conn", self.status_subject, event="idle_prune_failed", error=repr(e)
             )
+            return 0
+
+    async def _publish_heartbeat(self) -> None:
+        # Sweep BEFORE the connection check, matching the TypeScript port. A
+        # disconnected bot is the quietest lane there is, and returning early
+        # meant the one state this feature is named for never swept.
+        self._sweep_expired_claims()
+        if self._nc is None or self._nc.is_closed:
+            return
         envelope = create_heartbeat_envelope(
             self._config.bot_name,
             self._config.plugin_version,
@@ -1876,6 +1892,14 @@ class FleetBus:
             return
         req_id = original_req_id
 
+        # Renew from the moment the claim exists, not from the moment the
+        # session turn starts. `_warn_origin` awaits a publish that can stall
+        # on a full pending buffer mid-outage, and until this task existed the
+        # claim was held across it unrenewed.
+        renewer = asyncio.create_task(
+            self._renew_claim_until_done(subject, envelope, req_id, claim_owner)
+        )
+
         if isinstance(hops, int) and hops >= BATON_HOPS_WARN_AT:
             await self._warn_origin(subject, envelope, req_id)
 
@@ -1891,18 +1915,11 @@ class FleetBus:
                 kind=envelope["kind"],
                 **{"from": envelope["from"]},
             )
+            await _cancel_task(renewer)
             self._complete_claim(subject, envelope, req_id, claim_owner)
             return
 
         self._injection_delivered_ts = _utc_now_iso()
-        # Renew while the turn runs. Without this a turn longer than the lease
-        # is handed to a second consumer WHILE THE FIRST IS STILL EXECUTING —
-        # the one duplication window that is actually closable here. The
-        # post-effect/pre-commit window is not closable at this boundary and is
-        # documented as at-least-once; see SPEC and yugo#24.
-        renewer = asyncio.create_task(
-            self._renew_claim_until_done(subject, envelope, req_id, claim_owner)
-        )
         try:
             reply = await self._on_envelope(envelope, req_id)
         # CancelledError is a BaseException and deliberately NOT caught: a
