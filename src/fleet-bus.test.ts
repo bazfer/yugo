@@ -30,7 +30,6 @@ import {
   type FleetBusConfig,
   type FleetBusSessionEvent,
   type TokenBucket,
-  DEDUP_PRUNE_BUDGET,
 } from './fleet-bus'
 
 const jc = JSONCodec()
@@ -61,7 +60,6 @@ describe('durable envelope dedup', () => {
     // 100-row batch is what let the backlog grow ~156 rows per 256 arrivals.
     expect(store.prune(100)).toBe(101)
     expect(store.prune(100)).toBe(0)
-    expect(DEDUP_PRUNE_BUDGET).toBeGreaterThan(256)
   })
 
   test('pruning outpaces a steady arrival stream', () => {
@@ -421,6 +419,13 @@ class FakeNatsConnection {
     }
   }
 
+  /** Push a message into a live subscription, to drive the real `subscribe` loop. */
+  pushTo(subject: string, msg: Msg): void {
+    const sub = this.subscriptions.find(s => s.subject === subject)
+    if (!sub) throw new Error(`no subscription for ${subject}`)
+    sub.push(msg)
+  }
+
   isClosed(): boolean { return this.closed_ }
   async close(): Promise<void> { this.markClosed() }
   async drain(): Promise<void> { this.markClosed() }
@@ -453,6 +458,10 @@ class TestFleetBus extends FleetBus {
   }
   handleResult(value: unknown, subject = 'fleet.vec.result'): Promise<void> {
     return this.onResult(fakeMessage(subject, value))
+  }
+  /** Drive the real `subscribe` loop, which no other test exercises. */
+  runSubscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
+    (this as unknown as { subscribe: (s: string, h: typeof handler) => void }).subscribe(subject, handler)
   }
   outboundLedgerSize(): number {
     return (this as unknown as { outboundLedger: { size: number } }).outboundLedger.size
@@ -492,6 +501,95 @@ describe('request session injection', () => {
     await bus.handleRequest(envelope({ id: 'store-fault', to: 'vec' }))
     await bus.handleRequest(envelope({ id: 'healthy-after-store-fault', to: 'vec' }))
     expect(events.map(event => event.envelope.id)).toEqual(['healthy-after-store-fault'])
+  })
+
+  test('a rejecting handler does not end the subscription lane', async () => {
+    // `subscribe` caught OUTSIDE the `for await` loop, so one rejected
+    // handler permanently ended the lane while the connection and heartbeat
+    // stayed healthy — the bot looks alive and silently receives nothing.
+    // Nothing in the suite went through `subscribe`, so reverting the fix
+    // left everything green.
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async () => {},
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const seen: string[] = []
+    bus.runSubscribe('fleet.vec.request', async (message: Msg) => {
+      const id = (jc.decode(message.data) as { id: string }).id
+      seen.push(id)
+      if (id === 'poison') throw new Error('handler exploded')
+    })
+    nc.pushTo('fleet.vec.request', fakeMessage('fleet.vec.request', envelope({ id: 'poison', to: 'vec' })))
+    nc.pushTo('fleet.vec.request', fakeMessage('fleet.vec.request', envelope({ id: 'after-poison', to: 'vec' })))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(seen).toEqual(['poison', 'after-poison'])
+  })
+
+  test('a slow turn keeps a rival fenced for its whole duration', async () => {
+    // The test the P1 actually demands: fencing through the BUS, not the
+    // store. The previous round's renewal tests called `store.renew()`
+    // directly, so the whole renewal wiring could be deleted from FleetBus
+    // with the suite still green.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-renew-')), 'dedup.sqlite')
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const observed: boolean[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      // Short lease so the turn genuinely outlives it. The bus derives its
+      // renewal cadence from the store, so this is all that needs setting.
+      dedupStore: new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200),
+      injectIntoSession: async () => {
+        // Six lease-lengths of work. Without renewal the lease lapses after
+        // the first and the rival takes the envelope mid-turn.
+        for (let i = 0; i < 6; i += 1) {
+          await new Promise(resolve => setTimeout(resolve, 200))
+          observed.push(rival.claim('slow-turn', 'rival').duplicate)
+        }
+      },
+    }, allowlist)
+    await bus.handleRequest(envelope({ id: 'slow-turn', to: 'vec' }))
+    expect(observed.length).toBeGreaterThan(0)
+    expect(observed.every(Boolean)).toBe(true)
+    expect(rival.claim('slow-turn', 'late').duplicate).toBe(true)
+  })
+
+  test('a completion store fault does not reject the handler', async () => {
+    // `claimDedup`'s fault guard was covered; complete/release were not, so
+    // removing their try/catch left the suite entirely green.
+    class FailingComplete extends DurableEnvelopeDedupStore {
+      override complete(): boolean { throw new Error('database is locked') }
+    }
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: new FailingComplete(':memory:'),
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    // Must not reject: a rejected handler is what ends the lane.
+    await bus.handleRequest(envelope({ id: 'complete-fault', to: 'vec' }))
+    expect(events.map(event => event.envelope.id)).toEqual(['complete-fault'])
+  })
+
+  test('a failed completion does not arm the in-memory fast path', async () => {
+    // The durable row stays pending, so a redelivery after the lease must be
+    // able to recover it. Arming the memory ledger would suppress that for
+    // the full TTL even though the claim was never completed.
+    class FailingComplete extends DurableEnvelopeDedupStore {
+      override complete(): boolean { throw new Error('database is locked') }
+    }
+    const store = new FailingComplete(':memory:')
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, injectIntoSession: async () => {},
+    }, allowlist)
+    await bus.handleRequest(envelope({ id: 'unarmed', to: 'vec' }))
+    // The durable row is still pending, so the in-memory fast path must NOT
+    // be armed — arming it suppresses the redelivery for the full TTL even
+    // though the claim was never completed.
+    expect(bus.seenRequestLedgerHas('unarmed')).toBe(false)
+    expect(store.count()).toBe(1)
   })
 
   test('failed and cancelled delivery release pending claim for retry', async () => {

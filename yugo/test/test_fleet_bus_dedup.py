@@ -1,6 +1,7 @@
 """Durable envelope-id deduplication controls."""
 
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 import asyncio
 from datetime import datetime, timezone
 
@@ -51,9 +52,6 @@ def test_pending_lease_recovers_and_prune_uses_index_with_bounded_batch(tmp_path
     # per 256 arrivals; draining in one sweep is the fix.
     assert restarted.prune(prune_now) == 101
     assert restarted.prune(prune_now) == 0
-    # The budget is the only ceiling, and it is deliberately above the
-    # every-N-claims trigger so a steady stream loses ground on each sweep.
-    assert fleet_bus.DEDUP_PRUNE_BUDGET > fleet_bus.DEDUP_PRUNE_EVERY
 
 
 def test_prune_outpaces_a_steady_arrival_stream(tmp_path):
@@ -165,3 +163,83 @@ async def test_adapter_failure_or_cancellation_releases_pending_for_restart_retr
     restarted = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None), on_envelope=succeed)
     await restarted._on_request("fleet.vec.request", wire)
     assert len(delivered) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_slow_turn_keeps_a_rival_fenced_for_its_whole_duration(tmp_path):
+    """The test the P1 actually demands: fencing through the BUS, not the store.
+
+    The previous round's renewal tests called `store.renew()` directly, so the
+    entire renewal wiring could be deleted from `FleetBus` with both suites
+    still green. This drives a real turn that outlives its lease several times
+    over and asserts a second consumer is refused THROUGHOUT, then admitted
+    once the owner is gone.
+    """
+    path = tmp_path / "dedup.sqlite"
+    config = fleet_bus.FleetBusConfig(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec", "kat"}), plugin_version="test",
+        audit_log_path=None, dedup_store_path=str(path),
+    )
+    wire = {
+        "envelope_version": 1, "id": "slow-turn", "from": "kat", "to": "vec",
+        "kind": "text_message", "ts": datetime.now(timezone.utc).isoformat(),
+        "payload": {},
+    }
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=0.2)
+    observed: list[bool] = []
+
+    async def slow(_envelope, _req_id):
+        # Six lease-lengths of work. Without renewal the lease lapses after the
+        # first and the rival takes the envelope mid-turn.
+        for _ in range(6):
+            await asyncio.sleep(0.2)
+            observed.append(rival.claim("slow-turn", "rival")[0])
+        return None
+
+    bus = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None), on_envelope=slow)
+    # Short lease so the turn genuinely outlives it; the bus derives its
+    # renewal cadence from the store, so this is all that needs setting.
+    bus._dedup = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=0.2)
+    await bus._on_request("fleet.vec.request", wire)
+
+    assert observed, "the turn never ran"
+    assert all(observed), (
+        "a rival consumer claimed the envelope while the owner was still "
+        f"executing — renewal is not wired into the turn: {observed}"
+    )
+    # Owner is done and the claim settled, so the wire id stays deduped.
+    assert rival.claim("slow-turn", "late")[0] is True
+
+
+@pytest.mark.asyncio
+async def test_a_completion_store_fault_does_not_reject_the_handler(tmp_path):
+    """Containment for completion, not just for claim.
+
+    `claimDedup`'s fault guard was covered; `complete`/`release` were not, so
+    removing their try/except left the suite green apart from a source-text
+    regex. A SQLite fault at completion must be audited and swallowed.
+    """
+    path = tmp_path / "dedup.sqlite"
+    config = fleet_bus.FleetBusConfig(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec", "kat"}), plugin_version="test",
+        audit_log_path=None, dedup_store_path=str(path),
+    )
+    wire = {
+        "envelope_version": 1, "id": "complete-fault", "from": "kat", "to": "vec",
+        "kind": "text_message", "ts": datetime.now(timezone.utc).isoformat(),
+        "payload": {},
+    }
+
+    class FailingComplete(fleet_bus.DurableEnvelopeDedupStore):
+        def complete(self, envelope_id: str, owner: str) -> bool:
+            raise sqlite3.OperationalError("database is locked")
+
+    async def ok(_envelope, _req_id):
+        return None
+
+    bus = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None), on_envelope=ok)
+    bus._dedup = FailingComplete(str(path))
+    # Must not raise: a rejected handler is what ends the lane.
+    await bus._on_request("fleet.vec.request", wire)

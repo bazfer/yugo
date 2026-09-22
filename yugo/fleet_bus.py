@@ -1166,12 +1166,24 @@ class DurableEnvelopeDedupStore:
                 self._db.execute("ROLLBACK")
                 raise
 
+    @property
+    def lease_s(self) -> float:
+        """The lease this store issues. Callers deriving a renewal cadence MUST
+        read this rather than the module default, which this store may not use."""
+        return self._lease_s
+
     def renew(self, envelope_id: str, owner: str, now_s: float | None = None) -> bool:
         """Extend a live owner's lease. False means the lease was already lost.
 
-        The caller MUST stop doing externally-visible work when this returns
-        False: another consumer has taken the envelope, and anything this turn
-        does from here on is the duplicate, not the original.
+        False means another consumer has taken the envelope and anything this
+        turn still does is the duplicate, not the original.
+
+        Stated honestly: no caller can act on that today. There is no cancel
+        handle at this boundary, so `_renew_claim_until_done` records the loss
+        and stops renewing while the turn runs to completion. That is the
+        at-least-once contract working as designed, not a gap in this method —
+        closing it is yugo#24. The return value exists so a future caller with
+        a cancel handle has something to fence on.
         """
         now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
         with self._lock:
@@ -1189,8 +1201,12 @@ class DurableEnvelopeDedupStore:
         would suppress the real owner's result.
         """
         with self._lock:
+            # `AND state='pending'` matches the TypeScript port exactly. Without
+            # it a same-owner double-complete returns True here and False there,
+            # and the return value is now load-bearing on both sides.
             return self._db.execute(
-                "UPDATE envelope_dedup_v2 SET state='completed' WHERE envelope_id=? AND lease_owner=?",
+                "UPDATE envelope_dedup_v2 SET state='completed' "
+                "WHERE envelope_id=? AND lease_owner=? AND state='pending'",
                 (envelope_id, owner),
             ).rowcount == 1
 
@@ -1391,7 +1407,6 @@ class FleetBus:
         # Reported on every heartbeat from 3b. See create_heartbeat_envelope.
         self._injection_delivered_ts: str | None = None
         self._session_last_response_ts: str | None = None
-        self._dedup_lease_s = DEFAULT_DEDUP_LEASE_S
         self._dedup = DurableEnvelopeDedupStore(
             config.dedup_store_path or ":memory:", config.dedup_ttl_s
         )
@@ -1527,6 +1542,17 @@ class FleetBus:
     async def _publish_heartbeat(self) -> None:
         if self._nc is None or self._nc.is_closed:
             return
+        # Piggyback the quiet-lane sweep on the beat, matching the TypeScript
+        # port. `prune` is otherwise only reached from `claim`, so a lane that
+        # goes silent after a burst keeps its expired rows until the next
+        # arrival. Contained: a store fault must never stop heartbeats, which
+        # are this bot's liveness signal.
+        try:
+            self._dedup.prune_idle()
+        except Exception as e:  # noqa: BLE001 — liveness outranks cleanup
+            self._audit.record(
+                "conn", self.status_subject, event="idle_prune_failed", error=repr(e)
+            )
         envelope = create_heartbeat_envelope(
             self._config.bot_name,
             self._config.plugin_version,
@@ -1899,8 +1925,12 @@ class FleetBus:
                 error=repr(e),
             )
             return
-        await _cancel_task(renewer)
-        self._complete_claim(subject, envelope, req_id, claim_owner)
+        # The claim is NOT completed here. Completing before the reply is on
+        # the wire means a crash in this window leaves a `completed` row with
+        # no answer sent, and the redelivery is then suppressed for the full
+        # TTL — turning the documented at-least-once duplicate into a
+        # permanently LOST response, which is strictly worse. The lease stays
+        # held (and renewed) across publishing, and completion happens after.
         self._session_last_response_ts = _utc_now_iso()
         # Success is `dir="in"` carrying envelope identity AND the nonce —
         # the shape the TS port records from `injectIntoSession`. The audit
@@ -1935,6 +1965,13 @@ class FleetBus:
                 req_id=req_id,
                 error=repr(e),
             )
+        finally:
+            # Outbound processing is over, one way or the other: stop renewing
+            # and settle the claim. A publish fault still completes — the turn
+            # ran and its side effects happened, so replaying it would burn a
+            # second model call for an answer the peer may already have.
+            await _cancel_task(renewer)
+            self._complete_claim(subject, envelope, req_id, claim_owner)
 
     def _complete_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
         """Promote a claim, surviving a store fault and reporting owner loss.
@@ -1982,7 +2019,9 @@ class FleetBus:
         wall-clock because competing consumers compare it across processes.
         Cancelled by the caller on both exits.
         """
-        interval = max(1.0, self._dedup_lease_s * DEDUP_LEASE_RENEW_RATIO)
+        # The STORE's lease, not the module default — they are the same by
+        # default but a test or embedder can hand us a store with its own.
+        interval = max(0.05, self._dedup.lease_s * DEDUP_LEASE_RENEW_RATIO)
         while True:
             await asyncio.sleep(interval)
             try:

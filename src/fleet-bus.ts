@@ -106,7 +106,7 @@ export class DurableEnvelopeDedupStore {
   constructor(
     path: string,
     private readonly ttlMs = DEFAULT_DEDUP_TTL_MS,
-    private readonly leaseMs = DEFAULT_DEDUP_LEASE_MS,
+    private readonly leaseMsValue = DEFAULT_DEDUP_LEASE_MS,
   ) {
     if (path !== ':memory:' && ttlMs < MIN_DEDUP_TTL_MS) {
       throw new RangeError('durable dedup TTL must be at least the 7-day stream max_age')
@@ -140,14 +140,14 @@ export class DurableEnvelopeDedupStore {
         .run(envelopeId, nowMs - this.ttlMs)
       const inserted = this.db.query(
         "INSERT OR IGNORE INTO envelope_dedup_v2 VALUES (?,?,?,'pending',?,?)",
-      ).run(envelopeId, nowMs, reqId, owner, nowMs + this.leaseMs)
+      ).run(envelopeId, nowMs, reqId, owner, nowMs + this.leaseMsValue)
       if (inserted.changes === 1) return { duplicate: false, reqId, owner }
       const row = this.db.query('SELECT req_id,state,lease_until_ms FROM envelope_dedup_v2 WHERE envelope_id=?')
         .get(envelopeId) as { req_id: string; state: string; lease_until_ms: number }
       if (row.state === 'pending' && row.lease_until_ms <= nowMs) {
         const recovered = this.db.query(
           "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_ms=? WHERE envelope_id=? AND state='pending' AND lease_until_ms<=?",
-        ).run(owner, nowMs + this.leaseMs, envelopeId, nowMs)
+        ).run(owner, nowMs + this.leaseMsValue, envelopeId, nowMs)
         if (recovered.changes === 1) return { duplicate: false, reqId: row.req_id, owner }
       }
       return { duplicate: true, reqId: row.req_id }
@@ -163,7 +163,7 @@ export class DurableEnvelopeDedupStore {
   renew(envelopeId: string, owner: string, nowMs = Date.now()): boolean {
     return this.db.query(
       "UPDATE envelope_dedup_v2 SET lease_until_ms=? WHERE envelope_id=? AND lease_owner=? AND state='pending'",
-    ).run(nowMs + this.leaseMs, envelopeId, owner).changes === 1
+    ).run(nowMs + this.leaseMsValue, envelopeId, owner).changes === 1
   }
 
   /**
@@ -211,6 +211,12 @@ export class DurableEnvelopeDedupStore {
    */
   pruneIdle(nowMs = Date.now()): number {
     return this.prune(nowMs)
+  }
+
+  /** The lease this store issues. Callers deriving a renewal cadence MUST read
+   * this rather than the module default, which an injected store may not use. */
+  get leaseMs(): number {
+    return this.leaseMsValue
   }
 
   /** Row count. Test/ops introspection only — nothing on the hot path reads it. */
@@ -1305,7 +1311,15 @@ export class FleetBus {
    * turn nor a forward clock jump hands its envelope to a second worker.
    */
   private renewWhileRunning(subject: string, envelopeId: string, reqId: string, owner: string): () => void {
-    const intervalMs = Math.max(1_000, DEFAULT_DEDUP_LEASE_MS * DEDUP_LEASE_RENEW_RATIO)
+    // The STORE's lease, not the module default. An embedder can inject a
+    // store with its own lease (the third constructor parameter), and reading
+    // the default gave a 24s cadence against a 5s lease — renewal firing four
+    // leases late and fencing nothing, silently.
+    // Floor is a guard against a pathological zero, NOT a minimum cadence: a
+    // 1s floor silently disabled fencing for any lease under 2.5s, because
+    // renewal then fired after the lease had already lapsed. Matches the
+    // Python port's floor.
+    const intervalMs = Math.max(50, this.durableDedup.leaseMs * DEDUP_LEASE_RENEW_RATIO)
     const timer = setInterval(() => {
       let held: boolean
       try {
@@ -1492,11 +1506,22 @@ export class FleetBus {
       note: lateReplyEnvId !== undefined ? 'claude_discord_adapter_late_reply' : 'claude_discord_adapter_unsolicited_reply',
       ...(lateReplyEnvId !== undefined ? { late_reply_env_id: lateReplyEnvId } : {}),
     })
+    // Same lease discipline as `onRequest`. This path was missed in the first
+    // pass, which left the exact P1 it claimed to fix alive on the sibling
+    // route: an unsolicited or late `.result` whose turn outruns the lease
+    // could be reclaimed and re-injected while the first turn still ran.
+    const stopRenewing = this.renewWhileRunning(subject, envelope.id, claim.reqId, claim.owner!)
     try {
       await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId })
-      this.completeClaim(subject, envelope.id, claim.reqId, claim.owner!)
-      this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
+      stopRenewing()
+      // Gated for the reason `completeClaim`'s contract states: a lost owner
+      // must not arm the in-memory fast path, or the real owner's result is
+      // dropped here as a duplicate when it arrives.
+      if (this.completeClaim(subject, envelope.id, claim.reqId, claim.owner!)) {
+        this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
+      }
     } catch (error) {
+      stopRenewing()
       this.releaseClaim(subject, envelope.id, claim.reqId, claim.owner!)
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
     }
@@ -1554,6 +1579,17 @@ export class FleetBus {
   }
 
   private publishHeartbeat(): void {
+    // Piggyback the quiet-lane sweep on the heartbeat. `prune` is otherwise
+    // only reached from `claim`, so a lane that goes silent after a burst
+    // keeps its expired rows until the next arrival — the backlog survives
+    // exactly when there is most capacity to clear it. Contained: a store
+    // fault must never stop heartbeats, which are this bot's liveness signal.
+    try {
+      this.durableDedup.pruneIdle()
+    } catch (error) {
+      this.log(`idle dedup prune failed, heartbeat continues: ${String(error)}`)
+    }
+
     if (!this.nc || this.nc.isClosed()) return
     this.nc.publish(
       `fleet.${this.config.botName}.status`,
