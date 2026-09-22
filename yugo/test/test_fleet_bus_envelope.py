@@ -259,19 +259,30 @@ def test_no_reject_code_enters_fleet_bus_without_a_row_in_the_table_above():
     #                         recipient validation gap on PR #20 ... Vec fixed
     #                         at 8dec624, direct requests now reject/audit
     #                         mismatches as `recipient_mismatch`").
+    # A fourth code, and the first ADAPTER-SCOPED one in this module. Every
+    # code above is a bare validator/delivery string that both ports share
+    # verbatim. `yugo_duplicate_envelope` is not shared and is not meant to
+    # be: the durable dedup store is per-adapter, and each adapter prefixes
+    # its own drop reasons. The TypeScript counterpart is
+    # `claude_discord_adapter_duplicate_envelope` (`fleet-bus.ts`), which is
+    # the same event under the other adapter's prefix, not a divergence.
     expected = set(REJECT_CASES) | {
         "malformed_json",
         "injection_failed",
         "recipient_mismatch",
+        "yugo_duplicate_envelope",
     }
     source = Path(fleet_bus.__file__).read_text(encoding="utf-8")
     found = set(re.findall(r'error="([a-z_]+)"', source))
     found |= set(re.findall(r'reason="([a-z_]+)"', source))
     assert found == expected, (
         "the reject codes in fleet_bus.py no longer match the table in this "
-        "file. Both sides are a port of fleet-bus.ts `validateEnvelope` + "
-        "`onRequest`, so a code that belongs here needs a row above AND the "
-        "same string on the TypeScript side. "
+        "file. A code that belongs here needs a row above. For a SHARED "
+        "validator/delivery code it must also appear as the same string on "
+        "the TypeScript side, because both are a port of fleet-bus.ts "
+        "`validateEnvelope` + `onRequest`. An ADAPTER-SCOPED code (prefixed "
+        "`yugo_`) has no TypeScript twin by design — its counterpart carries "
+        "the other adapter's prefix instead. "
         f"missing={expected - found} unexpected={found - expected}"
     )
 
