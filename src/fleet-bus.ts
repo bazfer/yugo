@@ -858,9 +858,10 @@ export class FleetBus {
     if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
     const inbound = this.receiveLedger.get(reqId)
     if (inbound === undefined) return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
+    const subject = `fleet.${inbound.from}.request`
     if (!payloadIsJsonSerializable(payload)) {
       this.recordAudit({
-        dir: 'drop', subject: `fleet.${inbound.from}.result`,
+        dir: 'drop', subject,
         reason: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId,
       })
       return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId }
@@ -878,7 +879,7 @@ export class FleetBus {
       })
     } catch (error) {
       const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
-      this.recordAudit({ dir: 'drop', subject: `fleet.${inbound.from}.result`, reason, envelope_id: envelopeId })
+      this.recordAudit({ dir: 'drop', subject, reason, envelope_id: envelopeId })
       return { ok: false, error: reason, req_id: reqId }
     }
     const envelope: Envelope = {
@@ -895,10 +896,9 @@ export class FleetBus {
     }
     const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
     if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject: `fleet.${inbound.from}.result`, reason: validation.error, envelope_id: envelopeId })
+      this.recordAudit({ dir: 'drop', subject, reason: validation.error, envelope_id: envelopeId })
       return { ok: false, error: validation.error, req_id: reqId, envelope }
     }
-    const subject = `fleet.${inbound.from}.result`
     try {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
