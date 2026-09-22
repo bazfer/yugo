@@ -949,6 +949,57 @@ export class FleetBus {
       })
       return
     }
+
+    // Expand-phase correlation: migrated peers may send a reply on the
+    // request lane before publication flips away from `.result`. Correlation
+    // is subject-independent, so consult the existing outbound waiter ledger.
+    // Use the result-envelope dedup ledger as well: the same reply can arrive
+    // on both lanes during migration and must resolve exactly once.
+    const inReplyTo = result.envelope.in_reply_to
+    if (inReplyTo !== undefined) {
+      const seenResult = this.seenResultEnvelopes.get(result.envelope.id)
+      if (seenResult !== undefined) {
+        this.recordAudit({
+          dir: 'drop',
+          subject,
+          reason: 'claude_discord_adapter_duplicate_result_envelope',
+          envelope_id: result.envelope.id,
+          req_id: seenResult.reqId,
+        })
+        return
+      }
+
+      const match = this.outboundLedger.get(inReplyTo)
+      if (match !== undefined) {
+        if (result.envelope.from === match.expectedFrom) {
+          clearTimeout(match.timerId)
+          this.outboundLedger.delete(inReplyTo)
+          this.seenResultEnvelopes.set(result.envelope.id, { reqId: match.reqId, ts: Date.now() })
+          this.recordAudit({
+            dir: 'in', subject, envelope_id: result.envelope.id,
+            req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
+          })
+          match.resolve({
+            ok: true,
+            envelope: match.envelope,
+            delivered_to_subscriber: true,
+            reply: result.envelope,
+          })
+          return
+        }
+        // A matching id is not sufficient: only the addressed bot may answer
+        // the waiter. Preserve request-lane behavior by auditing the mismatch
+        // and falling through to ordinary fresh-turn injection.
+        this.recordAudit({
+          dir: 'drop',
+          subject,
+          reason: 'claude_discord_adapter_reply_from_mismatch',
+          envelope_id: result.envelope.id,
+          req_id: match.reqId,
+          expected_from: match.expectedFrom,
+        })
+      }
+    }
     // Envelope-id dedup (round-8 P2, class-widened from onResult). Peers can
     // retry `.request` frames for the same reasons they retry `.result` —
     // transport re-send, publisher restart, back-off retries. Without this
