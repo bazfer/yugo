@@ -46,8 +46,92 @@ def test_pending_lease_recovers_and_prune_uses_index_with_bounded_batch(tmp_path
         claim = restarted.claim(f"old-{index}", f"req-{index}", now_s=0)
         restarted.complete(f"old-{index}", claim[2])
     prune_now = fleet_bus.DEFAULT_DEDUP_TTL_S + 100
-    assert restarted.prune(prune_now) == 100
-    assert restarted.prune(prune_now) <= 1
+    # Batches stay bounded, but the sweep LOOPS until the expired set is
+    # drained. A single 100-row batch is what let the backlog grow ~156 rows
+    # per 256 arrivals; draining in one sweep is the fix.
+    assert restarted.prune(prune_now) == 101
+    assert restarted.prune(prune_now) == 0
+    # The budget is the only ceiling, and it is deliberately above the
+    # every-N-claims trigger so a steady stream loses ground on each sweep.
+    assert fleet_bus.DEDUP_PRUNE_BUDGET > fleet_bus.DEDUP_PRUNE_EVERY
+
+
+def test_prune_outpaces_a_steady_arrival_stream(tmp_path):
+    """Ohm's reproduction, inverted into an invariant.
+
+    1,024 unique claims with synthetic time advancing past the TTL between
+    them retained 624 rows under the single-batch prune, when only the newest
+    should be live. The cleanup must now keep the table bounded rather than
+    growing with the stream.
+    """
+    # `:memory:` deliberately bypasses the seven-day floor, which is the only
+    # way to advance synthetic time across many TTL windows in a unit test.
+    ttl = 100
+    store = fleet_bus.DurableEnvelopeDedupStore(":memory:", ttl_s=ttl)
+    for index in range(1024):
+        # Arrivals span many TTL windows, so by the end almost everything
+        # written is expired — the steady-stream shape from the review.
+        claim = store.claim(f"stream-{index}", f"req-{index}", now_s=float(index))
+        store.complete(f"stream-{index}", claim[2])
+    final_now = 1024.0
+    store.prune(final_now)
+    live = store._db.execute("SELECT COUNT(*) FROM envelope_dedup_v2").fetchone()[0]
+    expired = store._db.execute(
+        "SELECT COUNT(*) FROM envelope_dedup_v2 WHERE first_seen_s < ?", (final_now - ttl,)
+    ).fetchone()[0]
+    assert expired == 0, f"{expired} expired rows survived the sweep"
+    assert live <= ttl + 1, (
+        f"{live} rows retained for a {ttl}s TTL window — the table grew with the "
+        "stream instead of being bounded by it"
+    )
+
+
+def test_prune_idle_sweeps_a_quiet_lane(tmp_path):
+    """A stream that goes quiet after a burst must still shed its backlog."""
+    path = tmp_path / "dedup.sqlite"
+    store = fleet_bus.DurableEnvelopeDedupStore(str(path), ttl_s=fleet_bus.DEFAULT_DEDUP_TTL_S)
+    for index in range(50):
+        claim = store.claim(f"burst-{index}", f"req-{index}", now_s=0)
+        store.complete(f"burst-{index}", claim[2])
+    # No further claims arrive, so the every-N-claims trigger never fires.
+    assert store.prune_idle(fleet_bus.DEFAULT_DEDUP_TTL_S + 100) == 50
+    assert store._db.execute("SELECT COUNT(*) FROM envelope_dedup_v2").fetchone()[0] == 0
+
+
+def test_renew_holds_a_live_owner_past_the_original_expiry(tmp_path):
+    """The testable half of the P1: a still-running worker is not overlapped.
+
+    This does NOT assert exactly-once execution. Under the at-least-once
+    contract a crash after a side effect but before completion may duplicate;
+    what must never happen is a SECOND worker starting while the first is
+    alive and still executing.
+    """
+    path = tmp_path / "dedup.sqlite"
+    owner_store = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=2)
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=2)
+    duplicate, _, owner = owner_store.claim("long-turn", "original", now_s=100)
+    assert duplicate is False
+
+    # The turn outlives the original 2s lease, renewing as it goes.
+    assert owner_store.renew("long-turn", owner, now_s=101) is True
+    assert rival.claim("long-turn", "rival", now_s=102.5)[0] is True, "a live owner was overlapped"
+    assert owner_store.renew("long-turn", owner, now_s=103) is True
+    assert rival.claim("long-turn", "rival", now_s=104.5)[0] is True, "a live owner was overlapped"
+
+    # Owner dies. Recovery still works — that is the at-least-once half.
+    stolen = rival.claim("long-turn", "rival", now_s=200)
+    assert stolen[0] is False, "a dead owner's envelope was never recovered"
+    # And the original owner is now fenced: its completion must not land.
+    assert owner_store.complete("long-turn", owner) is False
+
+
+def test_complete_and_release_report_owner_loss(tmp_path):
+    path = tmp_path / "dedup.sqlite"
+    store = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=2)
+    _, _, owner = store.claim("env", "req", now_s=100)
+    assert store.complete("env", owner) is True
+    assert store.complete("env", "someone-else") is False
+    assert store.release("env", "someone-else") is False
 
 
 @pytest.mark.asyncio

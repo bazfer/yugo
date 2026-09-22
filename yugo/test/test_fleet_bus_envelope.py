@@ -272,6 +272,17 @@ def test_no_reject_code_enters_fleet_bus_without_a_row_in_the_table_above():
         "recipient_mismatch",
         "yugo_duplicate_envelope",
         "yugo_dedup_store_failed",
+        # The rest of the durable-dedup lifecycle, all adapter-scoped for the
+        # same reason as the two above. `_failed` codes are store faults
+        # contained per message so a SQLite error cannot end the lane;
+        # `owner_lost` and `lease_lost` are not faults at all — they record
+        # that another consumer holds the claim, which under the at-least-once
+        # execution contract is a visible duplicate rather than an error.
+        "yugo_dedup_complete_failed",
+        "yugo_dedup_release_failed",
+        "yugo_dedup_renew_failed",
+        "yugo_dedup_owner_lost",
+        "yugo_dedup_lease_lost",
     }
     source = Path(fleet_bus.__file__).read_text(encoding="utf-8")
     found = set(re.findall(r'error="([a-z_]+)"', source))

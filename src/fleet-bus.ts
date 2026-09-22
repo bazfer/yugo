@@ -25,6 +25,14 @@ export const MIN_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000
 export const DEFAULT_DEDUP_LEASE_MS = 60_000
 const DEDUP_PRUNE_EVERY = 256
 const DEDUP_PRUNE_LIMIT = 100
+// A single bounded batch cannot keep up: at 100 deleted per 256 admitted the
+// expired backlog grows ~156 rows per 256 arrivals. `prune` loops bounded
+// batches until drained or this budget is spent, and the budget is
+// deliberately larger than DEDUP_PRUNE_EVERY so a steady arrival stream loses
+// ground on every sweep rather than gaining it.
+export const DEDUP_PRUNE_BUDGET = 4 * DEDUP_PRUNE_EVERY
+// Renewal cadence for a live owner, as a fraction of the lease.
+export const DEDUP_LEASE_RENEW_RATIO = 0.4
 export const DEFAULT_ATTR_MAX_LEN = 1024
 export const DEFAULT_PAYLOAD_BODY_MAX_BYTES = 8192
 
@@ -119,6 +127,12 @@ export class DurableEnvelopeDedupStore {
 
   claim(envelopeId: string, reqId: string, nowMs = Date.now()): { duplicate: boolean; reqId: string; owner?: string } {
     const owner = randomUUID()
+    // `.immediate()`, not the default deferred wrapper. The first statement
+    // here is a write, so SQLite would upgrade anyway — but only at that
+    // statement, which leaves a window where two consumers both read before
+    // either writes. Taking the write lock up front is what makes the claim
+    // the concurrency arbiter it is documented to be, and it matches the
+    // Python port's `BEGIN IMMEDIATE`.
     const transaction = this.db.transaction(() => {
       this.claims += 1
       if (this.claims % DEDUP_PRUNE_EVERY === 0) this.prune(nowMs)
@@ -138,23 +152,76 @@ export class DurableEnvelopeDedupStore {
       }
       return { duplicate: true, reqId: row.req_id }
     })
-    return transaction()
+    return transaction.immediate()
   }
 
-  complete(envelopeId: string, owner: string): void {
-    this.db.query("UPDATE envelope_dedup_v2 SET state='completed' WHERE envelope_id=? AND lease_owner=? AND state='pending'")
-      .run(envelopeId, owner)
-  }
-
-  release(envelopeId: string, owner: string): void {
-    this.db.query("DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'")
-      .run(envelopeId, owner)
-  }
-
-  prune(nowMs = Date.now()): number {
+  /**
+   * Extend a live owner's lease. `false` means the lease was already lost and
+   * the caller must stop doing externally-visible work: another consumer holds
+   * the envelope, so anything from here on is the duplicate.
+   */
+  renew(envelopeId: string, owner: string, nowMs = Date.now()): boolean {
     return this.db.query(
-      'DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 WHERE first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?)',
-    ).run(nowMs - this.ttlMs, DEDUP_PRUNE_LIMIT).changes
+      "UPDATE envelope_dedup_v2 SET lease_until_ms=? WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+    ).run(nowMs + this.leaseMs, envelopeId, owner).changes === 1
+  }
+
+  /**
+   * Mark done. `false` means we no longer owned it, so we did NOT finish it —
+   * the in-memory fast paths key off this, and promoting a stale claim would
+   * suppress the real owner's result.
+   */
+  complete(envelopeId: string, owner: string): boolean {
+    return this.db.query("UPDATE envelope_dedup_v2 SET state='completed' WHERE envelope_id=? AND lease_owner=? AND state='pending'")
+      .run(envelopeId, owner).changes === 1
+  }
+
+  release(envelopeId: string, owner: string): boolean {
+    return this.db.query("DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'")
+      .run(envelopeId, owner).changes === 1
+  }
+
+  /**
+   * Delete expired claims in bounded batches until drained or out of budget.
+   *
+   * Bounded batches keep any single statement short; the LOOP is what lets
+   * cleanup outpace ingestion. At 100 deleted per 256 admitted the expired
+   * backlog grew ~156 rows per 256 arrivals. A short batch means the expired
+   * set is exhausted, so the loop stops without spending the rest of the budget.
+   */
+  prune(nowMs = Date.now(), budget = DEDUP_PRUNE_BUDGET): number {
+    const cutoff = nowMs - this.ttlMs
+    let deleted = 0
+    while (deleted < budget) {
+      const batch = Math.min(DEDUP_PRUNE_LIMIT, budget - deleted)
+      const n = this.db.query(
+        'DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 WHERE first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?)',
+      ).run(cutoff, batch).changes
+      deleted += n
+      if (n < batch) break // expired set exhausted
+    }
+    return deleted
+  }
+
+  /**
+   * Sweep on a quiet lane, where no claim arrives to trigger the counter.
+   * Without this a stream that goes quiet after a burst keeps its expired rows
+   * until the next arrival — the backlog survives exactly when there is most
+   * capacity to clear it.
+   */
+  pruneIdle(nowMs = Date.now()): number {
+    return this.prune(nowMs)
+  }
+
+  /** Row count. Test/ops introspection only — nothing on the hot path reads it. */
+  count(): number {
+    return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2').get() as { n: number }).n
+  }
+
+  /** Rows the TTL says should already be gone. The invariant a sweep must drive to zero. */
+  countExpired(nowMs = Date.now()): number {
+    return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2 WHERE first_seen_ms < ?')
+      .get(nowMs - this.ttlMs) as { n: number }).n
   }
 
   prunePlan(): string {
@@ -751,6 +818,47 @@ export class FleetBus {
     )
   }
 
+  /**
+   * Promote a claim, surviving a store fault and reporting owner loss.
+   *
+   * Every durable operation on this path is contained per message: a SQLite
+   * fault here must not reject the handler, which was the whole point of the
+   * claim-fault guard. Completion is the same class of risk and was not
+   * covered. Returns whether WE completed it — a lost owner must not populate
+   * the in-memory fast paths as a successful completion.
+   */
+  private completeClaim(subject: string, envelopeId: string, reqId: string, owner: string): boolean {
+    let won: boolean
+    try {
+      won = this.durableDedup.complete(envelopeId, owner)
+    } catch (error) {
+      this.recordAudit({
+        dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_complete_failed',
+        envelope_id: envelopeId, req_id: reqId, note: String(error),
+      })
+      return false
+    }
+    if (!won) {
+      this.recordAudit({
+        dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_owner_lost',
+        envelope_id: envelopeId, req_id: reqId,
+      })
+    }
+    return won
+  }
+
+  private releaseClaim(subject: string, envelopeId: string, reqId: string, owner: string): boolean {
+    try {
+      return this.durableDedup.release(envelopeId, owner)
+    } catch (error) {
+      this.recordAudit({
+        dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_release_failed',
+        envelope_id: envelopeId, req_id: reqId, note: String(error),
+      })
+      return false
+    }
+  }
+
   private claimDedup(subject: string, envelopeId: string, reqId: string) {
     try {
       return this.durableDedup.claim(envelopeId, reqId)
@@ -1110,7 +1218,7 @@ export class FleetBus {
             delivered_to_subscriber: true,
             reply: result.envelope,
           })
-          this.durableDedup.complete(result.envelope.id, owner)
+          this.completeClaim(subject, result.envelope.id, claim.reqId, owner)
           return
         }
         // A matching id is not sufficient: only the addressed bot may answer
@@ -1165,14 +1273,64 @@ export class FleetBus {
     this.receiveLedger.set(reqId, result.envelope)
     // Single dir:in audit per received envelope (dedup fix, round-3 P2).
     this.recordAudit({ dir: 'in', subject, envelope_id: result.envelope.id, req_id: reqId })
+    // Hold the lease for as long as the turn actually runs. Without this a
+    // turn longer than the lease is handed to a second consumer WHILE THE
+    // FIRST IS STILL EXECUTING — the one duplication window that is closable
+    // at this boundary. The post-effect/pre-commit window is not closable
+    // here; it is documented as at-least-once (SPEC, and yugo#24).
+    const stopRenewing = this.renewWhileRunning(subject, result.envelope.id, claim.reqId, claim.owner!)
     try {
       await this.injectIntoSession({ envelope: result.envelope, reqId })
-      this.durableDedup.complete(result.envelope.id, claim.owner!)
-      this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
+      stopRenewing()
+      // Only a claim we still OWNED counts as completed. Populating the
+      // in-memory fast path on a stale or failed completion would suppress
+      // the real owner's delivery.
+      if (this.completeClaim(subject, result.envelope.id, claim.reqId, claim.owner!)) {
+        this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
+      }
     } catch (error) {
-      this.durableDedup.release(result.envelope.id, claim.owner!)
+      stopRenewing()
+      this.releaseClaim(subject, result.envelope.id, claim.reqId, claim.owner!)
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
     }
+  }
+
+  /**
+   * Keep a live owner's lease fresh until the returned stop function is called.
+   *
+   * The cadence runs off a timer, so it cannot be stretched or skipped by a
+   * wall-clock step; the STORED deadline stays wall-clock because competing
+   * consumers in other processes compare it. What renewal buys is that a
+   * healthy owner keeps pushing its own deadline forward, so neither a slow
+   * turn nor a forward clock jump hands its envelope to a second worker.
+   */
+  private renewWhileRunning(subject: string, envelopeId: string, reqId: string, owner: string): () => void {
+    const intervalMs = Math.max(1_000, DEFAULT_DEDUP_LEASE_MS * DEDUP_LEASE_RENEW_RATIO)
+    const timer = setInterval(() => {
+      let held: boolean
+      try {
+        held = this.durableDedup.renew(envelopeId, owner)
+      } catch (error) {
+        clearInterval(timer)
+        this.recordAudit({
+          dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_renew_failed',
+          envelope_id: envelopeId, req_id: reqId, note: String(error),
+        })
+        return
+      }
+      if (!held) {
+        clearInterval(timer)
+        // Nothing here can cancel the in-flight turn, so record it: under the
+        // at-least-once contract this duplicate must be visible, not silent.
+        this.recordAudit({
+          dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_lease_lost',
+          envelope_id: envelopeId, req_id: reqId,
+        })
+      }
+    }, intervalMs)
+    // Never hold the event loop open for a lease timer.
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer) (timer as { unref: () => void }).unref()
+    return () => clearInterval(timer)
   }
 
   protected async onResult(message: Msg): Promise<void> {
@@ -1279,7 +1437,7 @@ export class FleetBus {
             req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
           })
           match.resolve({ ok: true, envelope: match.envelope, delivered_to_subscriber: true, reply: envelope })
-          this.durableDedup.complete(envelope.id, owner)
+          this.completeClaim(subject, envelope.id, claim.reqId, owner)
           return
         }
         // From mismatch — anti-hijack (P2-1). Do NOT resolve the waiter; treat
@@ -1336,10 +1494,10 @@ export class FleetBus {
     })
     try {
       await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId })
-      this.durableDedup.complete(envelope.id, claim.owner!)
+      this.completeClaim(subject, envelope.id, claim.reqId, claim.owner!)
       this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
     } catch (error) {
-      this.durableDedup.release(envelope.id, claim.owner!)
+      this.releaseClaim(subject, envelope.id, claim.reqId, claim.owner!)
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
     }
   }
@@ -1373,8 +1531,21 @@ export class FleetBus {
     this.subscriptions.add(subscription)
     void (async () => {
       try {
-        for await (const message of subscription) await handler(message)
+        for await (const message of subscription) {
+          // Contained PER MESSAGE. With the catch outside this loop, one
+          // rejected handler — a transient SQLITE_BUSY after the five-second
+          // timeout, a single bad envelope — ended the lane permanently on a
+          // healthy connection and heartbeat, so the bot looked alive and
+          // silently received nothing.
+          try {
+            await handler(message)
+          } catch (error) {
+            this.log(`subscription ${subject} handler failed, lane continues: ${String(error)}`)
+          }
+        }
       } catch (error) {
+        // Reaching here means the ITERATOR itself failed — the subscription is
+        // gone, not one message. That genuinely ends this lane.
         if (!this.nc?.isClosed()) this.log(`subscription ${subject} failed: ${String(error)}`)
       } finally {
         this.subscriptions.delete(subscription)

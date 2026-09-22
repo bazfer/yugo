@@ -30,6 +30,7 @@ import {
   type FleetBusConfig,
   type FleetBusSessionEvent,
   type TokenBucket,
+  DEDUP_PRUNE_BUDGET,
 } from './fleet-bus'
 
 const jc = JSONCodec()
@@ -49,15 +50,77 @@ describe('durable envelope dedup', () => {
     expect(restarted.prunePlan()).toContain('envelope_dedup_v2_first_seen')
   })
 
-  test('pruning uses the timestamp index and deletes at most its fixed budget', () => {
+  test('pruning uses the timestamp index and drains the expired set in bounded batches', () => {
     const store = new DurableEnvelopeDedupStore(':memory:', 10)
     for (let i = 0; i < 101; i += 1) {
       const claim = store.claim(`old-${i}`, `req-${i}`, 0)
       store.complete(`old-${i}`, claim.owner!)
     }
     expect(store.prunePlan()).toContain('envelope_dedup_v2_first_seen')
-    expect(store.prune(100)).toBe(100)
-    expect(store.prune(100)).toBe(1)
+    // Batches stay bounded, but the sweep LOOPS until drained. A single
+    // 100-row batch is what let the backlog grow ~156 rows per 256 arrivals.
+    expect(store.prune(100)).toBe(101)
+    expect(store.prune(100)).toBe(0)
+    expect(DEDUP_PRUNE_BUDGET).toBeGreaterThan(256)
+  })
+
+  test('pruning outpaces a steady arrival stream', () => {
+    // Ohm's reproduction, inverted into an invariant: 1,024 unique claims with
+    // synthetic time advancing past the TTL retained 624 rows under the
+    // single-batch prune, when only the newest should be live.
+    const ttl = 100
+    const store = new DurableEnvelopeDedupStore(':memory:', ttl)
+    for (let i = 0; i < 1_024; i += 1) {
+      const claim = store.claim(`stream-${i}`, `req-${i}`, i)
+      store.complete(`stream-${i}`, claim.owner!)
+    }
+    store.prune(1_024)
+    const live = store.count()
+    const expired = store.countExpired(1_024)
+    expect(expired).toBe(0)
+    expect(live).toBeLessThanOrEqual(ttl + 1)
+  })
+
+  test('pruneIdle sweeps a quiet lane', () => {
+    const store = new DurableEnvelopeDedupStore(':memory:', 10)
+    for (let i = 0; i < 50; i += 1) {
+      const claim = store.claim(`burst-${i}`, `req-${i}`, 0)
+      store.complete(`burst-${i}`, claim.owner!)
+    }
+    // No further claims arrive, so the every-N-claims trigger never fires.
+    expect(store.pruneIdle(100)).toBe(50)
+    expect(store.count()).toBe(0)
+  })
+
+  test('renewal holds a live owner past the original expiry', () => {
+    // The testable half of the P1. This does NOT assert exactly-once
+    // execution: under the at-least-once contract a crash after a side effect
+    // but before completion may duplicate. What must never happen is a SECOND
+    // worker starting while the first is alive and still executing.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const owner = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 2_000)
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 2_000)
+    const claim = owner.claim('long-turn', 'original', 100_000)
+    expect(claim.duplicate).toBe(false)
+
+    expect(owner.renew('long-turn', claim.owner!, 101_000)).toBe(true)
+    expect(rival.claim('long-turn', 'rival', 102_500).duplicate).toBe(true)
+    expect(owner.renew('long-turn', claim.owner!, 103_000)).toBe(true)
+    expect(rival.claim('long-turn', 'rival', 104_500).duplicate).toBe(true)
+
+    // Owner dies. Recovery still works — that is the at-least-once half.
+    expect(rival.claim('long-turn', 'rival', 200_000).duplicate).toBe(false)
+    // And the original owner is now fenced: its completion must not land.
+    expect(owner.complete('long-turn', claim.owner!)).toBe(false)
+    expect(owner.renew('long-turn', claim.owner!, 201_000)).toBe(false)
+  })
+
+  test('complete and release report owner loss instead of silently succeeding', () => {
+    const store = new DurableEnvelopeDedupStore(':memory:', DEFAULT_DEDUP_TTL_MS, 2_000)
+    const claim = store.claim('env', 'req', 100_000)
+    expect(store.complete('env', claim.owner!)).toBe(true)
+    expect(store.complete('env', 'someone-else')).toBe(false)
+    expect(store.release('env', 'someone-else')).toBe(false)
   })
 
   test('two store connections produce exactly one winner', () => {

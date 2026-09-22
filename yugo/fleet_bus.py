@@ -138,6 +138,19 @@ MIN_DEDUP_TTL_S = 7 * 24 * 60 * 60
 DEFAULT_DEDUP_LEASE_S = 60
 DEDUP_PRUNE_EVERY = 256
 DEDUP_PRUNE_LIMIT = 100
+# A single bounded batch cannot keep up: at 100 deleted per 256 admitted the
+# expired backlog grows ~156 rows per 256 arrivals. `prune` therefore loops
+# bounded batches until the expired set is drained or this budget is spent,
+# and the budget is deliberately larger than DEDUP_PRUNE_EVERY so a steady
+# arrival stream loses ground on every sweep rather than gaining it.
+DEDUP_PRUNE_BUDGET = 4 * DEDUP_PRUNE_EVERY
+# Renewal cadence for a live owner, as a fraction of the lease. Driven by a
+# MONOTONIC timer in-process: the stored lease_until_s stays wall-clock
+# because it is compared across processes, and a monotonic value is not
+# comparable outside the process that read it. What renewal buys is that a
+# healthy owner keeps pushing its own deadline forward, so neither a slow turn
+# nor a forward clock step can hand its envelope to a second worker.
+DEDUP_LEASE_RENEW_RATIO = 0.4
 
 _BOT_NAME_PATTERN = re.compile(r"[a-z0-9_-]+")
 
@@ -1075,6 +1088,17 @@ class AuditLog:
 # --- config ---
 
 
+async def _cancel_task(task: "asyncio.Task | None") -> None:
+    """Cancel a helper task and absorb its CancelledError, nothing else."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 class DurableEnvelopeDedupStore:
     """SQLite envelope-id claims retained for 8d (7d stream age + 1d slack).
 
@@ -1142,18 +1166,72 @@ class DurableEnvelopeDedupStore:
                 self._db.execute("ROLLBACK")
                 raise
 
-    def complete(self, envelope_id: str, owner: str) -> None:
-        self._db.execute("UPDATE envelope_dedup_v2 SET state='completed' WHERE envelope_id=? AND lease_owner=?", (envelope_id, owner))
+    def renew(self, envelope_id: str, owner: str, now_s: float | None = None) -> bool:
+        """Extend a live owner's lease. False means the lease was already lost.
 
-    def release(self, envelope_id: str, owner: str) -> None:
-        self._db.execute("DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'", (envelope_id, owner))
+        The caller MUST stop doing externally-visible work when this returns
+        False: another consumer has taken the envelope, and anything this turn
+        does from here on is the duplicate, not the original.
+        """
+        now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+        with self._lock:
+            return self._db.execute(
+                "UPDATE envelope_dedup_v2 SET lease_until_s=? "
+                "WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+                (now + self._lease_s, envelope_id, owner),
+            ).rowcount == 1
 
-    def prune(self, now_s: float) -> int:
-        return self._db.execute(
-            "DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 "
-            "WHERE first_seen_s < ? ORDER BY first_seen_s LIMIT ?)",
-            (now_s - self._ttl_s, DEDUP_PRUNE_LIMIT),
-        ).rowcount
+    def complete(self, envelope_id: str, owner: str) -> bool:
+        """Mark done. False means we no longer owned it, so we did NOT finish it.
+
+        A lost owner must not be recorded as a successful completion: the
+        in-memory fast paths key off this return, and promoting a stale claim
+        would suppress the real owner's result.
+        """
+        with self._lock:
+            return self._db.execute(
+                "UPDATE envelope_dedup_v2 SET state='completed' WHERE envelope_id=? AND lease_owner=?",
+                (envelope_id, owner),
+            ).rowcount == 1
+
+    def release(self, envelope_id: str, owner: str) -> bool:
+        with self._lock:
+            return self._db.execute(
+                "DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+                (envelope_id, owner),
+            ).rowcount == 1
+
+    def prune(self, now_s: float, budget: int = DEDUP_PRUNE_BUDGET) -> int:
+        """Delete expired claims in bounded batches until drained or out of budget.
+
+        Bounded batches keep any single statement short; the loop is what makes
+        cleanup able to OUTPACE ingestion. A short batch means the expired set
+        is exhausted, so the loop stops without spending the rest of the budget.
+        """
+        cutoff = now_s - self._ttl_s
+        deleted = 0
+        while deleted < budget:
+            batch = min(DEDUP_PRUNE_LIMIT, budget - deleted)
+            n = self._db.execute(
+                "DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 "
+                "WHERE first_seen_s < ? ORDER BY first_seen_s LIMIT ?)",
+                (cutoff, batch),
+            ).rowcount
+            deleted += n
+            if n < batch:  # expired set exhausted
+                break
+        return deleted
+
+    def prune_idle(self, now_s: float | None = None) -> int:
+        """Sweep on a quiet lane, where no claim arrives to trigger the counter.
+
+        Without this, a stream that goes quiet after a burst keeps its expired
+        rows until the next arrival — the backlog survives precisely when
+        there is most capacity to clear it.
+        """
+        now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+        with self._lock:
+            return self.prune(now)
 
 
 @dataclass(frozen=True)
@@ -1313,6 +1391,7 @@ class FleetBus:
         # Reported on every heartbeat from 3b. See create_heartbeat_envelope.
         self._injection_delivered_ts: str | None = None
         self._session_last_response_ts: str | None = None
+        self._dedup_lease_s = DEFAULT_DEDUP_LEASE_S
         self._dedup = DurableEnvelopeDedupStore(
             config.dedup_store_path or ":memory:", config.dedup_ttl_s
         )
@@ -1786,17 +1865,26 @@ class FleetBus:
                 kind=envelope["kind"],
                 **{"from": envelope["from"]},
             )
-            self._dedup.complete(envelope["id"], claim_owner)
+            self._complete_claim(subject, envelope, req_id, claim_owner)
             return
 
         self._injection_delivered_ts = _utc_now_iso()
+        # Renew while the turn runs. Without this a turn longer than the lease
+        # is handed to a second consumer WHILE THE FIRST IS STILL EXECUTING —
+        # the one duplication window that is actually closable here. The
+        # post-effect/pre-commit window is not closable at this boundary and is
+        # documented as at-least-once; see SPEC and yugo#24.
+        renewer = asyncio.create_task(
+            self._renew_claim_until_done(subject, envelope, req_id, claim_owner)
+        )
         try:
             reply = await self._on_envelope(envelope, req_id)
         # CancelledError is a BaseException and deliberately NOT caught: a
         # turn interrupted by shutdown is not a failed injection, and
         # swallowing the cancel here would stall `drain()` behind an LLM call.
         except BaseException as e:
-            self._dedup.release(envelope["id"], claim_owner)
+            await _cancel_task(renewer)
+            self._release_claim(subject, envelope, req_id, claim_owner)
             if isinstance(e, asyncio.CancelledError):
                 raise
             # Same reject code the TS peer writes when its `injectIntoSession`
@@ -1811,7 +1899,8 @@ class FleetBus:
                 error=repr(e),
             )
             return
-        self._dedup.complete(envelope["id"], claim_owner)
+        await _cancel_task(renewer)
+        self._complete_claim(subject, envelope, req_id, claim_owner)
         self._session_last_response_ts = _utc_now_iso()
         # Success is `dir="in"` carrying envelope identity AND the nonce —
         # the shape the TS port records from `injectIntoSession`. The audit
@@ -1846,6 +1935,73 @@ class FleetBus:
                 req_id=req_id,
                 error=repr(e),
             )
+
+    def _complete_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
+        """Promote a claim, surviving a store fault and reporting owner loss.
+
+        Every durable operation on this path is contained per message. A
+        SQLite fault here must not reject the handler and end the lane — that
+        was the whole point of the claim-fault guard, and completion is the
+        same class of risk.
+        """
+        try:
+            won = self._dedup.complete(envelope["id"], owner)
+        except Exception as e:
+            self._audit.record(
+                "drop", subject, reason="yugo_dedup_complete_failed",
+                id=envelope["id"], req_id=req_id, error=repr(e),
+            )
+            return False
+        if not won:
+            # Not an error path for THIS delivery — the work is done. It does
+            # mean another consumer holds the claim, so the caller must not
+            # record this as the authoritative completion.
+            self._audit.record(
+                "drop", subject, reason="yugo_dedup_owner_lost",
+                id=envelope["id"], req_id=req_id,
+            )
+        return won
+
+    def _release_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
+        try:
+            return self._dedup.release(envelope["id"], owner)
+        except Exception as e:
+            self._audit.record(
+                "drop", subject, reason="yugo_dedup_release_failed",
+                id=envelope["id"], req_id=req_id, error=repr(e),
+            )
+            return False
+
+    async def _renew_claim_until_done(
+        self, subject: str, envelope: dict, req_id: str, owner: str,
+    ) -> None:
+        """Hold the lease for as long as this turn is actually running.
+
+        Cadence comes off the event loop's MONOTONIC clock, so a wall-clock
+        step cannot stretch or skip the interval. The stored deadline stays
+        wall-clock because competing consumers compare it across processes.
+        Cancelled by the caller on both exits.
+        """
+        interval = max(1.0, self._dedup_lease_s * DEDUP_LEASE_RENEW_RATIO)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                held = self._dedup.renew(envelope["id"], owner)
+            except Exception as e:
+                self._audit.record(
+                    "drop", subject, reason="yugo_dedup_renew_failed",
+                    id=envelope["id"], req_id=req_id, error=repr(e),
+                )
+                return
+            if not held:
+                # Lease taken by another consumer. Nothing to cancel the turn
+                # with at this boundary; record it so the duplicate is visible
+                # rather than silent.
+                self._audit.record(
+                    "drop", subject, reason="yugo_dedup_lease_lost",
+                    id=envelope["id"], req_id=req_id,
+                )
+                return
 
     async def _warn_origin(self, subject: str, envelope: dict, req_id: str) -> None:
         """Tell `origin` that its baton has passed hop 8. v0.3d.
