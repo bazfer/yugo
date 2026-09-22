@@ -641,6 +641,114 @@ describe('request / publishReply / onResult', () => {
     expect(bus.outboundLedgerSize()).toBe(0)
   })
 
+  test('matching reply on .request resolves waiter without injection or publication change', async () => {
+    const nc = new FakeNatsConnection()
+    const injections: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async event => { injections.push(event) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+    await Promise.resolve()
+    const publishedEnv = nc.publishes[0]!.envelope as Envelope
+    const reply = {
+      envelope_version: 1, id: 'request-lane-reply-1', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: publishedEnv.id,
+      ts: '2026-08-27T00:00:00.000Z', payload: { done: true },
+    }
+
+    await bus.handleRequest(reply)
+    const result = await promise
+    expect(result.ok).toBe(true)
+    expect(result.reply?.id).toBe(reply.id)
+    expect(injections).toHaveLength(0)
+    expect(bus.outboundLedgerSize()).toBe(0)
+    // Expand changes consumption only: the adapter still publishes requests
+    // on `.request` and emits no migrated-lane reply of its own.
+    expect(nc.publishes.map(p => p.subject)).toEqual(['fleet.kat.request'])
+  })
+
+  test('same correlated reply on .request and .result resolves once and audits duplicate', async () => {
+    for (const firstLane of ['request', 'result'] as const) {
+      const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+      const auditLogPath = join(dir, 'fleet-bus.jsonl')
+      const nc = new FakeNatsConnection()
+      const injections: FleetBusSessionEvent[] = []
+      const bus = new TestFleetBus({
+        botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+        injectIntoSession: async event => { injections.push(event) },
+      }, allowlist)
+      bus.attachFakeNc(nc)
+
+      let resolutions = 0
+      const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+        .then(result => { resolutions += 1; return result })
+      await Promise.resolve()
+      const publishedEnv = nc.publishes[0]!.envelope as Envelope
+      const reply = {
+        envelope_version: 1, id: `dual-lane-reply-${firstLane}`, from: 'kat', to: 'vec',
+        kind: 'result', in_reply_to: publishedEnv.id,
+        ts: '2026-08-27T00:00:00.000Z', payload: {},
+      }
+
+      if (firstLane === 'request') {
+        await bus.handleRequest(reply)
+        await bus.handleResult(reply)
+      } else {
+        await bus.handleResult(reply)
+        await bus.handleRequest(reply)
+      }
+      await promise
+      expect(resolutions).toBe(1)
+      expect(injections).toHaveLength(0)
+      expect(readAudit(auditLogPath).some(
+        e => e.reason === 'claude_discord_adapter_duplicate_result_envelope',
+      )).toBe(true)
+    }
+  })
+
+  test('.request reply from wrong bot does not resolve waiter and injects as a fresh request', async () => {
+    const nc = new FakeNatsConnection()
+    const injections: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async event => { injections.push(event) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const promise = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+    await Promise.resolve()
+    const publishedEnv = nc.publishes[0]!.envelope as Envelope
+    await bus.handleRequest({
+      envelope_version: 1, id: 'request-lane-hijack-1', from: 'ohm', to: 'vec',
+      kind: 'result', in_reply_to: publishedEnv.id,
+      ts: '2026-08-27T00:00:00.000Z', payload: {},
+    })
+    expect(injections).toHaveLength(1)
+    expect(bus.outboundLedgerSize()).toBe(1)
+
+    await bus.handleResult({
+      envelope_version: 1, id: 'request-lane-correct-1', from: 'kat', to: 'vec',
+      kind: 'result', in_reply_to: publishedEnv.id,
+      ts: '2026-08-27T00:00:00.000Z', payload: {},
+    })
+    expect((await promise).ok).toBe(true)
+  })
+
+  test('unmatched in_reply_to on .request remains a fresh request', async () => {
+    const injections: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async event => { injections.push(event) },
+    }, allowlist)
+
+    await bus.handleRequest(envelope({ id: 'unmatched-request-reply', in_reply_to: 'not-in-ledger' }))
+    expect(injections).toHaveLength(1)
+    expect(injections[0]!.envelope.id).toBe('unmatched-request-reply')
+  })
+
   test('request({wait:true}) resolves timed_out after timeoutMs elapses', async () => {
     const nc = new FakeNatsConnection()
     const bus = new TestFleetBus({
