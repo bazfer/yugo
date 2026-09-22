@@ -9,6 +9,7 @@ import {
   BatonHopsExhausted,
   DEFAULT_MAX_ENVELOPE_BYTES,
   DEFAULT_PAYLOAD_BODY_MAX_BYTES,
+  DurableEnvelopeDedupStore,
   FixedWindowBucket,
   FleetBus,
   RESERVED_BOT_NAMES,
@@ -25,12 +26,34 @@ import {
   validateEnvelope,
   type Envelope,
   type FleetBusRequestResult,
+  type FleetBusConfig,
   type FleetBusSessionEvent,
   type TokenBucket,
 } from './fleet-bus'
 
 const jc = JSONCodec()
 const allowlist = normalizeAllowlist(['luna', 'deet', 'kat', 'vec', 'ohm', 'myc', 'helm'])
+
+describe('durable envelope dedup', () => {
+  test('survives restart, reports original req_id, and expires after TTL', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const first = new DurableEnvelopeDedupStore(path, 100)
+    expect(first.claim('env-1', 'req-original', 1_000)).toEqual({ duplicate: false, reqId: 'req-original' })
+    const restarted = new DurableEnvelopeDedupStore(path, 100)
+    expect(restarted.claim('env-1', 'req-new', 1_050)).toEqual({ duplicate: true, reqId: 'req-original' })
+    expect(restarted.claim('env-1', 'req-after-ttl', 1_101)).toEqual({ duplicate: false, reqId: 'req-after-ttl' })
+  })
+
+  test('two store connections produce exactly one winner', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const left = new DurableEnvelopeDedupStore(path)
+    const right = new DurableEnvelopeDedupStore(path)
+    const claims = [left.claim('raced', 'left'), right.claim('raced', 'right')]
+    expect(claims.filter(claim => !claim.duplicate)).toHaveLength(1)
+    expect(claims.filter(claim => claim.duplicate)).toHaveLength(1)
+    expect(claims[1]!.reqId).toBe('left')
+  })
+})
 
 function envelope(overrides: Record<string, unknown> = {}) {
   return {
@@ -332,6 +355,9 @@ function fakeMessage(subject: string, envelope: unknown): Msg {
 }
 
 class TestFleetBus extends FleetBus {
+  constructor(config: FleetBusConfig, allowed: ReadonlySet<string>) {
+    super({ ...config, dedupStorePath: config.dedupStorePath ?? ':memory:' }, allowed)
+  }
   attachFakeNc(nc: FakeNatsConnection): void {
     (this as unknown as { nc: FakeNatsConnection }).nc = nc
   }
@@ -362,6 +388,28 @@ class TestFleetBus extends FleetBus {
 }
 
 describe('request session injection', () => {
+  test('durable duplicate across adapter restart is dropped with original req_id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-dedup-restart-'))
+    const dedupStorePath = join(dir, 'dedup.sqlite')
+    const auditLogPath = join(dir, 'audit.jsonl')
+    const events: FleetBusSessionEvent[] = []
+    const config: FleetBusConfig = {
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStorePath, auditLogPath,
+      injectIntoSession: async event => { events.push(event) },
+    }
+    const wire = envelope({ id: 'restart-duplicate', to: 'vec' })
+    await new TestFleetBus(config, allowlist).handleRequest(wire)
+    const originalReqId = events[0]!.reqId
+    await new TestFleetBus(config, allowlist).handleRequest(wire)
+
+    expect(events).toHaveLength(1)
+    expect(readAudit(auditLogPath).some(entry =>
+      entry.reason === 'claude_discord_adapter_duplicate_envelope'
+      && entry.req_id === originalReqId,
+    )).toBe(true)
+  })
+
   test('injects an allowlisted envelope with a distinct server nonce', async () => {
     const events: Array<{ envelope: { from: string }; reqId: string }> = []
     const bus = new TestFleetBus({
@@ -1338,10 +1386,9 @@ describe('envelope-id dedup', () => {
     expect(drops[0]!.req_id).toBe(firstReqId)
   })
 
-  test('seenResult ledger is bounded — envelopes evicted past cap can re-inject (mutation witness)', async () => {
-    // Mutation witness: if the seen ledger were unbounded, ANY duplicate ever
-    // would drop; if the cap were bypassed, the same. Fill to cap+1, verify
-    // the first envelope's id has evicted, and its duplicate re-injects.
+  test('bounded memory eviction cannot disagree with durable dedup source of truth', async () => {
+    // Fill the fast-path LRU past capacity. The durable store must still block
+    // the evicted id rather than letting cache eviction become reprocessing.
     const nc = new FakeNatsConnection()
     const events: FleetBusSessionEvent[] = []
     const bus = new TestFleetBus({
@@ -1365,16 +1412,27 @@ describe('envelope-id dedup', () => {
     expect(bus.seenResultLedgerHas('cap-b')).toBe(true)
     expect(bus.seenResultLedgerHas('cap-c')).toBe(true)
 
-    // Duplicate of 'cap-a' — the seen entry has evicted, so this re-injects.
-    // (Unbounded dedup would still block it; broken dedup would block it too.
-    // Only a bounded-LRU dedup lets this through as expected.)
+    // Duplicate of 'cap-a' — absent from memory, still present durably.
     await bus.handleResult(makeReply('cap-a'))
-    expect(events).toHaveLength(4)
-    expect(events[3]!.envelope.id).toBe('cap-a')
+    expect(events).toHaveLength(3)
 
     // Duplicate of 'cap-c' — still in seen ledger, must drop.
     await bus.handleResult(makeReply('cap-c'))
-    expect(events).toHaveLength(4)
+    expect(events).toHaveLength(3)
+  })
+
+  test('memory fast path expires with durable TTL and cannot overrule it', async () => {
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupTtlMs: 1,
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    const wire = envelope({ id: 'ttl-cache-agreement', to: 'vec' })
+    await bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await bus.handleRequest(wire)
+    expect(events).toHaveLength(2)
   })
 
   test('late-reply duplicate — first tags lateReplyEnvId, second drops (does NOT re-inject untagged)', async () => {

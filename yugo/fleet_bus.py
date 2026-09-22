@@ -13,8 +13,8 @@ out: the answer is published back to the sender automatically, and any `<BUS
 to="...">` tag in it publishes to a THIRD party. 3d makes this adapter a
 PARTICIPANT in the baton protocol rather than a conduit for it — see the
 section below — and the shared in-tree envelope contract is 3e. Nothing here touches
-JetStream — no durable consumers, no DeliverPolicy, no dedup store. Those
-arrive with FB-3 (see SPEC §15 "JetStream migration").
+JetStream — no durable consumers or DeliverPolicy. Envelope-id deduplication is
+durable in SQLite so at-least-once relay delivery is safe across restarts.
 
 **Baton participation (3d).** §15's one-line summary of this slice is "baton
 field pass-through on inbound + outbound". Read literally that means carry the
@@ -64,6 +64,8 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
+import threading
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -131,6 +133,7 @@ AUDIT_RAW_MAX_CHARS = 200
 DEFAULT_MANIFEST_PATH = "/vault/infra/fleet-manifest.yaml"
 DEFAULT_AUDIT_LOG = "/root/.claude/fleet-bus-log.jsonl"
 DEFAULT_URL = "nats://nats:4222"
+DEFAULT_DEDUP_TTL_S = 8 * 24 * 60 * 60
 
 _BOT_NAME_PATTERN = re.compile(r"[a-z0-9_-]+")
 
@@ -1068,6 +1071,41 @@ class AuditLog:
 # --- config ---
 
 
+class DurableEnvelopeDedupStore:
+    """SQLite envelope-id claims retained for 8d (7d stream age + 1d slack).
+
+    A primary-key INSERT OR IGNORE is the concurrency arbiter. The lock
+    serializes this adapter's callbacks on one connection; the UNIQUE key also
+    makes competing processes deterministic.
+    """
+
+    def __init__(self, path: str, ttl_s: int = DEFAULT_DEDUP_TTL_S) -> None:
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        self._db.execute("PRAGMA busy_timeout=5000")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS envelope_dedup ("
+            "envelope_id TEXT PRIMARY KEY, first_seen_s REAL NOT NULL, req_id TEXT NOT NULL)"
+        )
+        self._ttl_s = ttl_s
+        self._lock = threading.Lock()
+
+    def claim(self, envelope_id: str, req_id: str, now_s: float | None = None) -> tuple[bool, str]:
+        now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+        with self._lock:
+            self._db.execute("DELETE FROM envelope_dedup WHERE first_seen_s < ?", (now - self._ttl_s,))
+            cursor = self._db.execute(
+                "INSERT OR IGNORE INTO envelope_dedup VALUES (?,?,?)", (envelope_id, now, req_id)
+            )
+            if cursor.rowcount == 1:
+                return False, req_id
+            original = self._db.execute(
+                "SELECT req_id FROM envelope_dedup WHERE envelope_id=?", (envelope_id,)
+            ).fetchone()[0]
+            return True, original
+
+
 @dataclass(frozen=True)
 class FleetBusConfig:
     bot_name: str
@@ -1081,6 +1119,8 @@ class FleetBusConfig:
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S
     reconnect_time_wait_s: float = DEFAULT_RECONNECT_TIME_WAIT_S
     drain_timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S
+    dedup_store_path: str | None = None
+    dedup_ttl_s: int = DEFAULT_DEDUP_TTL_S
 
 
 def bus_enabled(env: dict[str, str] | None = None) -> bool:
@@ -1168,6 +1208,8 @@ def load_config_from_env(
         allowed_from=frozenset(allowed_from),
         plugin_version=plugin_version,
         audit_log_path=source.get("FLEET_BUS_AUDIT_LOG", "").strip() or DEFAULT_AUDIT_LOG,
+        dedup_store_path=(source.get("YUGO_DEDUP_STORE_PATH", "").strip()
+                          or f"/var/lib/yugo/{bot_name}-dedup.sqlite"),
     )
 
 
@@ -1221,6 +1263,9 @@ class FleetBus:
         # Reported on every heartbeat from 3b. See create_heartbeat_envelope.
         self._injection_delivered_ts: str | None = None
         self._session_last_response_ts: str | None = None
+        self._dedup = DurableEnvelopeDedupStore(
+            config.dedup_store_path or ":memory:", config.dedup_ttl_s
+        )
 
     @property
     def subjects(self) -> tuple[str, ...]:
@@ -1655,14 +1700,21 @@ class FleetBus:
             return
 
         # Consumer-local nonce, like the TS port's `randomBytes(16)`. NOT the
-        # envelope id: ids are sender-chosen and there is no de-dup store
-        # until FB-3, so two turns may legitimately carry the same one. The
+        # envelope id: the nonce identifies what processing did with the
+        # stable wire id and is persisted by the durable de-dup store. The
         # frame contract also requires `req_id !== envelope.id`. From 3c it is
         # also the correlation key: every envelope this turn publishes carries
         # it on its `out` line — and from 3d that includes the hop-8 warning,
         # which is why the nonce is minted BEFORE the session hook is checked
         # rather than inside the branch that has one.
         req_id = uuid.uuid4().hex
+        duplicate, original_req_id = self._dedup.claim(envelope["id"], req_id)
+        if duplicate:
+            self._audit.record(
+                "drop", subject, reason="yugo_duplicate_envelope",
+                id=envelope["id"], req_id=original_req_id,
+            )
+            return
 
         if isinstance(hops, int) and hops >= BATON_HOPS_WARN_AT:
             await self._warn_origin(subject, envelope, req_id)

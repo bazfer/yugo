@@ -18,6 +18,9 @@ services:
     env_file: .env
     volumes:
       - ./persona.md:/root/persona.md:ro
+      # Persistent envelope-id dedup (8d TTL). Required once the bus is enabled
+      # so a container restart cannot forget already-processed deliveries.
+      - ./adapter-state:/var/lib/yugo
       # Tool declarations (v0.4b, SPEC §9). READ-ONLY is the control, not a
       # nicety: the mount is what makes a capability grant tamper-proof, and
       # it is why grants do not live in persona.md. Uncomment when the bot is

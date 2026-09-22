@@ -9,6 +9,8 @@ import {
 import { randomBytes, randomUUID } from 'node:crypto'
 import { appendFileSync, chmodSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { homedir } from 'node:os'
+import { Database } from 'bun:sqlite'
 import { parse as parseYaml } from 'yaml'
 
 export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
@@ -18,6 +20,7 @@ export const DEFAULT_EVICTED_LEDGER_CAP = 1000
 export const DEFAULT_SEEN_RESULT_LEDGER_CAP = 1000
 export const DEFAULT_SEEN_REQUEST_LEDGER_CAP = 1000
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+export const DEFAULT_DEDUP_TTL_MS = 8 * 24 * 60 * 60 * 1000
 export const DEFAULT_ATTR_MAX_LEN = 1024
 export const DEFAULT_PAYLOAD_BODY_MAX_BYTES = 8192
 
@@ -56,6 +59,8 @@ export interface FleetBusConfig {
   evictedLedgerCap?: number
   seenResultLedgerCap?: number
   seenRequestLedgerCap?: number
+  dedupStorePath?: string
+  dedupTtlMs?: number
   rateLimiters?: FleetBusRateLimiters
   supervisorSleepMs?: number
   /**
@@ -72,6 +77,42 @@ export interface FleetBusSessionEvent {
   unsolicited?: boolean
   /** Set when this envelope is a late reply to a request whose waiter was already evicted. */
   lateReplyEnvId?: string
+}
+
+/** Durable source of truth for envelope-id deduplication.
+ *
+ * Eight days exceeds the broker's seven-day max_age by one day, so every
+ * possible redelivery remains covered without retaining history forever.
+ * INSERT OR IGNORE against the primary key makes concurrent claims
+ * deterministic: exactly one caller inserts and every loser reads its reqId.
+ */
+export class DurableEnvelopeDedupStore {
+  private readonly db: Database
+
+  constructor(path: string, private readonly ttlMs = DEFAULT_DEDUP_TTL_MS) {
+    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
+    this.db = new Database(path, { create: true })
+    this.db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000')
+    this.db.exec(`CREATE TABLE IF NOT EXISTS envelope_dedup (
+      envelope_id TEXT PRIMARY KEY,
+      first_seen_ms INTEGER NOT NULL,
+      req_id TEXT NOT NULL
+    )`)
+  }
+
+  claim(envelopeId: string, reqId: string, nowMs = Date.now()): { duplicate: boolean; reqId: string } {
+    const transaction = this.db.transaction(() => {
+      this.db.query('DELETE FROM envelope_dedup WHERE first_seen_ms < ?').run(nowMs - this.ttlMs)
+      const inserted = this.db.query(
+        'INSERT OR IGNORE INTO envelope_dedup(envelope_id,first_seen_ms,req_id) VALUES (?,?,?)',
+      ).run(envelopeId, nowMs, reqId)
+      if (inserted.changes === 1) return { duplicate: false, reqId }
+      const row = this.db.query('SELECT req_id FROM envelope_dedup WHERE envelope_id=?')
+        .get(envelopeId) as { req_id: string }
+      return { duplicate: true, reqId: row.req_id }
+    })
+    return transaction()
+  }
 }
 
 export interface FleetBusFrameMeta {
@@ -628,6 +669,8 @@ export class FleetBus {
   // first-handle lets the drop audit correlate back to the original turn.
   private readonly seenResultEnvelopes: BoundedLru<string, { reqId: string; ts: number }>
   private readonly seenRequestEnvelopes: BoundedLru<string, { reqId: string; ts: number }>
+  private readonly durableDedup: DurableEnvelopeDedupStore
+  private readonly dedupTtlMs: number
   private readonly rateLimiters: FleetBusRateLimiters
   private readonly connectFn: (options: ConnectionOptions) => Promise<NatsConnection>
   private supervisorStopping = false
@@ -652,6 +695,23 @@ export class FleetBus {
     this.seenRequestEnvelopes = new BoundedLru<string, { reqId: string; ts: number }>(
       config.seenRequestLedgerCap ?? DEFAULT_SEEN_REQUEST_LEDGER_CAP,
     )
+    this.dedupTtlMs = config.dedupTtlMs ?? DEFAULT_DEDUP_TTL_MS
+    this.durableDedup = new DurableEnvelopeDedupStore(
+      config.dedupStorePath ?? `${homedir()}/.claude/fleet-bus-dedup-${config.botName}.sqlite`,
+      this.dedupTtlMs,
+    )
+  }
+
+  private freshSeen(
+    ledger: BoundedLru<string, { reqId: string; ts: number }>,
+    envelopeId: string,
+  ): { reqId: string; ts: number } | undefined {
+    const seen = ledger.get(envelopeId)
+    if (seen !== undefined && Date.now() - seen.ts >= this.dedupTtlMs) {
+      ledger.delete(envelopeId)
+      return undefined
+    }
+    return seen
   }
 
   async connect(): Promise<void> {
@@ -957,7 +1017,7 @@ export class FleetBus {
     // on both lanes during migration and must resolve exactly once.
     const inReplyTo = result.envelope.in_reply_to
     if (inReplyTo !== undefined) {
-      const seenResult = this.seenResultEnvelopes.get(result.envelope.id)
+      const seenResult = this.freshSeen(this.seenResultEnvelopes, result.envelope.id)
       if (seenResult !== undefined) {
         this.recordAudit({
           dir: 'drop',
@@ -972,6 +1032,11 @@ export class FleetBus {
       const match = this.outboundLedger.get(inReplyTo)
       if (match !== undefined) {
         if (result.envelope.from === match.expectedFrom) {
+          const claim = this.durableDedup.claim(result.envelope.id, match.reqId)
+          if (claim.duplicate) {
+            this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
+            return
+          }
           clearTimeout(match.timerId)
           this.outboundLedger.delete(inReplyTo)
           this.seenResultEnvelopes.set(result.envelope.id, { reqId: match.reqId, ts: Date.now() })
@@ -1007,7 +1072,7 @@ export class FleetBus {
     // turn. Separate ledger from seenResultEnvelopes so a peer with the same
     // wire id on both subjects (protocol violation, but possible) can't
     // silently swallow one side.
-    const seenRequest = this.seenRequestEnvelopes.get(result.envelope.id)
+    const seenRequest = this.freshSeen(this.seenRequestEnvelopes, result.envelope.id)
     if (seenRequest !== undefined) {
       this.recordAudit({
         dir: 'drop',
@@ -1029,6 +1094,11 @@ export class FleetBus {
     }
 
     const reqId = randomBytes(16).toString('hex')
+    const claim = this.durableDedup.claim(result.envelope.id, reqId)
+    if (claim.duplicate) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
+      return
+    }
     this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
     this.receiveLedger.set(reqId, result.envelope)
     // Single dir:in audit per received envelope (dedup fix, round-3 P2).
@@ -1103,7 +1173,7 @@ export class FleetBus {
     // tag on the second arrival). Runs AFTER validate/recipient/rate-limit
     // gates so a flood of duplicates from a bad peer still hits per-from/
     // per-subject limits first.
-    const seenResult = this.seenResultEnvelopes.get(envelope.id)
+    const seenResult = this.freshSeen(this.seenResultEnvelopes, envelope.id)
     if (seenResult !== undefined) {
       this.recordAudit({
         dir: 'drop',
@@ -1120,6 +1190,11 @@ export class FleetBus {
       const match = this.outboundLedger.get(inReplyTo)
       if (match !== undefined) {
         if (envelope.from === match.expectedFrom) {
+          const claim = this.durableDedup.claim(envelope.id, match.reqId)
+          if (claim.duplicate) {
+            this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId })
+            return
+          }
           // Ledger-matched .result: resolve the outstanding waiter and BYPASS
           // perSessionInject — this resolves an already-running tool call
           // rather than initiating a new session turn (P2-5). Preserve the
@@ -1170,6 +1245,11 @@ export class FleetBus {
       return
     }
     const reqId = randomBytes(16).toString('hex')
+    const claim = this.durableDedup.claim(envelope.id, reqId)
+    if (claim.duplicate) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId })
+      return
+    }
     // Round-8 P2: any inject path that reaches this line has committed a
     // session turn to this envelope; a duplicate arriving later must be
     // deduped so we don't burn another turn on the same wire id.
