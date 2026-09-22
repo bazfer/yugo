@@ -21,6 +21,10 @@ export const DEFAULT_SEEN_RESULT_LEDGER_CAP = 1000
 export const DEFAULT_SEEN_REQUEST_LEDGER_CAP = 1000
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 export const DEFAULT_DEDUP_TTL_MS = 8 * 24 * 60 * 60 * 1000
+export const MIN_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000
+export const DEFAULT_DEDUP_LEASE_MS = 60_000
+const DEDUP_PRUNE_EVERY = 256
+const DEDUP_PRUNE_LIMIT = 100
 export const DEFAULT_ATTR_MAX_LEN = 1024
 export const DEFAULT_PAYLOAD_BODY_MAX_BYTES = 8192
 
@@ -61,6 +65,7 @@ export interface FleetBusConfig {
   seenRequestLedgerCap?: number
   dedupStorePath?: string
   dedupTtlMs?: number
+  dedupStore?: DurableEnvelopeDedupStore
   rateLimiters?: FleetBusRateLimiters
   supervisorSleepMs?: number
   /**
@@ -88,30 +93,74 @@ export interface FleetBusSessionEvent {
  */
 export class DurableEnvelopeDedupStore {
   private readonly db: Database
+  private claims = 0
 
-  constructor(path: string, private readonly ttlMs = DEFAULT_DEDUP_TTL_MS) {
+  constructor(
+    path: string,
+    private readonly ttlMs = DEFAULT_DEDUP_TTL_MS,
+    private readonly leaseMs = DEFAULT_DEDUP_LEASE_MS,
+  ) {
+    if (path !== ':memory:' && ttlMs < MIN_DEDUP_TTL_MS) {
+      throw new RangeError('durable dedup TTL must be at least the 7-day stream max_age')
+    }
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
     this.db = new Database(path, { create: true })
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000')
-    this.db.exec(`CREATE TABLE IF NOT EXISTS envelope_dedup (
+    this.db.exec(`CREATE TABLE IF NOT EXISTS envelope_dedup_v2 (
       envelope_id TEXT PRIMARY KEY,
       first_seen_ms INTEGER NOT NULL,
-      req_id TEXT NOT NULL
+      req_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','completed')),
+      lease_owner TEXT NOT NULL,
+      lease_until_ms INTEGER NOT NULL
     )`)
+    this.db.exec('CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_ms)')
   }
 
-  claim(envelopeId: string, reqId: string, nowMs = Date.now()): { duplicate: boolean; reqId: string } {
+  claim(envelopeId: string, reqId: string, nowMs = Date.now()): { duplicate: boolean; reqId: string; owner?: string } {
+    const owner = randomUUID()
     const transaction = this.db.transaction(() => {
-      this.db.query('DELETE FROM envelope_dedup WHERE first_seen_ms < ?').run(nowMs - this.ttlMs)
+      this.claims += 1
+      if (this.claims % DEDUP_PRUNE_EVERY === 0) this.prune(nowMs)
+      this.db.query('DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND first_seen_ms < ?')
+        .run(envelopeId, nowMs - this.ttlMs)
       const inserted = this.db.query(
-        'INSERT OR IGNORE INTO envelope_dedup(envelope_id,first_seen_ms,req_id) VALUES (?,?,?)',
-      ).run(envelopeId, nowMs, reqId)
-      if (inserted.changes === 1) return { duplicate: false, reqId }
-      const row = this.db.query('SELECT req_id FROM envelope_dedup WHERE envelope_id=?')
-        .get(envelopeId) as { req_id: string }
+        "INSERT OR IGNORE INTO envelope_dedup_v2 VALUES (?,?,?,'pending',?,?)",
+      ).run(envelopeId, nowMs, reqId, owner, nowMs + this.leaseMs)
+      if (inserted.changes === 1) return { duplicate: false, reqId, owner }
+      const row = this.db.query('SELECT req_id,state,lease_until_ms FROM envelope_dedup_v2 WHERE envelope_id=?')
+        .get(envelopeId) as { req_id: string; state: string; lease_until_ms: number }
+      if (row.state === 'pending' && row.lease_until_ms <= nowMs) {
+        const recovered = this.db.query(
+          "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_ms=? WHERE envelope_id=? AND state='pending' AND lease_until_ms<=?",
+        ).run(owner, nowMs + this.leaseMs, envelopeId, nowMs)
+        if (recovered.changes === 1) return { duplicate: false, reqId: row.req_id, owner }
+      }
       return { duplicate: true, reqId: row.req_id }
     })
     return transaction()
+  }
+
+  complete(envelopeId: string, owner: string): void {
+    this.db.query("UPDATE envelope_dedup_v2 SET state='completed' WHERE envelope_id=? AND lease_owner=? AND state='pending'")
+      .run(envelopeId, owner)
+  }
+
+  release(envelopeId: string, owner: string): void {
+    this.db.query("DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'")
+      .run(envelopeId, owner)
+  }
+
+  prune(nowMs = Date.now()): number {
+    return this.db.query(
+      'DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 WHERE first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?)',
+    ).run(nowMs - this.ttlMs, DEDUP_PRUNE_LIMIT).changes
+  }
+
+  prunePlan(): string {
+    return this.db.query(
+      'EXPLAIN QUERY PLAN SELECT rowid FROM envelope_dedup_v2 WHERE first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?',
+    ).all(0, DEDUP_PRUNE_LIMIT).map(row => JSON.stringify(row)).join(' ')
   }
 }
 
@@ -696,10 +745,19 @@ export class FleetBus {
       config.seenRequestLedgerCap ?? DEFAULT_SEEN_REQUEST_LEDGER_CAP,
     )
     this.dedupTtlMs = config.dedupTtlMs ?? DEFAULT_DEDUP_TTL_MS
-    this.durableDedup = new DurableEnvelopeDedupStore(
+    this.durableDedup = config.dedupStore ?? new DurableEnvelopeDedupStore(
       config.dedupStorePath ?? `${homedir()}/.claude/fleet-bus-dedup-${config.botName}.sqlite`,
       this.dedupTtlMs,
     )
+  }
+
+  private claimDedup(subject: string, envelopeId: string, reqId: string) {
+    try {
+      return this.durableDedup.claim(envelopeId, reqId)
+    } catch (error) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_store_failed', envelope_id: envelopeId, req_id: reqId, error: String(error) })
+      return undefined
+    }
   }
 
   private freshSeen(
@@ -1032,11 +1090,13 @@ export class FleetBus {
       const match = this.outboundLedger.get(inReplyTo)
       if (match !== undefined) {
         if (result.envelope.from === match.expectedFrom) {
-          const claim = this.durableDedup.claim(result.envelope.id, match.reqId)
+          const claim = this.claimDedup(subject, result.envelope.id, match.reqId)
+          if (claim === undefined) return
           if (claim.duplicate) {
             this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
             return
           }
+          const owner = claim.owner!
           clearTimeout(match.timerId)
           this.outboundLedger.delete(inReplyTo)
           this.seenResultEnvelopes.set(result.envelope.id, { reqId: match.reqId, ts: Date.now() })
@@ -1050,6 +1110,7 @@ export class FleetBus {
             delivered_to_subscriber: true,
             reply: result.envelope,
           })
+          this.durableDedup.complete(result.envelope.id, owner)
           return
         }
         // A matching id is not sufficient: only the addressed bot may answer
@@ -1093,19 +1154,25 @@ export class FleetBus {
       return
     }
 
-    const reqId = randomBytes(16).toString('hex')
-    const claim = this.durableDedup.claim(result.envelope.id, reqId)
+    let reqId = randomBytes(16).toString('hex')
+    const claim = this.claimDedup(subject, result.envelope.id, reqId)
+    if (claim === undefined) return
     if (claim.duplicate) {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
       return
     }
-    this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
+    reqId = claim.reqId
     this.receiveLedger.set(reqId, result.envelope)
     // Single dir:in audit per received envelope (dedup fix, round-3 P2).
     this.recordAudit({ dir: 'in', subject, envelope_id: result.envelope.id, req_id: reqId })
-    await this.injectIntoSession({ envelope: result.envelope, reqId }).catch(error => {
+    try {
+      await this.injectIntoSession({ envelope: result.envelope, reqId })
+      this.durableDedup.complete(result.envelope.id, claim.owner!)
+      this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
+    } catch (error) {
+      this.durableDedup.release(result.envelope.id, claim.owner!)
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
-    })
+    }
   }
 
   protected async onResult(message: Msg): Promise<void> {
@@ -1190,11 +1257,13 @@ export class FleetBus {
       const match = this.outboundLedger.get(inReplyTo)
       if (match !== undefined) {
         if (envelope.from === match.expectedFrom) {
-          const claim = this.durableDedup.claim(envelope.id, match.reqId)
+          const claim = this.claimDedup(subject, envelope.id, match.reqId)
+          if (claim === undefined) return
           if (claim.duplicate) {
             this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId })
             return
           }
+          const owner = claim.owner!
           // Ledger-matched .result: resolve the outstanding waiter and BYPASS
           // perSessionInject — this resolves an already-running tool call
           // rather than initiating a new session turn (P2-5). Preserve the
@@ -1210,6 +1279,7 @@ export class FleetBus {
             req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
           })
           match.resolve({ ok: true, envelope: match.envelope, delivered_to_subscriber: true, reply: envelope })
+          this.durableDedup.complete(envelope.id, owner)
           return
         }
         // From mismatch — anti-hijack (P2-1). Do NOT resolve the waiter; treat
@@ -1244,16 +1314,17 @@ export class FleetBus {
       })
       return
     }
-    const reqId = randomBytes(16).toString('hex')
-    const claim = this.durableDedup.claim(envelope.id, reqId)
+    let reqId = randomBytes(16).toString('hex')
+    const claim = this.claimDedup(subject, envelope.id, reqId)
+    if (claim === undefined) return
     if (claim.duplicate) {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId })
       return
     }
+    reqId = claim.reqId
     // Round-8 P2: any inject path that reaches this line has committed a
     // session turn to this envelope; a duplicate arriving later must be
     // deduped so we don't burn another turn on the same wire id.
-    this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
     this.receiveLedger.set(reqId, envelope)
     this.recordAudit({
       dir: 'in',
@@ -1263,9 +1334,14 @@ export class FleetBus {
       note: lateReplyEnvId !== undefined ? 'claude_discord_adapter_late_reply' : 'claude_discord_adapter_unsolicited_reply',
       ...(lateReplyEnvId !== undefined ? { late_reply_env_id: lateReplyEnvId } : {}),
     })
-    await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId }).catch(error => {
+    try {
+      await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId })
+      this.durableDedup.complete(envelope.id, claim.owner!)
+      this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
+    } catch (error) {
+      this.durableDedup.release(envelope.id, claim.owner!)
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
-    })
+    }
   }
 
   protected onStatus(message: Msg): void {

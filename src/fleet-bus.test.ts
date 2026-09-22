@@ -8,6 +8,7 @@ import {
   BatonDerivationError,
   BatonHopsExhausted,
   DEFAULT_MAX_ENVELOPE_BYTES,
+  DEFAULT_DEDUP_TTL_MS,
   DEFAULT_PAYLOAD_BODY_MAX_BYTES,
   DurableEnvelopeDedupStore,
   FixedWindowBucket,
@@ -37,11 +38,26 @@ const allowlist = normalizeAllowlist(['luna', 'deet', 'kat', 'vec', 'ohm', 'myc'
 describe('durable envelope dedup', () => {
   test('survives restart, reports original req_id, and expires after TTL', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
-    const first = new DurableEnvelopeDedupStore(path, 100)
-    expect(first.claim('env-1', 'req-original', 1_000)).toEqual({ duplicate: false, reqId: 'req-original' })
-    const restarted = new DurableEnvelopeDedupStore(path, 100)
+    const first = new DurableEnvelopeDedupStore(path)
+    const initial = first.claim('env-1', 'req-original', 1_000)
+    expect(initial).toMatchObject({ duplicate: false, reqId: 'req-original' })
+    first.complete('env-1', initial.owner!)
+    const restarted = new DurableEnvelopeDedupStore(path)
     expect(restarted.claim('env-1', 'req-new', 1_050)).toEqual({ duplicate: true, reqId: 'req-original' })
-    expect(restarted.claim('env-1', 'req-after-ttl', 1_101)).toEqual({ duplicate: false, reqId: 'req-after-ttl' })
+    expect(restarted.prune(DEFAULT_DEDUP_TTL_MS + 1_001)).toBe(1)
+    expect(restarted.claim('env-1', 'req-after-ttl', DEFAULT_DEDUP_TTL_MS + 1_001)).toMatchObject({ duplicate: false, reqId: 'req-after-ttl' })
+    expect(restarted.prunePlan()).toContain('envelope_dedup_v2_first_seen')
+  })
+
+  test('pruning uses the timestamp index and deletes at most its fixed budget', () => {
+    const store = new DurableEnvelopeDedupStore(':memory:', 10)
+    for (let i = 0; i < 101; i += 1) {
+      const claim = store.claim(`old-${i}`, `req-${i}`, 0)
+      store.complete(`old-${i}`, claim.owner!)
+    }
+    expect(store.prunePlan()).toContain('envelope_dedup_v2_first_seen')
+    expect(store.prune(100)).toBe(100)
+    expect(store.prune(100)).toBe(1)
   })
 
   test('two store connections produce exactly one winner', () => {
@@ -52,6 +68,14 @@ describe('durable envelope dedup', () => {
     expect(claims.filter(claim => !claim.duplicate)).toHaveLength(1)
     expect(claims.filter(claim => claim.duplicate)).toHaveLength(1)
     expect(claims[1]!.reqId).toBe('left')
+  })
+
+  test('expired pending claim is recoverable with the original req_id', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const crashed = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
+    expect(crashed.claim('pending', 'original', 100)).toMatchObject({ duplicate: false, reqId: 'original' })
+    const restarted = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
+    expect(restarted.claim('pending', 'replacement', 111)).toMatchObject({ duplicate: false, reqId: 'original' })
   })
 })
 
@@ -388,6 +412,43 @@ class TestFleetBus extends FleetBus {
 }
 
 describe('request session injection', () => {
+  test('dedup store failure drops one delivery without killing later handling', async () => {
+    class FailOnceStore extends DurableEnvelopeDedupStore {
+      private fail = true
+      override claim(envelopeId: string, reqId: string, nowMs?: number) {
+        if (this.fail) { this.fail = false; throw new Error('disk busy') }
+        return super.claim(envelopeId, reqId, nowMs)
+      }
+    }
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: new FailOnceStore(':memory:'),
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    await bus.handleRequest(envelope({ id: 'store-fault', to: 'vec' }))
+    await bus.handleRequest(envelope({ id: 'healthy-after-store-fault', to: 'vec' }))
+    expect(events.map(event => event.envelope.id)).toEqual(['healthy-after-store-fault'])
+  })
+
+  test('failed and cancelled delivery release pending claim for retry', async () => {
+    for (const failure of [new Error('failed'), new DOMException('cancelled', 'AbortError')]) {
+      const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-failure-')), 'dedup.sqlite')
+      const wire = envelope({ id: `retry-${failure.name}`, to: 'vec' })
+      const failing = new TestFleetBus({
+        botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', dedupStorePath: path,
+        injectIntoSession: async () => { throw failure },
+      }, allowlist)
+      await failing.handleRequest(wire)
+      const events: FleetBusSessionEvent[] = []
+      const restarted = new TestFleetBus({
+        botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', dedupStorePath: path,
+        injectIntoSession: async event => { events.push(event) },
+      }, allowlist)
+      await restarted.handleRequest(wire)
+      expect(events).toHaveLength(1)
+    }
+  })
   test('durable duplicate across adapter restart is dropped with original req_id', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fleet-dedup-restart-'))
     const dedupStorePath = join(dir, 'dedup.sqlite')

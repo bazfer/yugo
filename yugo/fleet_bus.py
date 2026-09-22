@@ -134,6 +134,10 @@ DEFAULT_MANIFEST_PATH = "/vault/infra/fleet-manifest.yaml"
 DEFAULT_AUDIT_LOG = "/root/.claude/fleet-bus-log.jsonl"
 DEFAULT_URL = "nats://nats:4222"
 DEFAULT_DEDUP_TTL_S = 8 * 24 * 60 * 60
+MIN_DEDUP_TTL_S = 7 * 24 * 60 * 60
+DEFAULT_DEDUP_LEASE_S = 60
+DEDUP_PRUNE_EVERY = 256
+DEDUP_PRUNE_LIMIT = 100
 
 _BOT_NAME_PATTERN = re.compile(r"[a-z0-9_-]+")
 
@@ -1079,31 +1083,77 @@ class DurableEnvelopeDedupStore:
     makes competing processes deterministic.
     """
 
-    def __init__(self, path: str, ttl_s: int = DEFAULT_DEDUP_TTL_S) -> None:
+    def __init__(self, path: str, ttl_s: int = DEFAULT_DEDUP_TTL_S,
+                 lease_s: int = DEFAULT_DEDUP_LEASE_S) -> None:
+        if path != ":memory:" and ttl_s < MIN_DEDUP_TTL_S:
+            raise ValueError("durable dedup TTL must be at least the 7-day stream max_age")
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.execute(
-            "CREATE TABLE IF NOT EXISTS envelope_dedup ("
-            "envelope_id TEXT PRIMARY KEY, first_seen_s REAL NOT NULL, req_id TEXT NOT NULL)"
+            "CREATE TABLE IF NOT EXISTS envelope_dedup_v2 ("
+            "envelope_id TEXT PRIMARY KEY, first_seen_s REAL NOT NULL, req_id TEXT NOT NULL, "
+            "state TEXT NOT NULL CHECK(state IN ('pending','completed')), "
+            "lease_owner TEXT NOT NULL, lease_until_s REAL NOT NULL)"
         )
+        self._db.execute("CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_s)")
         self._ttl_s = ttl_s
+        self._lease_s = lease_s
         self._lock = threading.Lock()
+        self._claims = 0
 
-    def claim(self, envelope_id: str, req_id: str, now_s: float | None = None) -> tuple[bool, str]:
+    def claim(self, envelope_id: str, req_id: str, now_s: float | None = None) -> tuple[bool, str, str | None]:
         now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+        owner = uuid.uuid4().hex
         with self._lock:
-            self._db.execute("DELETE FROM envelope_dedup WHERE first_seen_s < ?", (now - self._ttl_s,))
-            cursor = self._db.execute(
-                "INSERT OR IGNORE INTO envelope_dedup VALUES (?,?,?)", (envelope_id, now, req_id)
-            )
-            if cursor.rowcount == 1:
-                return False, req_id
-            original = self._db.execute(
-                "SELECT req_id FROM envelope_dedup WHERE envelope_id=?", (envelope_id,)
-            ).fetchone()[0]
-            return True, original
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._claims += 1
+                if self._claims % DEDUP_PRUNE_EVERY == 0:
+                    self.prune(now)
+                self._db.execute(
+                    "DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND first_seen_s < ?",
+                    (envelope_id, now - self._ttl_s),
+                )
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO envelope_dedup_v2 VALUES (?,?,?,'pending',?,?)",
+                    (envelope_id, now, req_id, owner, now + self._lease_s),
+                )
+                if cursor.rowcount == 1:
+                    result = (False, req_id, owner)
+                else:
+                    row = self._db.execute(
+                        "SELECT req_id,state,lease_until_s FROM envelope_dedup_v2 WHERE envelope_id=?",
+                        (envelope_id,),
+                    ).fetchone()
+                    if row[1] == "pending" and row[2] <= now:
+                        changed = self._db.execute(
+                            "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_s=? "
+                            "WHERE envelope_id=? AND state='pending' AND lease_until_s<=?",
+                            (owner, now + self._lease_s, envelope_id, now),
+                        ).rowcount
+                        result = (False, row[0], owner) if changed else (True, row[0], None)
+                    else:
+                        result = (True, row[0], None)
+                self._db.execute("COMMIT")
+                return result
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
+    def complete(self, envelope_id: str, owner: str) -> None:
+        self._db.execute("UPDATE envelope_dedup_v2 SET state='completed' WHERE envelope_id=? AND lease_owner=?", (envelope_id, owner))
+
+    def release(self, envelope_id: str, owner: str) -> None:
+        self._db.execute("DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'", (envelope_id, owner))
+
+    def prune(self, now_s: float) -> int:
+        return self._db.execute(
+            "DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 "
+            "WHERE first_seen_s < ? ORDER BY first_seen_s LIMIT ?)",
+            (now_s - self._ttl_s, DEDUP_PRUNE_LIMIT),
+        ).rowcount
 
 
 @dataclass(frozen=True)
@@ -1708,13 +1758,18 @@ class FleetBus:
         # which is why the nonce is minted BEFORE the session hook is checked
         # rather than inside the branch that has one.
         req_id = uuid.uuid4().hex
-        duplicate, original_req_id = self._dedup.claim(envelope["id"], req_id)
+        try:
+            duplicate, original_req_id, claim_owner = self._dedup.claim(envelope["id"], req_id)
+        except Exception as e:  # store fault drops this delivery, subscription stays live
+            self._audit.record("drop", subject, reason="yugo_dedup_store_failed", id=envelope["id"], error=repr(e))
+            return
         if duplicate:
             self._audit.record(
                 "drop", subject, reason="yugo_duplicate_envelope",
                 id=envelope["id"], req_id=original_req_id,
             )
             return
+        req_id = original_req_id
 
         if isinstance(hops, int) and hops >= BATON_HOPS_WARN_AT:
             await self._warn_origin(subject, envelope, req_id)
@@ -1731,6 +1786,7 @@ class FleetBus:
                 kind=envelope["kind"],
                 **{"from": envelope["from"]},
             )
+            self._dedup.complete(envelope["id"], claim_owner)
             return
 
         self._injection_delivered_ts = _utc_now_iso()
@@ -1739,7 +1795,10 @@ class FleetBus:
         # CancelledError is a BaseException and deliberately NOT caught: a
         # turn interrupted by shutdown is not a failed injection, and
         # swallowing the cancel here would stall `drain()` behind an LLM call.
-        except Exception as e:  # noqa: BLE001 — any turn fault is one envelope's problem
+        except BaseException as e:
+            self._dedup.release(envelope["id"], claim_owner)
+            if isinstance(e, asyncio.CancelledError):
+                raise
             # Same reject code the TS peer writes when its `injectIntoSession`
             # rejects. The bus stays up and the subscription stays live: this
             # envelope is lost, the next one is not.
@@ -1752,6 +1811,7 @@ class FleetBus:
                 error=repr(e),
             )
             return
+        self._dedup.complete(envelope["id"], claim_owner)
         self._session_last_response_ts = _utc_now_iso()
         # Success is `dir="in"` carrying envelope identity AND the nonce —
         # the shape the TS port records from `injectIntoSession`. The audit

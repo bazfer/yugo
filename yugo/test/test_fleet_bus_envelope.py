@@ -271,6 +271,7 @@ def test_no_reject_code_enters_fleet_bus_without_a_row_in_the_table_above():
         "injection_failed",
         "recipient_mismatch",
         "yugo_duplicate_envelope",
+        "yugo_dedup_store_failed",
     }
     source = Path(fleet_bus.__file__).read_text(encoding="utf-8")
     found = set(re.findall(r'error="([a-z_]+)"', source))
