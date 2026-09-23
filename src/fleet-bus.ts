@@ -856,7 +856,17 @@ export class FleetBus {
       // claim must not be left pending forever. Release it: under
       // at-least-once a retry that runs the turn again is permitted, a wire id
       // suppressed for the full TTL with no answer sent is not.
+      //
+      // UNLESS its injection is still executing. The active-injection rule
+      // applies to EVERY removal path, not just `abandonRepliedClaim`: an
+      // evicted-but-running claim keeps its lease, and the finalizer in
+      // `onRequest` releases it once the callback exits. That finalizer holds
+      // the claim OBJECT, so it still works after the LRU has dropped the key.
       (reqId, claim) => {
+        if (claim.injectionActive) {
+          claim.abandonReason ??= 'claude_discord_adapter_pending_map_evicted'
+          return
+        }
         claim.stopRenewing()
         this.releaseClaim(claim.subject, claim.envelopeId, reqId, claim.owner)
       },
@@ -1237,14 +1247,23 @@ export class FleetBus {
    * branch; if no abandonment was deferred the claim simply stays pending,
    * waiting for `publishReply` as normal.
    */
-  private finishInjection(reqId: string): void {
-    const pending = this.pendingReplyClaims.get(reqId)
-    if (pending === undefined) return
-    pending.injectionActive = false
-    const reason = pending.abandonReason
+  private finishInjection(claim: PendingReplyClaim, reqId: string): void {
+    claim.injectionActive = false
+    const reason = claim.abandonReason
     if (reason === undefined) return
-    pending.abandonReason = undefined
-    this.abandonRepliedClaim(reqId, reason)
+    claim.abandonReason = undefined
+    // Identity, not key: the LRU may have evicted this entry, or a later
+    // delivery may have registered a DIFFERENT claim under the same reqId. A
+    // stale callback must never finalize a replacement owner, and must still
+    // release its own claim after eviction — which is why this takes the
+    // captured object rather than looking one up.
+    if (this.pendingReplyClaims.get(reqId) === claim) this.pendingReplyClaims.delete(reqId)
+    claim.stopRenewing()
+    this.releaseClaim(claim.subject, claim.envelopeId, reqId, claim.owner)
+    this.recordAudit({
+      dir: 'drop', subject: claim.subject, reason: 'claude_discord_adapter_reply_undelivered',
+      envelope_id: claim.envelopeId, req_id: reqId, note: reason,
+    })
   }
 
   /**
@@ -1465,20 +1484,21 @@ export class FleetBus {
       // until its answer ships, and stopping now would let the lease lapse
       // mid-turn and hand the envelope to a second consumer. `publishReply`,
       // the eviction hook and the failure path below all stop it.
-      this.pendingReplyClaims.set(reqId, {
+      const pendingClaim: PendingReplyClaim = {
         envelopeId: result.envelope.id,
         owner: claim.owner!,
         subject,
         stopRenewing,
         injectionActive: true,
-      })
+      }
+      this.pendingReplyClaims.set(reqId, pendingClaim)
       try {
         await this.injectIntoSession({ envelope: result.envelope, reqId })
       } finally {
         // The callback has exited — by return OR by throw — so ownership is
         // no longer protecting a running turn. Any abandonment deferred while
-        // it ran is performed now, exactly once.
-        this.finishInjection(reqId)
+        // it ran is performed now, exactly once, against THIS claim.
+        this.finishInjection(pendingClaim, reqId)
       }
       // SETTLE POINT — deferred to `publishReply`, matching the Python port.
       //

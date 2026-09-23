@@ -839,6 +839,51 @@ describe('request session injection', () => {
     expect(rival.claim('race-a', 'retry').duplicate).toBe(false)
   })
 
+  test('pending-map eviction does not release a still-executing claim', async () => {
+    // The SIBLING removal path. `abandonRepliedClaim` learned the
+    // active-injection rule; the pendingReplyClaims LRU eviction callback had
+    // not, and it fires after the entry is already gone from the map — so a
+    // reqId lookup cannot recover it. Ohm reached this through a real
+    // reconnect: `disconnect()` unsubscribes but does not join a handler
+    // already awaiting injection, so an old callback stays alive while a
+    // replacement subscription delivers new work that overflows the map.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-pendevict-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let releaseA: (() => void) | undefined
+    let aRunning = false
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, receiveLedgerCap: 1,
+      injectIntoSession: async event => {
+        if (event.envelope.id !== 'pend-a') return
+        aRunning = true
+        await new Promise<void>(resolve => { releaseA = resolve })
+        aRunning = false
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const injecting = bus.handleRequest(envelope({ id: 'pend-a', to: 'vec', from: 'kat' }))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(aRunning).toBe(true)
+
+    // A second request overflows the capacity-1 pending map, evicting A.
+    await bus.handleRequest(envelope({ id: 'pend-c', to: 'vec', from: 'kat' }))
+
+    // SAFETY: A's callback is still executing, so its claim must still be
+    // owned — a rival injecting now would be a live-turn overlap.
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(aRunning).toBe(true)
+    expect(rival.claim('pend-a', 'rival-during').duplicate).toBe(true)
+
+    // RECOVERY: the finalizer holds the claim OBJECT, so it still releases
+    // after the LRU dropped the key.
+    releaseA?.()
+    await injecting
+    expect(rival.claim('pend-a', 'retry').duplicate).toBe(false)
+  })
+
   test('the heartbeat sweeps expired claims', async () => {
     // The idle prune must be WIRED, not merely implemented: the store-level
     // test calls it directly, so deleting the heartbeat call left this green.
