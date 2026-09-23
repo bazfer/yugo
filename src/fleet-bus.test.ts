@@ -823,11 +823,19 @@ describe('request session injection', () => {
     await new Promise(resolve => setTimeout(resolve, 20))
     // B lands on the result lane and evicts A from the capacity-1 ledger.
     await bus.handleResult(envelope({ id: 'race-b', to: 'vec', from: 'kat', in_reply_to: 'nothing' }))
+
+    // SAFETY HALF: A's callback is still executing. Its reply is no longer
+    // deliverable, but the turn is not over — releasing now would let a rival
+    // inject the same envelope concurrently, on a healthy clock, which is the
+    // exact overlap renewal exists to prevent. Probe past several lease
+    // periods so this cannot pass merely because the lease had not lapsed.
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(rival.claim('race-a', 'rival-during').duplicate).toBe(true)
+
+    // RECOVERY HALF: once the callback exits, the deferred abandonment runs.
     releaseA?.()
     await injecting
-
-    await new Promise(resolve => setTimeout(resolve, 900))
-    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
     expect(rival.claim('race-a', 'retry').duplicate).toBe(false)
   })
 

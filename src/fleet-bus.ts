@@ -722,6 +722,18 @@ interface PendingReplyClaim {
   owner: string
   subject: string
   stopRenewing: () => void
+  /**
+   * True while the session callback for this envelope is still executing.
+   *
+   * "The reply can no longer be delivered" and "the turn is no longer
+   * running" are DIFFERENT facts, and only the second may release the durable
+   * claim. Releasing on the first lets a rival inject the same envelope while
+   * the first callback is mid-flight, on a healthy clock — precisely the
+   * live-owner overlap renewal exists to prevent.
+   */
+  injectionActive: boolean
+  /** Set when abandonment was decided while the injection was still running. */
+  abandonReason?: string
 }
 
 class BoundedLru<K, V> {
@@ -1218,6 +1230,24 @@ export class FleetBus {
   }
 
   /**
+   * Mark a turn's callback as finished and act on any deferred abandonment.
+   *
+   * Called from a `finally`, so it runs on both return and throw. Clearing
+   * `injectionActive` first means the abandon path below takes its immediate
+   * branch; if no abandonment was deferred the claim simply stays pending,
+   * waiting for `publishReply` as normal.
+   */
+  private finishInjection(reqId: string): void {
+    const pending = this.pendingReplyClaims.get(reqId)
+    if (pending === undefined) return
+    pending.injectionActive = false
+    const reason = pending.abandonReason
+    if (reason === undefined) return
+    pending.abandonReason = undefined
+    this.abandonRepliedClaim(reqId, reason)
+  }
+
+  /**
    * Release the inbound claim when its reply will NEVER be published.
    *
    * There is no outbound retry at this boundary, so a terminal delivery
@@ -1232,6 +1262,14 @@ export class FleetBus {
   private abandonRepliedClaim(reqId: string, reason: string): void {
     const pending = this.pendingReplyClaims.get(reqId)
     if (pending === undefined) return
+    if (pending.injectionActive) {
+      // Remember the decision, keep the lease. The reply is undeliverable,
+      // but the turn is still executing and ownership is what stops a second
+      // consumer starting the same work. `finishInjection` performs the
+      // release the moment the callback exits.
+      pending.abandonReason ??= reason
+      return
+    }
     this.pendingReplyClaims.delete(reqId)
     pending.stopRenewing()
     this.releaseClaim(pending.subject, pending.envelopeId, reqId, pending.owner)
@@ -1251,6 +1289,11 @@ export class FleetBus {
   private settleRepliedClaim(reqId: string): void {
     const pending = this.pendingReplyClaims.get(reqId)
     if (pending === undefined) return
+    if (pending.abandonReason !== undefined) {
+      // Already abandoned while the callback ran; a late reply does not undo
+      // that. `finishInjection` still owns the release.
+      return
+    }
     this.pendingReplyClaims.delete(reqId)
     pending.stopRenewing()
     if (this.completeClaim(pending.subject, pending.envelopeId, reqId, pending.owner)) {
@@ -1427,8 +1470,16 @@ export class FleetBus {
         owner: claim.owner!,
         subject,
         stopRenewing,
+        injectionActive: true,
       })
-      await this.injectIntoSession({ envelope: result.envelope, reqId })
+      try {
+        await this.injectIntoSession({ envelope: result.envelope, reqId })
+      } finally {
+        // The callback has exited — by return OR by throw — so ownership is
+        // no longer protecting a running turn. Any abandonment deferred while
+        // it ran is performed now, exactly once.
+        this.finishInjection(reqId)
+      }
       // SETTLE POINT — deferred to `publishReply`, matching the Python port.
       //
       // `injectIntoSession` only hands the envelope to the session; the answer
@@ -1453,9 +1504,10 @@ export class FleetBus {
       // lapses.
       return
     } catch (error) {
-      // Idempotent by design: if an early reply already settled the claim, or
-      // an eviction already abandoned it, this finds no entry and does
-      // nothing rather than releasing someone else's work.
+      // Idempotent by design: if an early reply already settled the claim, an
+      // eviction already abandoned it, or `finishInjection` already released
+      // it, this finds no entry and does nothing rather than releasing work
+      // that is no longer ours.
       this.abandonRepliedClaim(reqId, 'claude_discord_adapter_injection_failed')
       stopRenewing()
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
