@@ -30,6 +30,7 @@ import {
   type FleetBusConfig,
   type FleetBusSessionEvent,
   type TokenBucket,
+  DEFAULT_DEDUP_LEASE_MS,
 } from './fleet-bus'
 
 const jc = JSONCodec()
@@ -462,6 +463,10 @@ class TestFleetBus extends FleetBus {
   handleResult(value: unknown, subject = 'fleet.vec.result'): Promise<void> {
     return this.onResult(fakeMessage(subject, value))
   }
+  /** Settle a pending-reply claim without a live NATS connection. */
+  settleReply(reqId: string): void {
+    (this as unknown as { settleRepliedClaim: (r: string) => void }).settleRepliedClaim(reqId)
+  }
   /** Drive one heartbeat, to observe what the beat is wired to do. */
   beat(): void {
     (this as unknown as { publishHeartbeat: () => void }).publishHeartbeat()
@@ -706,9 +711,21 @@ describe('request session injection', () => {
 
     expect(events).toHaveLength(1)
     expect(readAudit(auditLogPath).some(entry =>
-      entry.reason === 'claude_discord_adapter_duplicate_envelope'
+      entry.reason === 'claude_discord_adapter_duplicate_request_envelope'
       && entry.req_id === originalReqId,
     )).toBe(true)
+
+    // And the part that matters: because the first turn never published a
+    // reply, its claim is still PENDING, not completed. The suppression above
+    // lasts only as long as the lease — once it lapses the retry is admitted
+    // and the peer can finally get an answer. Settling at inject time instead
+    // would have written `completed` here and suppressed that retry for the
+    // full 8-day TTL, with no reply ever sent. That is the regression this
+    // PR's durable store would otherwise have introduced: before it, the
+    // ledger was in-memory and a restart simply cleared it.
+    const store = new DurableEnvelopeDedupStore(dedupStorePath)
+    const row = store.claim('restart-duplicate', 'after-lease', Date.now() + DEFAULT_DEDUP_LEASE_MS + 1)
+    expect(row.duplicate).toBe(false)
   })
 
   test('injects an allowlisted envelope with a distinct server nonce', async () => {
@@ -1785,7 +1802,11 @@ describe('envelope-id dedup', () => {
     await bus.handleRequest(value)
     expect(events).toHaveLength(1)
     const firstReqId = events[0]!.reqId
-    expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(true)
+    // The in-memory fast path is NOT armed yet: the claim settles when the
+    // reply publishes, not when the session accepts the envelope. Suppression
+    // in this window comes from the durable store's pending row, which is the
+    // stronger guarantee — it survives a restart, where this ledger would not.
+    expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(false)
 
     // Retry — must drop as duplicate. Pre-fix: fresh reqId, second inject.
     await bus.handleRequest(value)
@@ -1794,6 +1815,10 @@ describe('envelope-id dedup', () => {
     expect(drops).toHaveLength(1)
     expect(drops[0]!.envelope_id).toBe('dup-req-1')
     expect(drops[0]!.req_id).toBe(firstReqId)
+
+    // Once the answer is on the wire the claim settles and the fast path arms.
+    bus.settleReply(firstReqId)
+    expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(true)
   })
 })
 

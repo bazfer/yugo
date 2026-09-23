@@ -1999,30 +1999,39 @@ class FleetBus:
             settled = True
         finally:
             # SETTLE FIRST, then stop renewing. Both settle calls are
-            # synchronous, so nothing can interrupt between here and the store
-            # write — whereas any `await` placed above them is a cancellation
-            # point that skips the decision entirely and strands the claim
-            # pending-but-unrenewed until its lease lapses.
+            # synchronous, so no cancellation point exists between here and
+            # the store write.
             #
-            # An earlier version used `asyncio.shield` here and claimed it
-            # prevented that. It does the opposite: shield protects the
-            # AWAITED task, not the awaiting coroutine, and its extra
-            # scheduling hop is exactly where a second cancel lands. Ordering
-            # is the fix; there is no await to protect.
+            # Precisely what this ordering fixes, because the comment here
+            # previously over-claimed: a bare `await _cancel_task(renewer)`
+            # above the settle was ALREADY safe, since `_cancel_task` absorbs
+            # CancelledError around its only await. What broke was wrapping
+            # that in `asyncio.shield`, whose CancelledError is raised OUTSIDE
+            # the helper's guard and so escaped the `finally` before the
+            # decision ran — shield protects the awaited task, not the
+            # awaiting coroutine. Settling first removes the question rather
+            # than depending on a helper's swallow behaviour.
             #
-            # Renewing after the settle is harmless: `renew` requires
+            # Renewing past the settle is harmless: `renew` requires
             # state='pending', so a completed claim ends the renewal loop on
             # its own and a released row no longer exists.
-            if settled:
-                self._complete_claim(subject, envelope, req_id, claim_owner)
-            else:
-                # Unfinished outbound work stays recoverable. Completing here
-                # would stamp a tombstone over an answer that never shipped and
-                # suppress redelivery for the whole TTL — the lost-response bug
-                # this ordering exists to prevent, reached by cancellation
-                # instead of by process death.
-                self._release_claim(subject, envelope, req_id, claim_owner)
-            await _cancel_task(renewer)
+            #
+            # The nested try/finally makes the cancel unconditional: a fault
+            # escaping the settle — the audit write sits outside the helpers'
+            # own guards — would otherwise leak the renewer, which would then
+            # extend an abandoned claim for the life of the process.
+            try:
+                if settled:
+                    self._complete_claim(subject, envelope, req_id, claim_owner)
+                else:
+                    # Unfinished outbound work stays recoverable. Completing
+                    # here would stamp a tombstone over an answer that never
+                    # shipped and suppress redelivery for the whole TTL — the
+                    # lost-response bug this ordering exists to prevent,
+                    # reached by cancellation instead of process death.
+                    self._release_claim(subject, envelope, req_id, claim_owner)
+            finally:
+                await _cancel_task(renewer)
 
     def _complete_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
         """Promote a claim, surviving a store fault and reporting owner loss.

@@ -716,6 +716,14 @@ export function defaultRateLimiters(): FleetBusRateLimiters {
 /* Bounded LRU (Map insertion order + delete-on-touch)                         */
 /* -------------------------------------------------------------------------- */
 
+/** A claim held open until its `.request` turn publishes an answer. */
+interface PendingReplyClaim {
+  envelopeId: string
+  owner: string
+  subject: string
+  stopRenewing: () => void
+}
+
 class BoundedLru<K, V> {
   private readonly store = new Map<K, V>()
   constructor(
@@ -787,6 +795,14 @@ export class FleetBus {
   private readonly mode: FleetBusMode
   private readonly outboundLedger: BoundedLru<string, InflightEntry>
   private readonly receiveLedger: BoundedLru<string, Envelope>
+  /**
+   * Claims awaiting an OUTBOUND reply, keyed by the same reqId as
+   * `receiveLedger`. A `.request` turn is not finished when the session
+   * accepts it — it is finished when its answer reaches the wire, which
+   * happens later in `publishReply`. Holding the claim here is what lets the
+   * settle point move there; see the settle-point comment in `onRequest`.
+   */
+  private readonly pendingReplyClaims: BoundedLru<string, PendingReplyClaim>
   private readonly evictedLedger: BoundedLru<string, true>
   // Envelope-id dedup ledgers (round-8 P2): peers can retry the same wire
   // envelope; without this both the .result and .request handlers happily
@@ -813,6 +829,17 @@ export class FleetBus {
       (_key, entry) => this.onInflightEvict(entry),
     )
     this.receiveLedger = new BoundedLru<string, Envelope>(config.receiveLedgerCap ?? DEFAULT_RECEIVE_LEDGER_CAP)
+    this.pendingReplyClaims = new BoundedLru<string, PendingReplyClaim>(
+      config.receiveLedgerCap ?? DEFAULT_RECEIVE_LEDGER_CAP,
+      // An evicted entry means we will never see that reply published, so the
+      // claim must not be left pending forever. Release it: under
+      // at-least-once a retry that runs the turn again is permitted, a wire id
+      // suppressed for the full TTL with no answer sent is not.
+      (reqId, claim) => {
+        claim.stopRenewing()
+        this.releaseClaim(claim.subject, claim.envelopeId, reqId, claim.owner)
+      },
+    )
     this.evictedLedger = new BoundedLru<string, true>(config.evictedLedgerCap ?? DEFAULT_EVICTED_LEDGER_CAP)
     this.seenResultEnvelopes = new BoundedLru<string, { reqId: string; ts: number }>(
       config.seenResultLedgerCap ?? DEFAULT_SEEN_RESULT_LEDGER_CAP,
@@ -1155,7 +1182,29 @@ export class FleetBus {
       return { ok: false, error: 'claude_discord_adapter_publish_failed', req_id: reqId, envelope }
     }
     this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: reqId })
+    // The answer is on the wire — NOW the inbound claim is finished. This is
+    // the in-band completion signal `onRequest` defers to, and the reason its
+    // claim is not settled at inject time. Only a claim we still own counts,
+    // and only then is the in-memory fast path armed.
+    this.settleRepliedClaim(reqId)
     return { ok: true, envelope, req_id: reqId }
+  }
+
+  /**
+   * Complete the inbound claim a published reply just answered.
+   *
+   * No-op when nothing is pending for this reqId — a reply to an unsolicited
+   * inject, a second reply on the same reqId, or a turn whose claim was
+   * already evicted. All three are ordinary, none is an error.
+   */
+  private settleRepliedClaim(reqId: string): void {
+    const pending = this.pendingReplyClaims.get(reqId)
+    if (pending === undefined) return
+    this.pendingReplyClaims.delete(reqId)
+    pending.stopRenewing()
+    if (this.completeClaim(pending.subject, pending.envelopeId, reqId, pending.owner)) {
+      this.seenRequestEnvelopes.set(pending.envelopeId, { reqId, ts: Date.now() })
+    }
   }
 
   protected async onRequest(message: Msg): Promise<void> {
@@ -1289,7 +1338,12 @@ export class FleetBus {
     const claim = this.claimDedup(subject, result.envelope.id, reqId)
     if (claim === undefined) return
     if (claim.duplicate) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
+      // The REQUEST-specific code, matching the in-memory gate above. Now that
+      // the claim settles on reply rather than on inject, a same-process retry
+      // reaches the durable store instead of that ledger — the suppression is
+      // strictly stronger, and the audit line must not change meaning just
+      // because the layer that caught it did.
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_request_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
       return
     }
     reqId = claim.reqId
@@ -1304,37 +1358,44 @@ export class FleetBus {
     const stopRenewing = this.renewWhileRunning(subject, result.envelope.id, claim.reqId, claim.owner!)
     try {
       await this.injectIntoSession({ envelope: result.envelope, reqId })
-      stopRenewing()
-      // SETTLE POINT — a DELIBERATE divergence from the Python port, recorded
-      // here because the sibling port treats this exact shape as a P1.
+      // SETTLE POINT — deferred to `publishReply`, matching the Python port.
       //
-      // `injectIntoSession` only hands the envelope to the session. The answer
-      // travels later and out-of-band, when the embedder calls `publishReply`,
-      // so nothing at this line knows whether a reply ever reached the wire.
-      // Completing here therefore CAN stamp a claim done for a turn whose
-      // answer never shipped — the tombstone `yugo/fleet_bus.py` now defers
-      // past `_publish_turn_output` specifically to avoid.
+      // `injectIntoSession` only hands the envelope to the session; the answer
+      // leaves out-of-band later. Completing here stamped a claim done for a
+      // turn whose answer might never ship — and because this PR makes the
+      // store DURABLE, that tombstone outlived a restart and suppressed the
+      // peer's retry for the full 8-day TTL. Before the durable store the same
+      // ledger was in-memory, so a restart cleared it and the retry was
+      // re-injected; shipping the inject-time settle would have turned a
+      // restart-recoverable suppression into a permanent one.
       //
-      // Why it is not a live bug today: SPEC §6.3 has JetStream capture applied
-      // but bots still bind core subscriptions — durable consumers land in
-      // FB-3. With no redelivery there is nothing to suppress. It becomes real
-      // the day a consumer binds durably, and it is tracked as yugo#27.
+      // That is NOT gated on JetStream: peers retry `.request` frames for
+      // transport re-send, publisher restart and back-off, as the round-8
+      // comment above this method says and `durable duplicate across adapter
+      // restart is dropped with original req_id` exercises over core
+      // subscriptions.
       //
-      // Why it is not simply fixed here: this adapter has no in-band completion
-      // signal to settle on. Closing it means threading an ack from
-      // `publishReply` back to the claim, which is FB-3's shape of work, not
-      // this PR's.
-      //
-      // Only a claim we still OWNED counts as completed. Populating the
-      // in-memory fast path on a stale or failed completion would suppress
-      // the real owner's delivery.
-      if (this.completeClaim(subject, result.envelope.id, claim.reqId, claim.owner!)) {
-        this.seenRequestEnvelopes.set(result.envelope.id, { reqId, ts: Date.now() })
-      }
+      // So the claim stays PENDING and renewed until the reply is published.
+      // `injectUnsolicited` keeps settling at inject time on purpose: an
+      // unsolicited inject legitimately may never reply, and holding a claim
+      // for an answer that is never owed would strand it until the lease
+      // lapses.
+      // Renewal deliberately CONTINUES here: the claim is still live work
+      // until its answer ships, and stopping now would let the lease lapse
+      // mid-turn and hand the envelope to a second consumer. `publishReply`
+      // and the eviction hook both stop it.
+      this.pendingReplyClaims.set(reqId, {
+        envelopeId: result.envelope.id,
+        owner: claim.owner!,
+        subject,
+        stopRenewing,
+      })
+      return
     } catch (error) {
       stopRenewing()
       this.releaseClaim(subject, result.envelope.id, claim.reqId, claim.owner!)
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
+      return
     }
   }
 
@@ -1359,10 +1420,6 @@ export class FleetBus {
    * overlap is an accepted duplicate under the at-least-once contract.
    */
   private renewWhileRunning(subject: string, envelopeId: string, reqId: string, owner: string): () => void {
-    // The STORE's lease, not the module default. An embedder can inject a
-    // store with its own lease (the third constructor parameter), and reading
-    // the default gave a 24s cadence against a 5s lease — renewal firing four
-    // leases late and fencing nothing, silently.
     // Floor guards against a pathological zero or negative cadence; it is not
     // a minimum tick. Kept low and matched to the Python port so the cadence
     // tracks the lease across the whole plausible range rather than being
