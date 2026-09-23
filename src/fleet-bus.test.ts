@@ -1199,7 +1199,7 @@ describe('request / publishReply / onResult', () => {
     expect(nc.publishes).toHaveLength(0)
   })
 
-  test('publishReply publishes to inbound.from.result with in_reply_to = inbound.id (NOT the local reqId)', async () => {
+  test('publishReply publishes to inbound.from.request with in_reply_to = inbound.id (NOT the local reqId)', async () => {
     const nc = new FakeNatsConnection()
     const events: FleetBusSessionEvent[] = []
     const bus = new TestFleetBus({
@@ -1214,7 +1214,8 @@ describe('request / publishReply / onResult', () => {
 
     const result = bus.publishReply(reqId, { done: true }, 'pr_review_result')
     expect(result.ok).toBe(true)
-    expect(nc.publishes.map(p => p.subject)).toEqual(['fleet.ohm.result'])
+    expect(nc.publishes.map(p => p.subject)).toEqual(['fleet.ohm.request'])
+    expect(nc.publishes.some(p => p.subject.endsWith('.result'))).toBe(false)
     const publishedReply = nc.publishes[0]!.envelope as Envelope
     // Wire in_reply_to MUST be the inbound wire id, not the consumer-local reqId (round-2 P1).
     expect(publishedReply.in_reply_to).toBe('wire-42')
