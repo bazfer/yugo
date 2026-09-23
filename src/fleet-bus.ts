@@ -1494,6 +1494,14 @@ export class FleetBus {
       this.pendingReplyClaims.set(reqId, pendingClaim)
       try {
         await this.injectIntoSession({ envelope: result.envelope, reqId })
+      } catch (error) {
+        // Record the failure ON THE CAPTURED OBJECT, not by reqId. After a
+        // takeover the key may belong to a REPLACEMENT owner, and a stale
+        // callback's exception must never become an instruction to abandon
+        // that owner's healthy claim. The finalizer below then releases this
+        // claim — and only this one — by identity.
+        pendingClaim.abandonReason ??= 'claude_discord_adapter_injection_failed'
+        throw error
       } finally {
         // The callback has exited — by return OR by throw — so ownership is
         // no longer protecting a running turn. Any abandonment deferred while
@@ -1524,11 +1532,11 @@ export class FleetBus {
       // lapses.
       return
     } catch (error) {
-      // Idempotent by design: if an early reply already settled the claim, an
-      // eviction already abandoned it, or `finishInjection` already released
-      // it, this finds no entry and does nothing rather than releasing work
-      // that is no longer ours.
-      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_injection_failed')
+      // The claim was already disposed of by identity in the inner
+      // catch/finally above. Deliberately NOT `abandonRepliedClaim(reqId, …)`:
+      // that looks up whichever claim now occupies the key, which after a
+      // takeover is someone else's. `stopRenewing` is this turn's own closure
+      // and is idempotent.
       stopRenewing()
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
       return

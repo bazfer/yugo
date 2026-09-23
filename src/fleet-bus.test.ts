@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
@@ -882,6 +883,56 @@ describe('request session injection', () => {
     releaseA?.()
     await injecting
     expect(rival.claim('pend-a', 'retry').duplicate).toBe(false)
+  })
+
+  test('a stale callback failure does not abandon a replacement owner', async () => {
+    // After a takeover the store keeps the ORIGINAL reqId but issues a new
+    // owner. Binding only the finalizer to the captured object left the outer
+    // catch abandoning by reqId — so an old callback's exception reached in
+    // and marked the REPLACEMENT's healthy claim for abandonment, and its own
+    // clean return then released it.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-stale-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let failOld: ((e: Error) => void) | undefined
+    let releaseNew: (() => void) | undefined
+    let calls = 0
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async () => {
+        calls += 1
+        if (calls === 1) await new Promise<void>((_, reject) => { failOld = reject })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({ id: 'stale-owner', to: 'vec', from: 'kat' })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    // Force the takeover that #26 admits is possible: a forward clock step
+    // makes a live lease instantly expired. Renewal cannot prevent it — the
+    // stored deadline is wall-clock — so expire it directly rather than
+    // waiting, which renewal would otherwise defeat. The store preserves the
+    // ORIGINAL reqId and issues a NEW owner, which is the whole point.
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-owner')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(calls).toBe(2)
+
+    // The OLD callback now fails. It must dispose of its own claim only.
+    failOld?.(new Error('old callback exploded'))
+    await oldTurn
+    // The NEW callback returns cleanly, having not yet published its reply.
+    releaseNew?.()
+    await newTurn
+
+    // The replacement's claim must still be pending and renewing, awaiting
+    // its out-of-band reply — not released by the stale failure.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
   })
 
   test('the heartbeat sweeps expired claims', async () => {
