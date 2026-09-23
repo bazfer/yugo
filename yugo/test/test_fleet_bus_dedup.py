@@ -96,6 +96,65 @@ def test_prune_idle_sweeps_a_quiet_lane(tmp_path):
     assert store._db.execute("SELECT COUNT(*) FROM envelope_dedup_v2").fetchone()[0] == 0
 
 
+def test_release_does_not_delete_a_replacement_owners_row(tmp_path):
+    """REGRESSION GUARD for the `AND lease_owner=?` fence on release()'s DELETE.
+
+    The takeover tests all assert on claim() return values; none reads
+    lease_owner back off the table, so dropping the fence on the one
+    DESTRUCTIVE statement left the suite green. A stale attempt releasing
+    after a takeover would delete the replacement's live pending row, after
+    which a peer retry re-injects a turn that is already running.
+    """
+    path = tmp_path / "dedup.sqlite"
+    store = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=2)
+    duplicate, req_id, owner_a = store.claim("rel-own", "req-rel", now_s=100)
+    assert duplicate is False
+
+    # A's lease expires; B takes over the same envelope, reqId preserved.
+    duplicate_b, req_id_b, owner_b = store.claim("rel-own", "req-rel", now_s=110)
+    assert duplicate_b is False
+    assert owner_b != owner_a
+    assert req_id_b == req_id
+
+    # A's stale callback releases with A's owner. It must be a no-op.
+    assert store.release("rel-own", owner_a) is False
+
+    row = store._db.execute(
+        "SELECT state, lease_owner FROM envelope_dedup_v2 WHERE envelope_id=?",
+        ("rel-own",),
+    ).fetchone()
+    assert row is not None, "release deleted the replacement owner's row"
+    assert row[0] == "pending"
+    assert row[1] == owner_b
+    # And B can still settle it.
+    assert store.complete("rel-own", owner_b) is True
+
+
+def test_renew_by_a_lost_owner_does_not_extend_the_winners_lease(tmp_path):
+    """REGRESSION GUARD for renew()'s owner fence, which the TS port tests and
+    this one did not. A loser that can still renew holds the winner's envelope
+    open indefinitely — the renewer keeps ticking after the lease is lost.
+    """
+    path = tmp_path / "dedup.sqlite"
+    store = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=2)
+    _, _, owner_a = store.claim("renew-own", "req-renew", now_s=100)
+    _, _, owner_b = store.claim("renew-own", "req-renew", now_s=110)
+    assert owner_b != owner_a
+
+    # The loser must be told it lost, and must not move the deadline.
+    before = store._db.execute(
+        "SELECT lease_until_s FROM envelope_dedup_v2 WHERE envelope_id=?", ("renew-own",)
+    ).fetchone()[0]
+    assert store.renew("renew-own", owner_a, now_s=111) is False
+    after = store._db.execute(
+        "SELECT lease_until_s FROM envelope_dedup_v2 WHERE envelope_id=?", ("renew-own",)
+    ).fetchone()[0]
+    assert after == before, "a lost owner extended the winner's lease"
+
+    # The winner still can.
+    assert store.renew("renew-own", owner_b, now_s=111) is True
+
+
 def test_renew_holds_a_live_owner_past_the_original_expiry(tmp_path):
     """The testable half of the P1: a still-running worker is not overlapped.
 

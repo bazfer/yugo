@@ -98,8 +98,12 @@ export interface FleetBusSessionEvent {
    * to `publishReply` so a stale caller cannot settle or abandon the claim of
    * the attempt that replaced it. Audit and wire correlation keep using
    * `reqId`; only claim-lifecycle authority uses this.
+   *
+   * Required and explicitly nullable. An injected request carries its attempt's
+   * identity; the unsolicited and late-reply paths have no attempt behind them
+   * and say so with `null`. Never optional — see `publishReply`.
    */
-  replyToken?: string
+  replyToken: string | null
 }
 
 /** Durable source of truth for envelope-id deduplication.
@@ -638,7 +642,11 @@ export function buildFleetBusFramePayloadBody(
   return { body: safeBody + marker, truncated: true }
 }
 
-export function buildFleetBusFrameMeta(event: FleetBusSessionEvent): FleetBusFrameMeta {
+export function buildFleetBusFrameMeta(
+  // Frame metadata is wire correlation only; it never touches claim authority,
+  // so it takes the envelope identity and deliberately not the attempt's.
+  event: Omit<FleetBusSessionEvent, 'replyToken'>,
+): FleetBusFrameMeta {
   const { envelope, reqId, lateReplyEnvId } = event
   const meta: FleetBusFrameMeta = {
     source: 'fleet-bus',
@@ -656,7 +664,7 @@ export function buildFleetBusFrameMeta(event: FleetBusSessionEvent): FleetBusFra
 }
 
 /** Build a complete `<channel>` injection frame for the given session event. */
-export function buildFleetBusFrame(event: FleetBusSessionEvent): string {
+export function buildFleetBusFrame(event: Omit<FleetBusSessionEvent, 'replyToken'>): string {
   const meta = buildFleetBusFrameMeta(event)
   const { envelope } = event
   const attrParts = [
@@ -1170,7 +1178,22 @@ export class FleetBus {
     })
   }
 
-  publishReply(reqId: string, payload: unknown, kind = 'result', replyToken?: string): FleetBusReplyResult {
+  publishReply(
+    reqId: string,
+    payload: unknown,
+    kind = 'result',
+    replyToken: string | null,
+  ): FleetBusReplyResult {
+    // `replyToken` is REQUIRED and explicitly nullable, never optional. A
+    // caller replying to an injection passes `event.replyToken`; a caller with
+    // no attempt behind it (unsolicited and late-reply paths) passes `null` and
+    // says so. An OPTIONAL parameter would be the worst available shape: the
+    // refusal below is unconditional once a claim exists, so a caller written
+    // against the old three-argument signature would compile clean and then
+    // fail every single reply at runtime, leaving the claim renewing and the
+    // peer's retries deduped. Making it required moves that break to compile
+    // time, which is the only place it is cheap.
+    //
     // Authority over the claim belongs to the ATTEMPT, not the reqId. After a
     // takeover the key names a replacement owner, so a stale caller's failure
     // would otherwise abandon a healthy newer claim, and a stale success would
@@ -1179,10 +1202,10 @@ export class FleetBus {
     const claimFor = (): PendingReplyClaim | undefined => {
       const pending = this.pendingReplyClaims.get(reqId)
       if (pending === undefined) return undefined
-      // SAFE BY DEFAULT. An absent token is not a wildcard: omitting it must
-      // WITHHOLD authority, not grant it. Treating `undefined` as "matches
-      // anything" preserved exactly the defect the token exists to fix, for
-      // precisely the callers not yet migrated.
+      // SAFE BY DEFAULT. A null token is not a wildcard: declaring "I have no
+      // attempt" must WITHHOLD authority, not grant it. Treating it as
+      // "matches anything" preserved exactly the defect the token exists to
+      // fix. Covered by `a null token cannot mutate a live claim`.
       if (pending.token !== replyToken) return undefined
       return pending
     }
@@ -1813,7 +1836,9 @@ export class FleetBus {
     // could be reclaimed and re-injected while the first turn still ran.
     const stopRenewing = this.renewWhileRunning(subject, envelope.id, claim.reqId, claim.owner!)
     try {
-      await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId })
+      // No attempt identity: nothing replies to an unsolicited or late result, so
+      // there is no claim for a caller to prove authority over. Stated, not omitted.
+      await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId, replyToken: null })
       stopRenewing()
       // Settles at INJECTION, unlike `onRequest` which now defers to
       // `publishReply`. Deliberate: an unsolicited or late `.result` inject
