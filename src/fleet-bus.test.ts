@@ -935,6 +935,54 @@ describe('request session injection', () => {
     expect(bus.pendingReplyClaimCount()).toBe(1)
   })
 
+  test('a stale caller\'s failed reply does not abandon the replacement owner', async () => {
+    // Same replacement-owner corruption as the exception case, reached through
+    // the public reply API instead. `reqId` is stable across a takeover, so it
+    // names the ENVELOPE, not the attempt; only the per-attempt token can tell
+    // the old caller from the new one.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-stalereply-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const events: FleetBusSessionEvent[] = []
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        events.push(event)
+        if (events.length === 1) await new Promise<void>(resolve => { releaseOld = resolve })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({ id: 'stale-reply', to: 'vec', from: 'kat' })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    // Force the takeover #26 admits: same reqId, new owner, new attempt token.
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-reply')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toHaveLength(2)
+    expect(events[0]!.replyToken).not.toBe(events[1]!.replyToken)
+
+    // The OLD caller replies with an unserializable payload and returns
+    // cleanly. No exception is involved anywhere.
+    const stale = bus.publishReply(events[0]!.reqId, { bad: undefined }, 'result', events[0]!.replyToken)
+    expect(stale.ok).toBe(false)
+    releaseOld?.()
+    await oldTurn
+
+    // The NEW attempt returns normally, still owing its out-of-band reply. It
+    // must remain pending and renewing, untouched by the stale failure.
+    releaseNew?.()
+    await newTurn
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+  })
+
   test('the heartbeat sweeps expired claims', async () => {
     // The idle prune must be WIRED, not merely implemented: the store-level
     // test calls it directly, so deleting the heartbeat call left this green.

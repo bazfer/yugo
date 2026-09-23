@@ -161,6 +161,11 @@ DEDUP_PRUNE_BUDGET = 4 * DEDUP_PRUNE_EVERY
 # clock domain — boot id plus monotonic deadlines, with reboot recovery — and
 # is tracked as yugo#26. Until then a clock-step-induced overlap is an
 # accepted duplicate under the at-least-once contract.
+#
+# And a clock step is NOT the only way a lease is lost: a renewal failure, a
+# store fault, or an event-loop stall longer than the lease produce the same
+# takeover. Owner fencing must not be described as if yugo#26 were its only
+# prerequisite.
 DEDUP_LEASE_RENEW_RATIO = 0.4
 
 _BOT_NAME_PATTERN = re.compile(r"[a-z0-9_-]+")

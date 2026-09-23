@@ -90,6 +90,16 @@ export interface FleetBusSessionEvent {
   unsolicited?: boolean
   /** Set when this envelope is a late reply to a request whose waiter was already evicted. */
   lateReplyEnvId?: string
+  /**
+   * Opaque handle identifying THIS injection attempt.
+   *
+   * `reqId` is stable across a takeover — the store preserves it and issues a
+   * new owner — so it identifies the ENVELOPE, not the attempt. Pass this back
+   * to `publishReply` so a stale caller cannot settle or abandon the claim of
+   * the attempt that replaced it. Audit and wire correlation keep using
+   * `reqId`; only claim-lifecycle authority uses this.
+   */
+  replyToken?: string
 }
 
 /** Durable source of truth for envelope-id deduplication.
@@ -734,6 +744,8 @@ interface PendingReplyClaim {
   injectionActive: boolean
   /** Set when abandonment was decided while the injection was still running. */
   abandonReason?: string
+  /** Identifies the attempt that owns this claim; see `FleetBusSessionEvent.replyToken`. */
+  token: string
 }
 
 class BoundedLru<K, V> {
@@ -1158,19 +1170,34 @@ export class FleetBus {
     })
   }
 
-  publishReply(reqId: string, payload: unknown, kind = 'result'): FleetBusReplyResult {
+  publishReply(reqId: string, payload: unknown, kind = 'result', replyToken?: string): FleetBusReplyResult {
+    // Authority over the claim belongs to the ATTEMPT, not the reqId. After a
+    // takeover the key names a replacement owner, so a stale caller's failure
+    // would otherwise abandon a healthy newer claim, and a stale success would
+    // settle it. `claimFor` resolves only when the token matches; every claim
+    // mutation below goes through it.
+    const claimFor = (): PendingReplyClaim | undefined => {
+      const pending = this.pendingReplyClaims.get(reqId)
+      if (pending === undefined) return undefined
+      if (replyToken !== undefined && pending.token !== replyToken) return undefined
+      return pending
+    }
+    const abandonOwn = (reason: string): void => {
+      if (claimFor() === undefined) return
+      this.abandonRepliedClaim(reqId, reason)
+    }
     if (this.mode === 'publish-only') {
       return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only', req_id: reqId }
     }
     if (!this.nc || this.nc.isClosed()) {
-      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_fleet_bus_not_connected')
+      abandonOwn('claude_discord_adapter_fleet_bus_not_connected')
       return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
     }
     const inbound = this.receiveLedger.get(reqId)
     if (inbound === undefined) {
       // The inbound envelope is gone, so this reply can never be built — and
       // a claim that cannot be answered must not keep renewing.
-      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_req_id_unknown')
+      abandonOwn('claude_discord_adapter_req_id_unknown')
       return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
     }
     const subject = `fleet.${inbound.from}.request`
@@ -1179,7 +1206,7 @@ export class FleetBus {
         dir: 'drop', subject,
         reason: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId,
       })
-      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_payload_not_json_serializable')
+      abandonOwn('claude_discord_adapter_payload_not_json_serializable')
       return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId }
     }
     const canonicalBot = normalizeBotName(this.config.botName)!
@@ -1220,14 +1247,14 @@ export class FleetBus {
       // the REQUEST lane, so the audit subject is computed rather than
       // hardcoded to `.result`.
       this.recordAudit({ dir: 'drop', subject, reason: validation.error, envelope_id: envelopeId })
-      this.abandonRepliedClaim(reqId, validation.error)
+      abandonOwn(validation.error)
       return { ok: false, error: validation.error, req_id: reqId, envelope }
     }
     try {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, error: String(error) })
-      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_publish_failed')
+      abandonOwn('claude_discord_adapter_publish_failed')
       return { ok: false, error: 'claude_discord_adapter_publish_failed', req_id: reqId, envelope }
     }
     this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: reqId })
@@ -1235,7 +1262,7 @@ export class FleetBus {
     // the in-band completion signal `onRequest` defers to, and the reason its
     // claim is not settled at inject time. Only a claim we still own counts,
     // and only then is the in-memory fast path armed.
-    this.settleRepliedClaim(reqId)
+    if (claimFor() !== undefined) this.settleRepliedClaim(reqId)
     return { ok: true, envelope, req_id: reqId }
   }
 
@@ -1484,16 +1511,18 @@ export class FleetBus {
       // until its answer ships, and stopping now would let the lease lapse
       // mid-turn and hand the envelope to a second consumer. `publishReply`,
       // the eviction hook and the failure path below all stop it.
+      const replyToken = randomUUID()
       const pendingClaim: PendingReplyClaim = {
         envelopeId: result.envelope.id,
         owner: claim.owner!,
         subject,
         stopRenewing,
         injectionActive: true,
+        token: replyToken,
       }
       this.pendingReplyClaims.set(reqId, pendingClaim)
       try {
-        await this.injectIntoSession({ envelope: result.envelope, reqId })
+        await this.injectIntoSession({ envelope: result.envelope, reqId, replyToken })
       } catch (error) {
         // Record the failure ON THE CAPTURED OBJECT, not by reqId. After a
         // takeover the key may belong to a REPLACEMENT owner, and a stale
