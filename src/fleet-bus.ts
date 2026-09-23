@@ -862,20 +862,20 @@ export class FleetBus {
    * claim-fault guard. Completion is the same class of risk and was not
    * covered. Returns whether WE completed it.
    *
-   * The two INJECTION paths gate their in-memory ledger on that return: they
-   * await an unbounded session turn between claim and complete, so owner loss
-   * is reachable and arming the ledger would drop the real owner's envelope
-   * as a duplicate. The two LEDGER-MATCHED paths deliberately arm first and
-   * ignore the return — `match.resolve` is synchronous, there is no await
-   * between claim and complete, and arming early is what makes those paths
-   * re-entrant. Do not "fix" that asymmetry without reading both.
+   * Callers that gate on the return do so because they await an unbounded
+   * session turn between claim and complete, making owner loss reachable —
+   * arming the ledger there would drop the real owner's envelope as a
+   * duplicate. The LEDGER-MATCHED paths deliberately arm first and ignore the
+   * return: `match.resolve` is synchronous, there is no await between claim
+   * and complete, and arming early is what makes those paths re-entrant. Do
+   * not "fix" that asymmetry without reading both.
    *
-   * A SECOND asymmetry, against the Python port rather than within this one:
-   * both call sites here settle when the session accepts the envelope, not
-   * when a reply reaches the wire, because this adapter's reply is published
-   * out-of-band. Python settles after its publish. That divergence is
-   * deliberate, inert until durable consumers bind (SPEC §6.3, FB-3), and
-   * tracked as yugo#27.
+   * Where the settle points now are, since an earlier version of this comment
+   * described the opposite: `onRequest` does NOT settle here — it holds its
+   * claim in `pendingReplyClaims` and settles in `publishReply`, when the
+   * answer actually reaches the wire. `injectUnsolicited` still settles at
+   * injection, deliberately, because an unsolicited inject may legitimately
+   * never reply; that remaining asymmetry is yugo#27.
    */
   private completeClaim(subject: string, envelopeId: string, reqId: string, owner: string): boolean {
     let won: boolean
@@ -1131,7 +1131,10 @@ export class FleetBus {
     if (this.mode === 'publish-only') {
       return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only', req_id: reqId }
     }
-    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
+    if (!this.nc || this.nc.isClosed()) {
+      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_fleet_bus_not_connected')
+      return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
+    }
     const inbound = this.receiveLedger.get(reqId)
     if (inbound === undefined) return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
     if (!payloadIsJsonSerializable(payload)) {
@@ -1139,6 +1142,7 @@ export class FleetBus {
         dir: 'drop', subject: `fleet.${inbound.from}.result`,
         reason: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId,
       })
+      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_payload_not_json_serializable')
       return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId }
     }
     const canonicalBot = normalizeBotName(this.config.botName)!
@@ -1172,6 +1176,7 @@ export class FleetBus {
     const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
     if (!validation.ok) {
       this.recordAudit({ dir: 'drop', subject: `fleet.${inbound.from}.result`, reason: validation.error, envelope_id: envelopeId })
+      this.abandonRepliedClaim(reqId, validation.error)
       return { ok: false, error: validation.error, req_id: reqId, envelope }
     }
     const subject = `fleet.${inbound.from}.result`
@@ -1179,6 +1184,7 @@ export class FleetBus {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, error: String(error) })
+      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_publish_failed')
       return { ok: false, error: 'claude_discord_adapter_publish_failed', req_id: reqId, envelope }
     }
     this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: reqId })
@@ -1188,6 +1194,30 @@ export class FleetBus {
     // and only then is the in-memory fast path armed.
     this.settleRepliedClaim(reqId)
     return { ok: true, envelope, req_id: reqId }
+  }
+
+  /**
+   * Release the inbound claim when its reply will NEVER be published.
+   *
+   * There is no outbound retry at this boundary, so a terminal delivery
+   * failure leaves nothing that could ever settle the claim. Left alone the
+   * renewal timer keeps extending a lease for work that finished long ago:
+   * on a quiet process the entry is never capacity-evicted, peer retries are
+   * rejected as duplicates, and recovery needs an unrelated eviction, a
+   * restart, or the full TTL rather than the lease. Releasing hands the
+   * envelope straight back — under at-least-once a repeated effect is
+   * permitted and a lost answer is not.
+   */
+  private abandonRepliedClaim(reqId: string, reason: string): void {
+    const pending = this.pendingReplyClaims.get(reqId)
+    if (pending === undefined) return
+    this.pendingReplyClaims.delete(reqId)
+    pending.stopRenewing()
+    this.releaseClaim(pending.subject, pending.envelopeId, reqId, pending.owner)
+    this.recordAudit({
+      dir: 'drop', subject: pending.subject, reason: 'claude_discord_adapter_reply_undelivered',
+      envelope_id: pending.envelopeId, req_id: reqId, note: reason,
+    })
   }
 
   /**
@@ -1621,9 +1651,11 @@ export class FleetBus {
     try {
       await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId })
       stopRenewing()
-      // Same settle-point divergence as `onRequest` above — see that comment
-      // and yugo#27. The answer leaves out-of-band, so completing here cannot
-      // know it shipped.
+      // Settles at INJECTION, unlike `onRequest` which now defers to
+      // `publishReply`. Deliberate: an unsolicited or late `.result` inject
+      // may legitimately never produce a reply, so holding its claim open
+      // would strand it until the lease lapses. The cost is that this path
+      // cannot know its turn's output shipped — tracked as yugo#27.
       //
       // Gated for the reason `completeClaim`'s contract states: a lost owner
       // must not arm the in-memory fast path, or the real owner's result is

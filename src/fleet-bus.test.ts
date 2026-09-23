@@ -383,7 +383,10 @@ class FakeNatsConnection {
     this.closedResolve = resolve
   }
 
+  failPublish = false
+
   publish(subject: string, data: Uint8Array): void {
+    if (this.failPublish) throw new Error('transport failed')
     if (this.closed_) throw new Error('closed')
     this.publishes.push({ subject, envelope: jc.decode(data) })
   }
@@ -657,6 +660,36 @@ describe('request session injection', () => {
     }, allowlist)
     await bus.handleResult(envelope({ id: 'unsolicited-failed', to: 'vec', from: 'kat' }))
     expect(store.count()).toBe(0)
+  })
+
+  test('a failed publishReply abandons the claim instead of renewing it forever', async () => {
+    // Ohm's reproduction: the turn finished, the answer failed to publish, and
+    // there is no outbound retry at this boundary — so nothing could ever
+    // settle the claim. Left alone the renewal timer extends a lease for work
+    // that is over, peer retries are rejected as duplicates, and recovery
+    // needs an unrelated eviction, a restart or the full TTL.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-undeliv-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => { reqId = event.reqId },
+    }, allowlist)
+    const nc = new FakeNatsConnection()
+    bus.attachFakeNc(nc)
+    await bus.handleRequest(envelope({ id: 'undelivered', to: 'vec', from: 'kat' }))
+    expect(reqId).not.toBe('')
+
+    nc.failPublish = true
+    const result = bus.publishReply(reqId, { text: 'an answer' })
+    expect(result.ok).toBe(false)
+
+    // Well past several lease periods: a still-renewing claim would keep the
+    // rival locked out indefinitely.
+    await new Promise(resolve => setTimeout(resolve, 900))
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('undelivered', 'retry').duplicate).toBe(false)
   })
 
   test('the heartbeat sweeps expired claims', async () => {

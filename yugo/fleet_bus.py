@@ -1978,7 +1978,13 @@ class FleetBus:
                 **{"from": envelope["from"]},
             )
             try:
-                await self._publish_turn_output(subject, envelope, req_id, reply)
+                # Settle on the REAL transport result, not merely on the
+                # absence of an exception. `publish_request` catches transport
+                # errors and returns False (and returns False when
+                # disconnected), so watching only for a raise let a genuine
+                # delivery failure stamp the claim `completed` with no answer
+                # ever sent — suppressed for the whole TTL.
+                delivered = await self._publish_turn_output(subject, envelope, req_id, reply)
             except Exception as e:  # noqa: BLE001 — the subscription outlives one turn
                 # `publish_request` already absorbs every per-envelope fault, so
                 # reaching here means a fault in the parse-and-dispatch code
@@ -1995,6 +2001,17 @@ class FleetBus:
                     req_id=req_id,
                     error=repr(e),
                 )
+                return
+            if not delivered:
+                # Output owed and not delivered. Leave the claim recoverable:
+                # under at-least-once a repeated effect is permitted and a lost
+                # response is not. Partial sends land here too — a turn whose
+                # tag reached its peer but whose answer did not is unfinished.
+                #
+                # No audit line here on purpose: `publish_request` already
+                # recorded the failure that produced this, and a second
+                # `yugo_publish_failed` for one event would double-count in
+                # the terminal-path audit sets.
                 return
             settled = True
         finally:
@@ -2194,8 +2211,20 @@ class FleetBus:
 
     async def _publish_turn_output(
         self, subject: str, envelope: dict, req_id: str, reply: Any
-    ) -> None:
+    ) -> bool:
         """Send a completed bus turn: third-party `<BUS>` tags, then the reply.
+
+        Returns whether every outbound act this turn OWED actually reached the
+        wire. The caller settles the durable claim on that answer, so it must
+        be the real transport result: `publish_request` CATCHES transport
+        errors and returns False rather than raising, and it also returns False
+        when disconnected. An earlier version only watched for exceptions
+        escaping this function, so a genuine transport failure returned
+        normally, the claim was stamped `completed`, and the envelope was
+        suppressed for the whole TTL with no answer ever sent.
+
+        A deliberately suppressed reply (`in_reply_to` set, or an all-tags
+        turn) returns True: nothing was owed, so nothing failed.
 
         TWO different outbound acts, and keeping them separate is the whole
         design:
@@ -2255,10 +2284,14 @@ class FleetBus:
         Suppressions are audited rather than silent. "My bot received it, ran a
         turn and said nothing" is otherwise unexplainable from the log.
         """
+        # Every outbound act that FAILED flips this. Starts True because a
+        # turn that owes nothing has delivered everything it owed.
+        delivered = True
+
         if not isinstance(reply, str):
             # The hook contract is `str | None`; None is a turn with nothing
             # to say. Anything else is a caller bug, not an envelope.
-            return
+            return delivered
 
         baton = next_baton_fields(envelope)
         tags = find_bus_tags(reply)
@@ -2313,13 +2346,17 @@ class FleetBus:
                     raw=_audit_excerpt(reply[tag.start : tag.end]),
                 )
                 continue
-            await self.publish_request(
+            if not await self.publish_request(
                 tag.attrs.get("to"),
                 {"text": body},
                 baton=baton,
                 req_id=req_id,
                 source_subject=subject,
-            )
+            ):
+                # A tag that never reached its peer is undelivered output. The
+                # turn is not settled on a partial send; under at-least-once a
+                # repeat is permitted and a silent loss is not.
+                delivered = False
 
         if envelope.get("in_reply_to") is not None:
             self._audit.record(
@@ -2330,7 +2367,7 @@ class FleetBus:
                 req_id=req_id,
                 cause="in_reply_to",
             )
-            return
+            return delivered
 
         answer = strip_bus_tags(reply, tags).strip()
         if not answer:
@@ -2344,15 +2381,17 @@ class FleetBus:
                 req_id=req_id,
                 cause="empty_reply",
             )
-            return
-        await self.publish_request(
+            return delivered
+        if not await self.publish_request(
             envelope["from"],
             {"text": answer},
             in_reply_to=envelope["id"],
             baton=baton,
             req_id=req_id,
             source_subject=subject,
-        )
+        ):
+            delivered = False
+        return delivered
 
     async def _teardown(self) -> None:
         nats = _lazy_nats()

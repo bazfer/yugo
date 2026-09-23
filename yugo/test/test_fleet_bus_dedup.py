@@ -285,6 +285,7 @@ async def test_the_claim_is_still_pending_while_the_reply_is_published(tmp_path)
             "SELECT state FROM envelope_dedup_v2 WHERE envelope_id=?", ("publish-window",)
         ).fetchone()
         state_at_publish.append(row[0])
+        return True  # the real helper returns delivery success; None reads as failure
 
     bus._publish_turn_output = spy
     await bus._on_request("fleet.vec.request", wire)
@@ -511,3 +512,48 @@ async def test_a_second_cancel_during_cleanup_still_settles_the_claim(tmp_path):
     )
     rival = fleet_bus.DurableEnvelopeDedupStore(str(path))
     assert rival.claim("double-cancel", "retry")[0] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["transport_error", "disconnected"])
+async def test_a_transport_publish_failure_leaves_the_claim_recoverable(tmp_path, mode):
+    """Failure at the REAL NATS boundary, not a throwing dispatcher stub.
+
+    `publish_request` catches transport errors and returns False rather than
+    raising, and returns False when disconnected. Watching only for an
+    exception escaping `_publish_turn_output` therefore missed genuine
+    delivery failures entirely: the claim was stamped `completed`, zero
+    replies shipped, and the envelope stayed suppressed for the whole TTL.
+
+    The previous publish-failure test replaced `_publish_turn_output` with a
+    raising stub, which bypasses exactly the failure conversion that needed
+    exercising. This one fails at `nc.publish` with the real helpers in place.
+    """
+    path = tmp_path / "dedup.sqlite"
+    bus = fleet_bus.FleetBus(
+        _bus_config(path), fleet_bus.AuditLog(None),
+        on_envelope=lambda _e, _r: asyncio.sleep(0, result="an answer"),
+    )
+
+    class FakeNats:
+        def __init__(self, closed):
+            self.is_closed = closed
+            self.publishes = 0
+
+        async def publish(self, *_args, **_kwargs):
+            self.publishes += 1
+            raise OSError("transport failed")
+
+    bus._nc = FakeNats(closed=(mode == "disconnected"))
+    await bus._on_request("fleet.vec.request", _wire(f"transport-{mode}"))
+
+    row = bus._dedup._db.execute(
+        "SELECT state FROM envelope_dedup_v2 WHERE envelope_id=?", (f"transport-{mode}",)
+    ).fetchone()
+    assert row is None or row[0] != "completed", (
+        f"{mode}: the claim was stamped completed although no answer reached the wire"
+    )
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert rival.claim(f"transport-{mode}", "retry")[0] is False, (
+        f"{mode}: an undelivered answer is not recoverable — suppressed for the full TTL"
+    )
