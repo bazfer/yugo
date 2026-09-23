@@ -466,3 +466,48 @@ async def test_cancellation_during_the_hop_warning_does_not_orphan_the_renewer(t
     assert rival.claim("cancelled-warning", "retry")[0] is False, (
         "the envelope is not recoverable after a cancel during the hop warning"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_second_cancel_during_cleanup_still_settles_the_claim(tmp_path):
+    """The settle decision must not sit behind an await.
+
+    A cancel delivered while the cleanup path is suspended raises straight out
+    of the `finally`, skipping the decision and leaving the claim `pending`
+    with an unrenewed lease — recoverable only once that lease lapses, instead
+    of immediately. `asyncio.shield` does NOT prevent this: it protects the
+    awaited task, not the awaiting coroutine, and its extra scheduling hop is
+    where the second cancel lands. Ordering is the fix.
+    """
+    path = tmp_path / "dedup.sqlite"
+    bus = fleet_bus.FleetBus(
+        _bus_config(path), fleet_bus.AuditLog(None),
+        on_envelope=lambda _e, _r: asyncio.sleep(0, result="an answer"),
+    )
+    publishing = asyncio.Event()
+
+    async def block_before_sending(*_args, **_kwargs):
+        publishing.set()
+        await asyncio.sleep(3600)
+
+    bus._publish_turn_output = block_before_sending
+    task = asyncio.create_task(bus._on_request("fleet.vec.request", _wire("double-cancel")))
+    await asyncio.wait_for(publishing.wait(), timeout=5)
+
+    # Two cancels: the first interrupts the publish, the second arrives while
+    # cleanup is running — the window the shield was wrongly believed to close.
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = bus._dedup._db.execute(
+        "SELECT state FROM envelope_dedup_v2 WHERE envelope_id=?", ("double-cancel",)
+    ).fetchone()
+    assert row is None, (
+        f"the settle decision was skipped — row left as {row} with an unrenewed "
+        "lease, recoverable only after it lapses instead of immediately"
+    )
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert rival.claim("double-cancel", "retry")[0] is False

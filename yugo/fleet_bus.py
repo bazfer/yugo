@@ -1998,10 +1998,21 @@ class FleetBus:
                 return
             settled = True
         finally:
-            # Renewal stops on EVERY exit, cancellation included. Shielded so a
-            # second cancel arriving here cannot skip the settle decision below
-            # and strand the claim pending-but-unrenewed.
-            await asyncio.shield(_cancel_task(renewer))
+            # SETTLE FIRST, then stop renewing. Both settle calls are
+            # synchronous, so nothing can interrupt between here and the store
+            # write — whereas any `await` placed above them is a cancellation
+            # point that skips the decision entirely and strands the claim
+            # pending-but-unrenewed until its lease lapses.
+            #
+            # An earlier version used `asyncio.shield` here and claimed it
+            # prevented that. It does the opposite: shield protects the
+            # AWAITED task, not the awaiting coroutine, and its extra
+            # scheduling hop is exactly where a second cancel lands. Ordering
+            # is the fix; there is no await to protect.
+            #
+            # Renewing after the settle is harmless: `renew` requires
+            # state='pending', so a completed claim ends the renewal loop on
+            # its own and a released row no longer exists.
             if settled:
                 self._complete_claim(subject, envelope, req_id, claim_owner)
             else:
@@ -2011,6 +2022,7 @@ class FleetBus:
                 # this ordering exists to prevent, reached by cancellation
                 # instead of by process death.
                 self._release_claim(subject, envelope, req_id, claim_owner)
+            await _cancel_task(renewer)
 
     def _complete_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
         """Promote a claim, surviving a store fault and reporting owner loss.

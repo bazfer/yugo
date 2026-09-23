@@ -127,12 +127,15 @@ export class DurableEnvelopeDedupStore {
 
   claim(envelopeId: string, reqId: string, nowMs = Date.now()): { duplicate: boolean; reqId: string; owner?: string } {
     const owner = randomUUID()
-    // `.immediate()`, not the default deferred wrapper. The first statement
-    // here is a write, so SQLite would upgrade anyway — but only at that
-    // statement, which leaves a window where two consumers both read before
-    // either writes. Taking the write lock up front is what makes the claim
-    // the concurrency arbiter it is documented to be, and it matches the
-    // Python port's `BEGIN IMMEDIATE`.
+    // `.immediate()`, matching the Python port's `BEGIN IMMEDIATE`.
+    //
+    // Honest about what it does and does not buy: the arbiter is the PRIMARY
+    // KEY plus `INSERT OR IGNORE`, not the transaction mode. The first
+    // statement here is a DELETE, so a deferred transaction takes the write
+    // lock at that same point and behaves identically — a review confirmed the
+    // exactly-one-winner test passes either way. This is kept for parity with
+    // the sibling port and to state the intent at the top, not because
+    // correctness depends on it.
     const transaction = this.db.transaction(() => {
       this.claims += 1
       if (this.claims % DEDUP_PRUNE_EVERY === 0) this.prune(nowMs)
@@ -839,6 +842,13 @@ export class FleetBus {
    * ignore the return — `match.resolve` is synchronous, there is no await
    * between claim and complete, and arming early is what makes those paths
    * re-entrant. Do not "fix" that asymmetry without reading both.
+   *
+   * A SECOND asymmetry, against the Python port rather than within this one:
+   * both call sites here settle when the session accepts the envelope, not
+   * when a reply reaches the wire, because this adapter's reply is published
+   * out-of-band. Python settles after its publish. That divergence is
+   * deliberate, inert until durable consumers bind (SPEC §6.3, FB-3), and
+   * tracked as yugo#27.
    */
   private completeClaim(subject: string, envelopeId: string, reqId: string, owner: string): boolean {
     let won: boolean
@@ -1295,6 +1305,26 @@ export class FleetBus {
     try {
       await this.injectIntoSession({ envelope: result.envelope, reqId })
       stopRenewing()
+      // SETTLE POINT — a DELIBERATE divergence from the Python port, recorded
+      // here because the sibling port treats this exact shape as a P1.
+      //
+      // `injectIntoSession` only hands the envelope to the session. The answer
+      // travels later and out-of-band, when the embedder calls `publishReply`,
+      // so nothing at this line knows whether a reply ever reached the wire.
+      // Completing here therefore CAN stamp a claim done for a turn whose
+      // answer never shipped — the tombstone `yugo/fleet_bus.py` now defers
+      // past `_publish_turn_output` specifically to avoid.
+      //
+      // Why it is not a live bug today: SPEC §6.3 has JetStream capture applied
+      // but bots still bind core subscriptions — durable consumers land in
+      // FB-3. With no redelivery there is nothing to suppress. It becomes real
+      // the day a consumer binds durably, and it is tracked as yugo#27.
+      //
+      // Why it is not simply fixed here: this adapter has no in-band completion
+      // signal to settle on. Closing it means threading an ack from
+      // `publishReply` back to the claim, which is FB-3's shape of work, not
+      // this PR's.
+      //
       // Only a claim we still OWNED counts as completed. Populating the
       // in-memory fast path on a stale or failed completion would suppress
       // the real owner's delivery.
@@ -1333,10 +1363,12 @@ export class FleetBus {
     // store with its own lease (the third constructor parameter), and reading
     // the default gave a 24s cadence against a 5s lease — renewal firing four
     // leases late and fencing nothing, silently.
-    // Floor is a guard against a pathological zero, NOT a minimum cadence: a
-    // 1s floor silently disabled fencing for any lease under 2.5s, because
-    // renewal then fired after the lease had already lapsed. Matches the
-    // Python port's floor.
+    // Floor guards against a pathological zero or negative cadence; it is not
+    // a minimum tick. Kept low and matched to the Python port so the cadence
+    // tracks the lease across the whole plausible range rather than being
+    // clamped for short leases. Note that no test pins this value — the
+    // fencing tests use a 1s lease, which survives a 1s floor — so treat it as
+    // a documented intent, not an invariant.
     const intervalMs = Math.max(50, this.durableDedup.leaseMs * DEDUP_LEASE_RENEW_RATIO)
     const timer = setInterval(() => {
       let held: boolean
@@ -1532,6 +1564,10 @@ export class FleetBus {
     try {
       await this.injectIntoSession({ envelope, reqId, unsolicited: true, lateReplyEnvId })
       stopRenewing()
+      // Same settle-point divergence as `onRequest` above — see that comment
+      // and yugo#27. The answer leaves out-of-band, so completing here cannot
+      // know it shipped.
+      //
       // Gated for the reason `completeClaim`'s contract states: a lost owner
       // must not arm the in-memory fast path, or the real owner's result is
       // dropped here as a duplicate when it arrives.
