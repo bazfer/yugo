@@ -1408,6 +1408,26 @@ export class FleetBus {
     // here; it is documented as at-least-once (SPEC, and yugo#24).
     const stopRenewing = this.renewWhileRunning(subject, result.envelope.id, claim.reqId, claim.owner!)
     try {
+      // REGISTER BEFORE AWAITING. `injectIntoSession` is an unbounded
+      // `Promise<void>` and nothing stops the session replying, or a
+      // cross-lane arrival evicting this envelope, DURING that await. While no
+      // pending entry exists the claim is owned and renewing but invisible:
+      // `settleRepliedClaim`, `abandonRepliedClaim` and the eviction hook all
+      // no-op, and registering afterwards would blindly resurrect a claim that
+      // had already been settled or abandoned. Registering first makes every
+      // terminal transition observable, and there is no later re-registration
+      // to lose one.
+      //
+      // Renewal deliberately CONTINUES past this point: the claim is live work
+      // until its answer ships, and stopping now would let the lease lapse
+      // mid-turn and hand the envelope to a second consumer. `publishReply`,
+      // the eviction hook and the failure path below all stop it.
+      this.pendingReplyClaims.set(reqId, {
+        envelopeId: result.envelope.id,
+        owner: claim.owner!,
+        subject,
+        stopRenewing,
+      })
       await this.injectIntoSession({ envelope: result.envelope, reqId })
       // SETTLE POINT — deferred to `publishReply`, matching the Python port.
       //
@@ -1431,20 +1451,13 @@ export class FleetBus {
       // unsolicited inject legitimately may never reply, and holding a claim
       // for an answer that is never owed would strand it until the lease
       // lapses.
-      // Renewal deliberately CONTINUES here: the claim is still live work
-      // until its answer ships, and stopping now would let the lease lapse
-      // mid-turn and hand the envelope to a second consumer. `publishReply`
-      // and the eviction hook both stop it.
-      this.pendingReplyClaims.set(reqId, {
-        envelopeId: result.envelope.id,
-        owner: claim.owner!,
-        subject,
-        stopRenewing,
-      })
       return
     } catch (error) {
+      // Idempotent by design: if an early reply already settled the claim, or
+      // an eviction already abandoned it, this finds no entry and does
+      // nothing rather than releasing someone else's work.
+      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_injection_failed')
       stopRenewing()
-      this.releaseClaim(subject, result.envelope.id, claim.reqId, claim.owner!)
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
       return
     }

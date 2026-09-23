@@ -466,6 +466,9 @@ class TestFleetBus extends FleetBus {
   handleResult(value: unknown, subject = 'fleet.vec.result'): Promise<void> {
     return this.onResult(fakeMessage(subject, value))
   }
+  pendingReplyClaimCount(): number {
+    return (this as unknown as { pendingReplyClaims: { size: number } }).pendingReplyClaims.size
+  }
   /** Settle a pending-reply claim without a live NATS connection. */
   settleReply(reqId: string): void {
     (this as unknown as { settleRepliedClaim: (r: string) => void }).settleRepliedClaim(reqId)
@@ -749,6 +752,83 @@ describe('request session injection', () => {
     await new Promise(resolve => setTimeout(resolve, 900))
     const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
     expect(rival.claim('hops-exhausted', 'retry').duplicate).toBe(false)
+  })
+
+  test('a reply published DURING injection is not lost to registration order', async () => {
+    // The claim used to be registered only AFTER `await injectIntoSession`.
+    // Nothing stops a session replying inside that await — the API is
+    // `Promise<void>` — so the settle found no pending entry, did nothing,
+    // and the handler then registered a claim that was already answered.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-early-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let replyResult: FleetBusReplyResult | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        replyResult = bus.publishReply(event.reqId, { text: 'done' })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({ id: 'early-reply', to: 'vec', from: 'kat' }))
+    expect(replyResult?.ok).toBe(true)
+    // Settled, so the fast path is armed and nothing is left renewing.
+    expect(bus.seenRequestLedgerHas('early-reply')).toBe(true)
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+  })
+
+  test('a reply that FAILS during injection is not resurrected afterwards', async () => {
+    // Same race, failure side: abandonment ran while no pending entry existed,
+    // then the handler registered the abandoned claim and it renewed forever.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-early-fail-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        nc.failPublish = true
+        bus.publishReply(event.reqId, { text: 'done' })
+      },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    await bus.handleRequest(envelope({ id: 'early-fail', to: 'vec', from: 'kat' }))
+    await new Promise(resolve => setTimeout(resolve, 900))
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('early-fail', 'retry').duplicate).toBe(false)
+  })
+
+  test('eviction DURING injection is not undone by late registration', async () => {
+    // Cross-lane: A's injection is still awaiting when an unsolicited result B
+    // arrives on the other handler, installs itself in the receive ledger and
+    // evicts A. The eviction hook fired before A was registered, so A used to
+    // be registered after its inbound envelope was already gone.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-race-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let releaseA: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, receiveLedgerCap: 1,
+      injectIntoSession: async event => {
+        if (event.envelope.id !== 'race-a') return
+        await new Promise<void>(resolve => { releaseA = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const injecting = bus.handleRequest(envelope({ id: 'race-a', to: 'vec', from: 'kat' }))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    // B lands on the result lane and evicts A from the capacity-1 ledger.
+    await bus.handleResult(envelope({ id: 'race-b', to: 'vec', from: 'kat', in_reply_to: 'nothing' }))
+    releaseA?.()
+    await injecting
+
+    await new Promise(resolve => setTimeout(resolve, 900))
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('race-a', 'retry').duplicate).toBe(false)
   })
 
   test('the heartbeat sweeps expired claims', async () => {
