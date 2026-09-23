@@ -692,6 +692,65 @@ describe('request session injection', () => {
     expect(rival.claim('undelivered', 'retry').duplicate).toBe(false)
   })
 
+  test('receive-ledger eviction abandons the claim it stranded', async () => {
+    // Ohm's A/B/C reproduction. Publishing A's reply TOUCHES A in the receive
+    // ledger (LRU) and REMOVES A from the pending map, so the two ledgers
+    // drift: C then evicts B from the receive ledger while the pending map
+    // holds B and C and evicts nothing. B's reply can never be built, yet its
+    // claim kept renewing — on a quiet process, suppressing B until the TTL.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-evict-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const seen: string[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, receiveLedgerCap: 2,
+      injectIntoSession: async event => { seen.push(event.reqId) },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({ id: 'evict-a', to: 'vec', from: 'kat' }))
+    await bus.handleRequest(envelope({ id: 'evict-b', to: 'vec', from: 'kat' }))
+    expect(bus.publishReply(seen[0]!, { text: 'reply to A' }).ok).toBe(true)
+    await bus.handleRequest(envelope({ id: 'evict-c', to: 'vec', from: 'kat' }))
+
+    // Deliberately do NOT call publishReply for B. The eviction itself must
+    // release the claim — a quiet process may never attempt that reply, and
+    // the `req_id_unknown` guard in publishReply would otherwise mask this.
+    await new Promise(resolve => setTimeout(resolve, 900))
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('evict-b', 'retry').duplicate).toBe(false)
+
+    // And the guard in publishReply covers the same condition when the reply
+    // IS attempted — defence in depth, not a duplicate of the above.
+    expect(bus.publishReply(seen[1]!, { text: 'reply to B' }).ok).toBe(false)
+  })
+
+  test('baton hop exhaustion abandons the claim instead of renewing it', async () => {
+    // Respecting the hop ceiling is correct; keeping a live lease for a reply
+    // that will never be sent is not a disposition.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-hops-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => { reqId = event.reqId },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({
+      id: 'hops-exhausted', to: 'vec', from: 'kat',
+      root_id: 'hops-exhausted', origin: 'kat', owner: 'kat', hops: 15,
+    }))
+    expect(reqId).not.toBe('')
+    // Derivation increments to 16 and throws BatonHopsExhausted.
+    expect(bus.publishReply(reqId, { text: 'an answer' }).ok).toBe(false)
+
+    await new Promise(resolve => setTimeout(resolve, 900))
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('hops-exhausted', 'retry').duplicate).toBe(false)
+  })
+
   test('the heartbeat sweeps expired claims', async () => {
     // The idle prune must be WIRED, not merely implemented: the store-level
     // test calls it directly, so deleting the heartbeat call left this green.

@@ -828,7 +828,16 @@ export class FleetBus {
       config.inflightLedgerCap ?? DEFAULT_INFLIGHT_LEDGER_CAP,
       (_key, entry) => this.onInflightEvict(entry),
     )
-    this.receiveLedger = new BoundedLru<string, Envelope>(config.receiveLedgerCap ?? DEFAULT_RECEIVE_LEDGER_CAP)
+    // Evicting an inbound envelope strands any claim still waiting to answer
+    // it: `publishReply` needs that envelope to build the reply, so once it is
+    // gone the claim can never be settled and would renew forever. The two
+    // maps have the same capacity but NOT the same contents — a successful
+    // reply removes its claim while leaving the inbound entry, so the ledgers
+    // drift apart and one can evict a key the other still holds.
+    this.receiveLedger = new BoundedLru<string, Envelope>(
+      config.receiveLedgerCap ?? DEFAULT_RECEIVE_LEDGER_CAP,
+      reqId => { this.abandonRepliedClaim(reqId, 'claude_discord_adapter_receive_ledger_evicted') },
+    )
     this.pendingReplyClaims = new BoundedLru<string, PendingReplyClaim>(
       config.receiveLedgerCap ?? DEFAULT_RECEIVE_LEDGER_CAP,
       // An evicted entry means we will never see that reply published, so the
@@ -1136,7 +1145,12 @@ export class FleetBus {
       return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
     }
     const inbound = this.receiveLedger.get(reqId)
-    if (inbound === undefined) return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
+    if (inbound === undefined) {
+      // The inbound envelope is gone, so this reply can never be built — and
+      // a claim that cannot be answered must not keep renewing.
+      this.abandonRepliedClaim(reqId, 'claude_discord_adapter_req_id_unknown')
+      return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
+    }
     const subject = `fleet.${inbound.from}.request`
     if (!payloadIsJsonSerializable(payload)) {
       this.recordAudit({
@@ -1160,6 +1174,10 @@ export class FleetBus {
     } catch (error) {
       const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
       this.recordAudit({ dir: 'drop', subject, reason, envelope_id: envelopeId })
+      // Terminal for this reply: hop exhaustion and derivation failure are
+      // not retried here. Respecting the hop ceiling is correct; holding a
+      // live lease for a reply that will never be sent is not a disposition.
+      this.abandonRepliedClaim(reqId, reason)
       return { ok: false, error: reason, req_id: reqId }
     }
     const envelope: Envelope = {
