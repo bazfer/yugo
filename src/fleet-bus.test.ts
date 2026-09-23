@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test'
+import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
@@ -8,7 +9,9 @@ import {
   BatonDerivationError,
   BatonHopsExhausted,
   DEFAULT_MAX_ENVELOPE_BYTES,
+  DEFAULT_DEDUP_TTL_MS,
   DEFAULT_PAYLOAD_BODY_MAX_BYTES,
+  DurableEnvelopeDedupStore,
   FixedWindowBucket,
   FleetBus,
   RESERVED_BOT_NAMES,
@@ -25,12 +28,122 @@ import {
   validateEnvelope,
   type Envelope,
   type FleetBusRequestResult,
+  type FleetBusConfig,
   type FleetBusSessionEvent,
   type TokenBucket,
+  DEFAULT_DEDUP_LEASE_MS,
 } from './fleet-bus'
 
 const jc = JSONCodec()
 const allowlist = normalizeAllowlist(['luna', 'deet', 'kat', 'vec', 'ohm', 'myc', 'helm'])
+
+describe('durable envelope dedup', () => {
+  test('survives restart, reports original req_id, and expires after TTL', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const first = new DurableEnvelopeDedupStore(path)
+    const initial = first.claim('env-1', 'req-original', 1_000)
+    expect(initial).toMatchObject({ duplicate: false, reqId: 'req-original' })
+    first.complete('env-1', initial.owner!)
+    const restarted = new DurableEnvelopeDedupStore(path)
+    expect(restarted.claim('env-1', 'req-new', 1_050)).toEqual({ duplicate: true, reqId: 'req-original' })
+    expect(restarted.prune(DEFAULT_DEDUP_TTL_MS + 1_001)).toBe(1)
+    expect(restarted.claim('env-1', 'req-after-ttl', DEFAULT_DEDUP_TTL_MS + 1_001)).toMatchObject({ duplicate: false, reqId: 'req-after-ttl' })
+    expect(restarted.prunePlan()).toContain('envelope_dedup_v2_first_seen')
+  })
+
+  test('pruning uses the timestamp index and drains the expired set in bounded batches', () => {
+    const store = new DurableEnvelopeDedupStore(':memory:', 10)
+    for (let i = 0; i < 101; i += 1) {
+      const claim = store.claim(`old-${i}`, `req-${i}`, 0)
+      store.complete(`old-${i}`, claim.owner!)
+    }
+    expect(store.prunePlan()).toContain('envelope_dedup_v2_first_seen')
+    // Batches stay bounded, but the sweep LOOPS until drained. A single
+    // 100-row batch is what let the backlog grow ~156 rows per 256 arrivals.
+    expect(store.prune(100)).toBe(101)
+    expect(store.prune(100)).toBe(0)
+  })
+
+  test('pruning outpaces a steady arrival stream', () => {
+    // Ohm's reproduction, inverted into an invariant: 1,024 unique claims with
+    // synthetic time advancing past the TTL retained 624 rows under the
+    // single-batch prune, when only the newest should be live.
+    const ttl = 100
+    const store = new DurableEnvelopeDedupStore(':memory:', ttl)
+    for (let i = 0; i < 1_024; i += 1) {
+      const claim = store.claim(`stream-${i}`, `req-${i}`, i)
+      store.complete(`stream-${i}`, claim.owner!)
+    }
+    store.prune(1_024)
+    const live = store.count()
+    const expired = store.countExpired(1_024)
+    expect(expired).toBe(0)
+    expect(live).toBeLessThanOrEqual(ttl + 1)
+  })
+
+  test('pruneIdle sweeps a quiet lane', () => {
+    const store = new DurableEnvelopeDedupStore(':memory:', 10)
+    for (let i = 0; i < 50; i += 1) {
+      const claim = store.claim(`burst-${i}`, `req-${i}`, 0)
+      store.complete(`burst-${i}`, claim.owner!)
+    }
+    // No further claims arrive, so the every-N-claims trigger never fires.
+    expect(store.pruneIdle(100)).toBe(50)
+    expect(store.count()).toBe(0)
+  })
+
+  test('renewal holds a live owner past the original expiry', () => {
+    // The testable half of the P1. This does NOT assert exactly-once
+    // execution: under the at-least-once contract a crash after a side effect
+    // but before completion may duplicate. What must never happen is a SECOND
+    // worker starting while the first is alive and still executing.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const owner = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 2_000)
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 2_000)
+    const claim = owner.claim('long-turn', 'original', 100_000)
+    expect(claim.duplicate).toBe(false)
+
+    expect(owner.renew('long-turn', claim.owner!, 101_000)).toBe(true)
+    expect(rival.claim('long-turn', 'rival', 102_500).duplicate).toBe(true)
+    expect(owner.renew('long-turn', claim.owner!, 103_000)).toBe(true)
+    expect(rival.claim('long-turn', 'rival', 104_500).duplicate).toBe(true)
+
+    // Owner dies. Recovery still works — that is the at-least-once half.
+    expect(rival.claim('long-turn', 'rival', 200_000).duplicate).toBe(false)
+    // And the original owner is now fenced: its completion must not land.
+    expect(owner.complete('long-turn', claim.owner!)).toBe(false)
+    expect(owner.renew('long-turn', claim.owner!, 201_000)).toBe(false)
+  })
+
+  test('complete and release report owner loss instead of silently succeeding', () => {
+    const store = new DurableEnvelopeDedupStore(':memory:', DEFAULT_DEDUP_TTL_MS, 2_000)
+    const claim = store.claim('env', 'req', 100_000)
+    expect(store.complete('env', claim.owner!)).toBe(true)
+    // The SAME owner completing twice — what `AND state='pending'` buys, and
+    // the clause the owner predicate alone never exercises.
+    expect(store.complete('env', claim.owner!)).toBe(false)
+    expect(store.complete('env', 'someone-else')).toBe(false)
+    expect(store.release('env', 'someone-else')).toBe(false)
+  })
+
+  test('two store connections produce exactly one winner', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const left = new DurableEnvelopeDedupStore(path)
+    const right = new DurableEnvelopeDedupStore(path)
+    const claims = [left.claim('raced', 'left'), right.claim('raced', 'right')]
+    expect(claims.filter(claim => !claim.duplicate)).toHaveLength(1)
+    expect(claims.filter(claim => claim.duplicate)).toHaveLength(1)
+    expect(claims[1]!.reqId).toBe('left')
+  })
+
+  test('expired pending claim is recoverable with the original req_id', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-')), 'dedup.sqlite')
+    const crashed = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
+    expect(crashed.claim('pending', 'original', 100)).toMatchObject({ duplicate: false, reqId: 'original' })
+    const restarted = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
+    expect(restarted.claim('pending', 'replacement', 111)).toMatchObject({ duplicate: false, reqId: 'original' })
+  })
+})
 
 function envelope(overrides: Record<string, unknown> = {}) {
   return {
@@ -271,7 +384,10 @@ class FakeNatsConnection {
     this.closedResolve = resolve
   }
 
+  failPublish = false
+
   publish(subject: string, data: Uint8Array): void {
+    if (this.failPublish) throw new Error('transport failed')
     if (this.closed_) throw new Error('closed')
     this.publishes.push({ subject, envelope: jc.decode(data) })
   }
@@ -311,6 +427,13 @@ class FakeNatsConnection {
     }
   }
 
+  /** Push a message into a live subscription, to drive the real `subscribe` loop. */
+  pushTo(subject: string, msg: Msg): void {
+    const sub = this.subscriptions.find(s => s.subject === subject)
+    if (!sub) throw new Error(`no subscription for ${subject}`)
+    sub.push(msg)
+  }
+
   isClosed(): boolean { return this.closed_ }
   async close(): Promise<void> { this.markClosed() }
   async drain(): Promise<void> { this.markClosed() }
@@ -332,6 +455,9 @@ function fakeMessage(subject: string, envelope: unknown): Msg {
 }
 
 class TestFleetBus extends FleetBus {
+  constructor(config: FleetBusConfig, allowed: ReadonlySet<string>) {
+    super({ ...config, dedupStorePath: config.dedupStorePath ?? ':memory:' }, allowed)
+  }
   attachFakeNc(nc: FakeNatsConnection): void {
     (this as unknown as { nc: FakeNatsConnection }).nc = nc
   }
@@ -340,6 +466,21 @@ class TestFleetBus extends FleetBus {
   }
   handleResult(value: unknown, subject = 'fleet.vec.result'): Promise<void> {
     return this.onResult(fakeMessage(subject, value))
+  }
+  pendingReplyClaimCount(): number {
+    return (this as unknown as { pendingReplyClaims: { size: number } }).pendingReplyClaims.size
+  }
+  /** Settle a pending-reply claim without a live NATS connection. */
+  settleReply(reqId: string): void {
+    (this as unknown as { settleRepliedClaim: (r: string) => void }).settleRepliedClaim(reqId)
+  }
+  /** Drive one heartbeat, to observe what the beat is wired to do. */
+  beat(): void {
+    (this as unknown as { publishHeartbeat: () => void }).publishHeartbeat()
+  }
+  /** Drive the real `subscribe` loop, which no other test exercises. */
+  runSubscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
+    (this as unknown as { subscribe: (s: string, h: typeof handler) => void }).subscribe(subject, handler)
   }
   outboundLedgerSize(): number {
     return (this as unknown as { outboundLedger: { size: number } }).outboundLedger.size
@@ -362,6 +503,741 @@ class TestFleetBus extends FleetBus {
 }
 
 describe('request session injection', () => {
+  test('dedup store failure drops one delivery without killing later handling', async () => {
+    class FailOnceStore extends DurableEnvelopeDedupStore {
+      private fail = true
+      override claim(envelopeId: string, reqId: string, nowMs?: number) {
+        if (this.fail) { this.fail = false; throw new Error('disk busy') }
+        return super.claim(envelopeId, reqId, nowMs)
+      }
+    }
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: new FailOnceStore(':memory:'),
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    await bus.handleRequest(envelope({ id: 'store-fault', to: 'vec' }))
+    await bus.handleRequest(envelope({ id: 'healthy-after-store-fault', to: 'vec' }))
+    expect(events.map(event => event.envelope.id)).toEqual(['healthy-after-store-fault'])
+  })
+
+  test('a rejecting handler does not end the subscription lane', async () => {
+    // `subscribe` caught OUTSIDE the `for await` loop, so one rejected
+    // handler permanently ended the lane while the connection and heartbeat
+    // stayed healthy — the bot looks alive and silently receives nothing.
+    // Nothing in the suite went through `subscribe`, so reverting the fix
+    // left everything green.
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async () => {},
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const seen: string[] = []
+    const tokens: Array<string | null | undefined> = []
+    bus.runSubscribe('fleet.vec.request', async (message: Msg) => {
+      const id = (jc.decode(message.data) as { id: string }).id
+      seen.push(id)
+      if (id === 'poison') throw new Error('handler exploded')
+    })
+    nc.pushTo('fleet.vec.request', fakeMessage('fleet.vec.request', envelope({ id: 'poison', to: 'vec' })))
+    nc.pushTo('fleet.vec.request', fakeMessage('fleet.vec.request', envelope({ id: 'after-poison', to: 'vec' })))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(seen).toEqual(['poison', 'after-poison'])
+  })
+
+  test('a slow turn keeps a rival fenced for its whole duration', async () => {
+    // The test the P1 actually demands: fencing through the BUS, not the
+    // store. The previous round's renewal tests called `store.renew()`
+    // directly, so the whole renewal wiring could be deleted from FleetBus
+    // with the suite still green.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-renew-')), 'dedup.sqlite')
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000)
+    const observed: boolean[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      // Short lease so the turn genuinely outlives it. The bus derives its
+      // renewal cadence from the store, so this is all that needs setting.
+      dedupStore: new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000),
+      injectIntoSession: async () => {
+        // Three lease-lengths of work. Without renewal the lease lapses after
+        // the first and the rival takes the envelope mid-turn. A 1s lease
+        // gives 600ms of headroom between a renewal tick and the probe; at
+        // 200ms the margin was 120ms, which a stalled event loop on a shared
+        // CI runner can eat — a fencing test that flakes reads as "renewal is
+        // broken". Three iterations keeps it inside the default timeout.
+        for (let i = 0; i < 3; i += 1) {
+          await new Promise(resolve => setTimeout(resolve, 1_000))
+          observed.push(rival.claim('slow-turn', 'rival').duplicate)
+        }
+      },
+    }, allowlist)
+    await bus.handleRequest(envelope({ id: 'slow-turn', to: 'vec' }))
+    expect(observed.length).toBeGreaterThan(0)
+    expect(observed.every(Boolean)).toBe(true)
+    expect(rival.claim('slow-turn', 'late').duplicate).toBe(true)
+  })
+
+  test('a completion store fault does not reject the handler', async () => {
+    // `claimDedup`'s fault guard was covered; complete/release were not, so
+    // removing their try/catch left the suite entirely green.
+    class FailingComplete extends DurableEnvelopeDedupStore {
+      override complete(): boolean { throw new Error('database is locked') }
+    }
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: new FailingComplete(':memory:'),
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    // Must not reject: a rejected handler is what ends the lane.
+    await bus.handleRequest(envelope({ id: 'complete-fault', to: 'vec' }))
+    expect(events.map(event => event.envelope.id)).toEqual(['complete-fault'])
+  })
+
+  test('a failed completion does not arm the in-memory fast path', async () => {
+    // The durable row stays pending, so a redelivery after the lease must be
+    // able to recover it. Arming the memory ledger would suppress that for
+    // the full TTL even though the claim was never completed.
+    class FailingComplete extends DurableEnvelopeDedupStore {
+      override complete(): boolean { throw new Error('database is locked') }
+    }
+    const store = new FailingComplete(':memory:')
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, injectIntoSession: async () => {},
+    }, allowlist)
+    await bus.handleRequest(envelope({ id: 'unarmed', to: 'vec' }))
+    // The durable row is still pending, so the in-memory fast path must NOT
+    // be armed — arming it suppresses the redelivery for the full TTL even
+    // though the claim was never completed.
+    expect(bus.seenRequestLedgerHas('unarmed')).toBe(false)
+    expect(store.count()).toBe(1)
+  })
+
+  test('a slow UNSOLICITED turn keeps a rival fenced for its whole duration', async () => {
+    // Every claim-lifecycle test targeted `onRequest`. `injectUnsolicited`
+    // takes a durable claim too and runs the same unbounded session turn, so
+    // deleting its renewal left the suite green — the exact P1 this branch
+    // exists to fix, on the route it was missed on the first time.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-unsol-')), 'dedup.sqlite')
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000)
+    const observed: boolean[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 1_000),
+      injectIntoSession: async () => {
+        for (let i = 0; i < 3; i += 1) {
+          await new Promise(resolve => setTimeout(resolve, 1_000))
+          observed.push(rival.claim('unsolicited-slow', 'rival').duplicate)
+        }
+      },
+    }, allowlist)
+    // No outbound waiter matches, so this lands on the unsolicited path.
+    await bus.handleResult(envelope({ id: 'unsolicited-slow', to: 'vec', from: 'kat' }))
+    expect(observed.length).toBeGreaterThan(0)
+    expect(observed.every(Boolean)).toBe(true)
+  })
+
+  test('a failed unsolicited completion does not arm seenResultEnvelopes', async () => {
+    class FailingComplete extends DurableEnvelopeDedupStore {
+      override complete(): boolean { throw new Error('database is locked') }
+    }
+    const store = new FailingComplete(':memory:')
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, injectIntoSession: async () => {},
+    }, allowlist)
+    await bus.handleResult(envelope({ id: 'unsolicited-unarmed', to: 'vec', from: 'kat' }))
+    // The durable row is still pending, so the memory ledger must not claim
+    // otherwise — this is `completeClaim`'s own stated contract.
+    expect(bus.seenResultLedgerHas('unsolicited-unarmed')).toBe(false)
+    expect(store.count()).toBe(1)
+  })
+
+  test('a failed unsolicited injection releases the claim for retry', async () => {
+    const store = new DurableEnvelopeDedupStore(':memory:')
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async () => { throw new Error('session gone') },
+    }, allowlist)
+    await bus.handleResult(envelope({ id: 'unsolicited-failed', to: 'vec', from: 'kat' }))
+    expect(store.count()).toBe(0)
+  })
+
+  test('a failed publishReply abandons the claim instead of renewing it forever', async () => {
+    // Ohm's reproduction: the turn finished, the answer failed to publish, and
+    // there is no outbound retry at this boundary — so nothing could ever
+    // settle the claim. Left alone the renewal timer extends a lease for work
+    // that is over, peer retries are rejected as duplicates, and recovery
+    // needs an unrelated eviction, a restart or the full TTL.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-undeliv-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    let token: string | null | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => { reqId = event.reqId; token = event.replyToken },
+    }, allowlist)
+    const nc = new FakeNatsConnection()
+    bus.attachFakeNc(nc)
+    await bus.handleRequest(envelope({ id: 'undelivered', to: 'vec', from: 'kat' }))
+    expect(reqId).not.toBe('')
+
+    nc.failPublish = true
+    const result = bus.publishReply(reqId, { text: 'an answer' }, 'result', token!)
+    expect(result.ok).toBe(false)
+
+    // Well past several lease periods: a still-renewing claim would keep the
+    // rival locked out indefinitely.
+    await new Promise(resolve => setTimeout(resolve, 900))
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('undelivered', 'retry').duplicate).toBe(false)
+  })
+
+  test('receive-ledger eviction abandons the claim it stranded', async () => {
+    // Ohm's A/B/C reproduction. Publishing A's reply TOUCHES A in the receive
+    // ledger (LRU) and REMOVES A from the pending map, so the two ledgers
+    // drift: C then evicts B from the receive ledger while the pending map
+    // holds B and C and evicts nothing. B's reply can never be built, yet its
+    // claim kept renewing — on a quiet process, suppressing B until the TTL.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-evict-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const seen: string[] = []
+    const tokens: Array<string | null | undefined> = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, receiveLedgerCap: 2,
+      injectIntoSession: async event => { seen.push(event.reqId); tokens.push(event.replyToken) },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({ id: 'evict-a', to: 'vec', from: 'kat' }))
+    await bus.handleRequest(envelope({ id: 'evict-b', to: 'vec', from: 'kat' }))
+    expect(bus.publishReply(seen[0]!, { text: 'reply to A' }, 'result', tokens[0]!).ok).toBe(true)
+    await bus.handleRequest(envelope({ id: 'evict-c', to: 'vec', from: 'kat' }))
+
+    // Deliberately do NOT call publishReply for B. The eviction itself must
+    // release the claim — a quiet process may never attempt that reply, and
+    // the `req_id_unknown` guard in publishReply would otherwise mask this.
+    await new Promise(resolve => setTimeout(resolve, 900))
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('evict-b', 'retry').duplicate).toBe(false)
+
+    // And the guard in publishReply covers the same condition when the reply
+    // IS attempted — defence in depth, not a duplicate of the above.
+    expect(bus.publishReply(seen[1]!, { text: 'reply to B' }, 'result', tokens[1]!).ok).toBe(false)
+  })
+
+  test('baton hop exhaustion abandons the claim instead of renewing it', async () => {
+    // Respecting the hop ceiling is correct; keeping a live lease for a reply
+    // that will never be sent is not a disposition.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-hops-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    let token: string | null | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => { reqId = event.reqId; token = event.replyToken },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({
+      id: 'hops-exhausted', to: 'vec', from: 'kat',
+      root_id: 'hops-exhausted', origin: 'kat', owner: 'kat', hops: 15,
+    }))
+    expect(reqId).not.toBe('')
+    // Derivation increments to 16 and throws BatonHopsExhausted.
+    expect(bus.publishReply(reqId, { text: 'an answer' }, 'result', token!).ok).toBe(false)
+
+    await new Promise(resolve => setTimeout(resolve, 900))
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('hops-exhausted', 'retry').duplicate).toBe(false)
+  })
+
+  test('a reply published DURING injection is not lost to registration order', async () => {
+    // The claim used to be registered only AFTER `await injectIntoSession`.
+    // Nothing stops a session replying inside that await — the API is
+    // `Promise<void>` — so the settle found no pending entry, did nothing,
+    // and the handler then registered a claim that was already answered.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-early-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let replyResult: FleetBusReplyResult | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        replyResult = bus.publishReply(event.reqId, { text: 'done' }, 'result', event.replyToken)
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({ id: 'early-reply', to: 'vec', from: 'kat' }))
+    expect(replyResult?.ok).toBe(true)
+    // Settled, so the fast path is armed and nothing is left renewing.
+    expect(bus.seenRequestLedgerHas('early-reply')).toBe(true)
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+  })
+
+  test('a reply that FAILS during injection is not resurrected afterwards', async () => {
+    // Same race, failure side: abandonment ran while no pending entry existed,
+    // then the handler registered the abandoned claim and it renewed forever.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-early-fail-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        nc.failPublish = true
+        bus.publishReply(event.reqId, { text: 'done' }, 'result', event.replyToken)
+      },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    await bus.handleRequest(envelope({ id: 'early-fail', to: 'vec', from: 'kat' }))
+    await new Promise(resolve => setTimeout(resolve, 900))
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('early-fail', 'retry').duplicate).toBe(false)
+  })
+
+  test('eviction DURING injection is not undone by late registration', async () => {
+    // Cross-lane: A's injection is still awaiting when an unsolicited result B
+    // arrives on the other handler, installs itself in the receive ledger and
+    // evicts A. The eviction hook fired before A was registered, so A used to
+    // be registered after its inbound envelope was already gone.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-race-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let releaseA: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, receiveLedgerCap: 1,
+      injectIntoSession: async event => {
+        if (event.envelope.id !== 'race-a') return
+        await new Promise<void>(resolve => { releaseA = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const injecting = bus.handleRequest(envelope({ id: 'race-a', to: 'vec', from: 'kat' }))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    // B lands on the result lane and evicts A from the capacity-1 ledger.
+    await bus.handleResult(envelope({ id: 'race-b', to: 'vec', from: 'kat', in_reply_to: 'nothing' }))
+
+    // SAFETY HALF: A's callback is still executing. Its reply is no longer
+    // deliverable, but the turn is not over — releasing now would let a rival
+    // inject the same envelope concurrently, on a healthy clock, which is the
+    // exact overlap renewal exists to prevent. Probe past several lease
+    // periods so this cannot pass merely because the lease had not lapsed.
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(rival.claim('race-a', 'rival-during').duplicate).toBe(true)
+
+    // RECOVERY HALF: once the callback exits, the deferred abandonment runs.
+    releaseA?.()
+    await injecting
+    expect(rival.claim('race-a', 'retry').duplicate).toBe(false)
+  })
+
+  test('pending-map eviction does not release a still-executing claim', async () => {
+    // The SIBLING removal path. `abandonRepliedClaim` learned the
+    // active-injection rule; the pendingReplyClaims LRU eviction callback had
+    // not, and it fires after the entry is already gone from the map — so a
+    // reqId lookup cannot recover it. Ohm reached this through a real
+    // reconnect: `disconnect()` unsubscribes but does not join a handler
+    // already awaiting injection, so an old callback stays alive while a
+    // replacement subscription delivers new work that overflows the map.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-pendevict-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let releaseA: (() => void) | undefined
+    let aRunning = false
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, receiveLedgerCap: 1,
+      injectIntoSession: async event => {
+        if (event.envelope.id !== 'pend-a') return
+        aRunning = true
+        await new Promise<void>(resolve => { releaseA = resolve })
+        aRunning = false
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const injecting = bus.handleRequest(envelope({ id: 'pend-a', to: 'vec', from: 'kat' }))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(aRunning).toBe(true)
+
+    // A second request overflows the capacity-1 pending map, evicting A.
+    await bus.handleRequest(envelope({ id: 'pend-c', to: 'vec', from: 'kat' }))
+
+    // SAFETY: A's callback is still executing, so its claim must still be
+    // owned — a rival injecting now would be a live-turn overlap.
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    await new Promise(resolve => setTimeout(resolve, 700))
+    expect(aRunning).toBe(true)
+    expect(rival.claim('pend-a', 'rival-during').duplicate).toBe(true)
+
+    // RECOVERY: the finalizer holds the claim OBJECT, so it still releases
+    // after the LRU dropped the key.
+    releaseA?.()
+    await injecting
+    expect(rival.claim('pend-a', 'retry').duplicate).toBe(false)
+  })
+
+  test('a stale callback failure does not abandon a replacement owner', async () => {
+    // After a takeover the store keeps the ORIGINAL reqId but issues a new
+    // owner. Binding only the finalizer to the captured object left the outer
+    // catch abandoning by reqId — so an old callback's exception reached in
+    // and marked the REPLACEMENT's healthy claim for abandonment, and its own
+    // clean return then released it.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-stale-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let failOld: ((e: Error) => void) | undefined
+    let releaseNew: (() => void) | undefined
+    let calls = 0
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async () => {
+        calls += 1
+        if (calls === 1) await new Promise<void>((_, reject) => { failOld = reject })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({ id: 'stale-owner', to: 'vec', from: 'kat' })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    // Force the takeover that #26 admits is possible: a forward clock step
+    // makes a live lease instantly expired. Renewal cannot prevent it — the
+    // stored deadline is wall-clock — so expire it directly rather than
+    // waiting, which renewal would otherwise defeat. The store preserves the
+    // ORIGINAL reqId and issues a NEW owner, which is the whole point.
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-owner')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(calls).toBe(2)
+
+    // The OLD callback now fails. It must dispose of its own claim only.
+    failOld?.(new Error('old callback exploded'))
+    await oldTurn
+    // The NEW callback returns cleanly, having not yet published its reply.
+    releaseNew?.()
+    await newTurn
+
+    // The replacement's claim must still be pending and renewing, awaiting
+    // its out-of-band reply — not released by the stale failure.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+  })
+
+  test('a stale caller\'s failed reply does not abandon the replacement owner', async () => {
+    // Same replacement-owner corruption as the exception case, reached through
+    // the public reply API instead. `reqId` is stable across a takeover, so it
+    // names the ENVELOPE, not the attempt; only the per-attempt token can tell
+    // the old caller from the new one.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-stalereply-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const events: FleetBusSessionEvent[] = []
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        events.push(event)
+        if (events.length === 1) await new Promise<void>(resolve => { releaseOld = resolve })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({ id: 'stale-reply', to: 'vec', from: 'kat' })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    // Force the takeover #26 admits: same reqId, new owner, new attempt token.
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-reply')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toHaveLength(2)
+    expect(events[0]!.replyToken).not.toBe(events[1]!.replyToken)
+
+    // The OLD caller replies with an unserializable payload and returns
+    // cleanly. No exception is involved anywhere.
+    const stale = bus.publishReply(events[0]!.reqId, { bad: undefined }, 'result', events[0]!.replyToken)
+    expect(stale.ok).toBe(false)
+    releaseOld?.()
+    await oldTurn
+
+    // The NEW attempt returns normally, still owing its out-of-band reply. It
+    // must remain pending and renewing, untouched by the stale failure.
+    releaseNew?.()
+    await newTurn
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+  })
+
+  test('reply authority requires attempt identity: missing, stale and current token', async () => {
+    // Ohm's matrix. An ABSENT token must withhold authority, not grant it —
+    // treating undefined as a wildcard preserved the exact defect the token
+    // exists to fix, for precisely the callers not yet migrated.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-matrix-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const events: FleetBusSessionEvent[] = []
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        events.push(event)
+        if (events.length === 1) await new Promise<void>(resolve => { releaseOld = resolve })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({ id: 'token-matrix', to: 'vec', from: 'kat' })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('token-matrix')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toHaveLength(2)
+
+    const reqId = events[0]!.reqId
+    // MISSING token: refused outright rather than publishing and stranding.
+    expect(bus.publishReply(reqId, { text: 'no token' }, 'result', null).error)
+      .toBe('claude_discord_adapter_reply_token_mismatch')
+    // STALE token: same refusal.
+    expect(bus.publishReply(reqId, { text: 'stale' }, 'result', events[0]!.replyToken).error)
+      .toBe('claude_discord_adapter_reply_token_mismatch')
+    // Neither may have touched the replacement's claim.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    // CURRENT token: settles the right attempt.
+    expect(bus.publishReply(reqId, { text: 'real' }, 'result', events[1]!.replyToken).ok).toBe(true)
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+
+    releaseOld?.(); releaseNew?.()
+    await oldTurn; await newTurn
+  })
+
+  test('a null token cannot mutate a live claim on the disconnected path', async () => {
+    // REGRESSION GUARD for `claimFor`'s own fence, which the token-matrix test
+    // above cannot see: there, every refusal is already returned by the
+    // pre-publish check, so `claimFor` could treat a null token as a wildcard
+    // and the suite would stay green. `abandonOwn` runs BEFORE that check on
+    // the not-connected branch, so this is the one path where `claimFor`
+    // alone decides. An unmigrated caller passing no attempt identity must
+    // NOT be able to abandon the claim of the attempt that is still running.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-nulltok-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const events: FleetBusSessionEvent[] = []
+    let release: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        events.push(event)
+        await new Promise<void>(resolve => { release = resolve })
+      },
+    }, allowlist)
+    const nc = new FakeNatsConnection()
+    bus.attachFakeNc(nc)
+
+    const turn = bus.handleRequest(envelope({ id: 'null-tok', to: 'vec', from: 'kat' }))
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toHaveLength(1)
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    // Let the turn FINISH. The claim stays pending, waiting for its reply —
+    // and `injectionActive` is now false, so `abandonRepliedClaim` no longer
+    // defers. `claimFor` is the only thing standing between an unmigrated
+    // caller and the claim.
+    release?.()
+    await turn
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    await nc.close()
+    const result = bus.publishReply(events[0]!.reqId, { text: 'no token' }, 'result', null)
+    expect(result.error).toBe('claude_discord_adapter_fleet_bus_not_connected')
+
+    // THE SAFETY HALF: the running attempt's claim survives. Asserting only
+    // that the reply failed cannot see a fence that releases too early.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+    const raw = new Database(path)
+    const row = raw.query(
+      'SELECT state, lease_owner FROM envelope_dedup_v2 WHERE envelope_id = ?',
+    ).get('null-tok') as { state: string; lease_owner: string | null }
+    raw.close()
+    expect(row.state).toBe('pending')
+    expect(row.lease_owner).not.toBeNull()
+  })
+
+  test('releasing a claim does not delete a replacement owner\'s durable row', async () => {
+    // REGRESSION GUARD for the `AND lease_owner = ?` fence on release()'s
+    // DELETE. Every takeover test asserts pendingReplyClaimCount(), which is
+    // the IN-MEMORY half; none reads lease_owner off the table, so dropping
+    // the fence on the one destructive statement left the suite green.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-relown-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+
+    const first = store.claim('rel-own', 'req-rel-own')
+    expect(first.duplicate).toBe(false)
+    const ownerA = first.owner!
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('rel-own')
+    raw.close()
+
+    // B takes over the SAME envelope; reqId is preserved, owner is new.
+    const second = store.claim('rel-own', 'req-rel-own')
+    const ownerB = second.owner
+    // A genuine takeover: same envelope, preserved reqId, NEW owner.
+    expect(ownerB).toBeDefined()
+    expect(ownerB).not.toBe(ownerA)
+    expect(second.reqId).toBe('req-rel-own')
+
+    // A's stale callback releases with A's owner. B's row must survive intact.
+    store.release('rel-own', ownerA)
+
+    const check = new Database(path)
+    const row = check.query(
+      'SELECT state, lease_owner FROM envelope_dedup_v2 WHERE envelope_id = ?',
+    ).get('rel-own') as { state: string; lease_owner: string } | null
+    check.close()
+    expect(row).not.toBeNull()
+    expect(row!.state).toBe('pending')
+    expect(row!.lease_owner).toBe(ownerB!)
+
+    // And B can still settle: a released row would let a peer retry re-inject
+    // a turn that is already running.
+    expect(store.complete('rel-own', ownerB!)).toBe(true)
+  })
+
+  test('a stale token cannot abandon via the baton-derivation path', async () => {
+    // The catch called abandonRepliedClaim(reqId, …) directly, bypassing the
+    // fence — so supplying a stale token did not protect the replacement.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-hoptok-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const events: FleetBusSessionEvent[] = []
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        events.push(event)
+        if (events.length === 1) await new Promise<void>(resolve => { releaseOld = resolve })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({
+      id: 'hop-token', to: 'vec', from: 'kat',
+      root_id: 'hop-token', origin: 'kat', owner: 'kat', hops: 15,
+    })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('hop-token')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toHaveLength(2)
+
+    // Old attempt replies with its own (now stale) token; derivation hits the
+    // hop ceiling. The replacement's claim must be untouched.
+    bus.publishReply(events[0]!.reqId, { text: 'done' }, 'result', events[0]!.replyToken)
+    releaseOld?.()
+    await oldTurn
+    releaseNew?.()
+    await newTurn
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+  })
+
+  test('the heartbeat sweeps expired claims', async () => {
+    // The idle prune must be WIRED, not merely implemented: the store-level
+    // test calls it directly, so deleting the heartbeat call left this green.
+    const store = new DurableEnvelopeDedupStore(':memory:', 10)
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store, injectIntoSession: async () => {},
+    }, allowlist)
+    for (let i = 0; i < 20; i += 1) {
+      const claim = store.claim(`stale-${i}`, `req-${i}`, 0)
+      store.complete(`stale-${i}`, claim.owner!)
+    }
+    expect(store.count()).toBe(20)
+    bus.beat()
+    expect(store.count()).toBe(0)
+  })
+
+  test('failed and cancelled delivery release pending claim for retry', async () => {
+    for (const failure of [new Error('failed'), new DOMException('cancelled', 'AbortError')]) {
+      const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-failure-')), 'dedup.sqlite')
+      const wire = envelope({ id: `retry-${failure.name}`, to: 'vec' })
+      const failing = new TestFleetBus({
+        botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', dedupStorePath: path,
+        injectIntoSession: async () => { throw failure },
+      }, allowlist)
+      await failing.handleRequest(wire)
+      const events: FleetBusSessionEvent[] = []
+      const restarted = new TestFleetBus({
+        botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', dedupStorePath: path,
+        injectIntoSession: async event => { events.push(event) },
+      }, allowlist)
+      await restarted.handleRequest(wire)
+      expect(events).toHaveLength(1)
+    }
+  })
+  test('durable duplicate across adapter restart is dropped with original req_id', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-dedup-restart-'))
+    const dedupStorePath = join(dir, 'dedup.sqlite')
+    const auditLogPath = join(dir, 'audit.jsonl')
+    const events: FleetBusSessionEvent[] = []
+    const config: FleetBusConfig = {
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStorePath, auditLogPath,
+      injectIntoSession: async event => { events.push(event) },
+    }
+    const wire = envelope({ id: 'restart-duplicate', to: 'vec' })
+    await new TestFleetBus(config, allowlist).handleRequest(wire)
+    const originalReqId = events[0]!.reqId
+    await new TestFleetBus(config, allowlist).handleRequest(wire)
+
+    expect(events).toHaveLength(1)
+    expect(readAudit(auditLogPath).some(entry =>
+      entry.reason === 'claude_discord_adapter_duplicate_request_envelope'
+      && entry.req_id === originalReqId,
+    )).toBe(true)
+
+    // And the part that matters: because the first turn never published a
+    // reply, its claim is still PENDING, not completed. The suppression above
+    // lasts only as long as the lease — once it lapses the retry is admitted
+    // and the peer can finally get an answer. Settling at inject time instead
+    // would have written `completed` here and suppressed that retry for the
+    // full 8-day TTL, with no reply ever sent. That is the regression this
+    // PR's durable store would otherwise have introduced: before it, the
+    // ledger was in-memory and a restart simply cleared it.
+    const store = new DurableEnvelopeDedupStore(dedupStorePath)
+    const row = store.claim('restart-duplicate', 'after-lease', Date.now() + DEFAULT_DEDUP_LEASE_MS + 1)
+    expect(row.duplicate).toBe(false)
+  })
+
   test('injects an allowlisted envelope with a distinct server nonce', async () => {
     const events: Array<{ envelope: { from: string }; reqId: string }> = []
     const bus = new TestFleetBus({
@@ -439,7 +1315,7 @@ describe('request session injection', () => {
     expect(bus.receiveLedgerSize()).toBe(2)
     // First reqId should now be evicted — publishReply on it returns req_id_unknown.
     const first = events[0]!.reqId
-    const result = bus.publishReply(first, {})
+    const result = bus.publishReply(first, {}, 'result', null)
     expect(result.error).toBe('claude_discord_adapter_req_id_unknown')
   })
 
@@ -454,7 +1330,7 @@ describe('request session injection', () => {
     // publishReply on the received reqId should now find the inbound envelope
     // (although publish will fail with fleet_bus_not_connected — that's OK, it
     // proves the ledger lookup succeeded).
-    const reply = bus.publishReply(events[0]!.reqId, { ok: true })
+    const reply = bus.publishReply(events[0]!.reqId, { ok: true }, 'result', null)
     expect(reply.error).toBe('claude_discord_adapter_fleet_bus_not_connected')
   })
 })
@@ -794,7 +1670,7 @@ describe('request / publishReply / onResult', () => {
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
     }, allowlist)
     bus.attachFakeNc(nc)
-    const result = bus.publishReply('never-received-nonce', { ok: true })
+    const result = bus.publishReply('never-received-nonce', { ok: true }, 'result', null)
     expect(result.ok).toBe(false)
     expect(result.error).toBe('claude_discord_adapter_req_id_unknown')
     expect(nc.publishes).toHaveLength(0)
@@ -813,7 +1689,7 @@ describe('request / publishReply / onResult', () => {
     expect(events).toHaveLength(1)
     const reqId = events[0]!.reqId
 
-    const result = bus.publishReply(reqId, { done: true }, 'pr_review_result')
+    const result = bus.publishReply(reqId, { done: true }, 'pr_review_result', events[0]!.replyToken)
     expect(result.ok).toBe(true)
     expect(nc.publishes.map(p => p.subject)).toEqual(['fleet.ohm.request'])
     expect(nc.publishes.some(p => p.subject.endsWith('.result'))).toBe(false)
@@ -880,7 +1756,7 @@ describe('request / publishReply / onResult', () => {
     const reqId = events[0]!.reqId
     // Also verify nested case here — round-2 P2 was specifically about the
     // nested-undefined silent-drop the top-level guard missed.
-    const result = bus.publishReply(reqId, { ok: true, data: undefined })
+    const result = bus.publishReply(reqId, { ok: true, data: undefined }, 'result', events[0]!.replyToken)
     expect(result.ok).toBe(false)
     expect(result.error).toBe('claude_discord_adapter_payload_not_json_serializable')
     expect(nc.publishes).toHaveLength(0)
@@ -1339,10 +2215,9 @@ describe('envelope-id dedup', () => {
     expect(drops[0]!.req_id).toBe(firstReqId)
   })
 
-  test('seenResult ledger is bounded — envelopes evicted past cap can re-inject (mutation witness)', async () => {
-    // Mutation witness: if the seen ledger were unbounded, ANY duplicate ever
-    // would drop; if the cap were bypassed, the same. Fill to cap+1, verify
-    // the first envelope's id has evicted, and its duplicate re-injects.
+  test('bounded memory eviction cannot disagree with durable dedup source of truth', async () => {
+    // Fill the fast-path LRU past capacity. The durable store must still block
+    // the evicted id rather than letting cache eviction become reprocessing.
     const nc = new FakeNatsConnection()
     const events: FleetBusSessionEvent[] = []
     const bus = new TestFleetBus({
@@ -1366,16 +2241,27 @@ describe('envelope-id dedup', () => {
     expect(bus.seenResultLedgerHas('cap-b')).toBe(true)
     expect(bus.seenResultLedgerHas('cap-c')).toBe(true)
 
-    // Duplicate of 'cap-a' — the seen entry has evicted, so this re-injects.
-    // (Unbounded dedup would still block it; broken dedup would block it too.
-    // Only a bounded-LRU dedup lets this through as expected.)
+    // Duplicate of 'cap-a' — absent from memory, still present durably.
     await bus.handleResult(makeReply('cap-a'))
-    expect(events).toHaveLength(4)
-    expect(events[3]!.envelope.id).toBe('cap-a')
+    expect(events).toHaveLength(3)
 
     // Duplicate of 'cap-c' — still in seen ledger, must drop.
     await bus.handleResult(makeReply('cap-c'))
-    expect(events).toHaveLength(4)
+    expect(events).toHaveLength(3)
+  })
+
+  test('memory fast path expires with durable TTL and cannot overrule it', async () => {
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupTtlMs: 1,
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    const wire = envelope({ id: 'ttl-cache-agreement', to: 'vec' })
+    await bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    await bus.handleRequest(wire)
+    expect(events).toHaveLength(2)
   })
 
   test('late-reply duplicate — first tags lateReplyEnvId, second drops (does NOT re-inject untagged)', async () => {
@@ -1427,7 +2313,11 @@ describe('envelope-id dedup', () => {
     await bus.handleRequest(value)
     expect(events).toHaveLength(1)
     const firstReqId = events[0]!.reqId
-    expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(true)
+    // The in-memory fast path is NOT armed yet: the claim settles when the
+    // reply publishes, not when the session accepts the envelope. Suppression
+    // in this window comes from the durable store's pending row, which is the
+    // stronger guarantee — it survives a restart, where this ledger would not.
+    expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(false)
 
     // Retry — must drop as duplicate. Pre-fix: fresh reqId, second inject.
     await bus.handleRequest(value)
@@ -1436,6 +2326,10 @@ describe('envelope-id dedup', () => {
     expect(drops).toHaveLength(1)
     expect(drops[0]!.envelope_id).toBe('dup-req-1')
     expect(drops[0]!.req_id).toBe(firstReqId)
+
+    // Once the answer is on the wire the claim settles and the fast path arms.
+    bus.settleReply(firstReqId)
+    expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(true)
   })
 })
 
@@ -1601,7 +2495,7 @@ describe('publish-only mode', () => {
       connectFn: async () => nc as unknown as NatsConnection,
     }, allowlist)
     await bus.connect()
-    const result = bus.publishReply('any', {})
+    const result = bus.publishReply('any', {}, 'result', null)
     expect(result.ok).toBe(false)
     expect(result.error).toBe('claude_discord_adapter_multi_instance_publish_only')
     await bus.disconnect()

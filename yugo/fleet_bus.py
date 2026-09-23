@@ -13,8 +13,8 @@ out: the answer is published back to the sender automatically, and any `<BUS
 to="...">` tag in it publishes to a THIRD party. 3d makes this adapter a
 PARTICIPANT in the baton protocol rather than a conduit for it — see the
 section below — and the shared in-tree envelope contract is 3e. Nothing here touches
-JetStream — no durable consumers, no DeliverPolicy, no dedup store. Those
-arrive with FB-3 (see SPEC §15 "JetStream migration").
+JetStream — no durable consumers or DeliverPolicy. Envelope-id deduplication is
+durable in SQLite so at-least-once relay delivery is safe across restarts.
 
 **Baton participation (3d).** §15's one-line summary of this slice is "baton
 field pass-through on inbound + outbound". Read literally that means carry the
@@ -64,6 +64,8 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
+import threading
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -131,6 +133,40 @@ AUDIT_RAW_MAX_CHARS = 200
 DEFAULT_MANIFEST_PATH = "/vault/infra/fleet-manifest.yaml"
 DEFAULT_AUDIT_LOG = "/root/.claude/fleet-bus-log.jsonl"
 DEFAULT_URL = "nats://nats:4222"
+DEFAULT_DEDUP_TTL_S = 8 * 24 * 60 * 60
+MIN_DEDUP_TTL_S = 7 * 24 * 60 * 60
+DEFAULT_DEDUP_LEASE_S = 60
+DEDUP_PRUNE_EVERY = 256
+DEDUP_PRUNE_LIMIT = 100
+# A single bounded batch cannot keep up: at 100 deleted per 256 admitted the
+# expired backlog grows ~156 rows per 256 arrivals. `prune` therefore loops
+# bounded batches until the expired set is drained or this budget is spent,
+# and the budget is deliberately larger than DEDUP_PRUNE_EVERY so a steady
+# arrival stream loses ground on every sweep rather than gaining it.
+DEDUP_PRUNE_BUDGET = 4 * DEDUP_PRUNE_EVERY
+# Renewal cadence for a live owner, as a fraction of the lease. Driven by a
+# MONOTONIC timer in-process: the stored lease_until_s stays wall-clock
+# because it is compared across processes, and a monotonic value is not
+# comparable outside the process that read it.
+#
+# What renewal buys: a turn that simply outlives its lease is no longer handed
+# to a second worker while the first is still executing.
+#
+# What it does NOT buy, stated plainly because the opposite was claimed here
+# before: it does not defend against a forward wall-clock step. The stored
+# deadline is wall-clock, so a jump forward makes a live claim instantly
+# expired and a rival can take it before the owner's next renewal tick, with
+# the owner's callback still running. A monotonic CADENCE does not change the
+# wall-clock PREDICATE that admits the competitor. Closing that needs a real
+# clock domain — boot id plus monotonic deadlines, with reboot recovery — and
+# is tracked as yugo#26. Until then a clock-step-induced overlap is an
+# accepted duplicate under the at-least-once contract.
+#
+# And a clock step is NOT the only way a lease is lost: a renewal failure, a
+# store fault, or an event-loop stall longer than the lease produce the same
+# takeover. Owner fencing must not be described as if yugo#26 were its only
+# prerequisite.
+DEDUP_LEASE_RENEW_RATIO = 0.4
 
 _BOT_NAME_PATTERN = re.compile(r"[a-z0-9_-]+")
 
@@ -1068,6 +1104,174 @@ class AuditLog:
 # --- config ---
 
 
+async def _cancel_task(task: "asyncio.Task | None") -> None:
+    """Cancel a helper task and absorb its CancelledError, nothing else."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+class DurableEnvelopeDedupStore:
+    """SQLite envelope-id claims retained for 8d (7d stream age + 1d slack).
+
+    A primary-key INSERT OR IGNORE is the concurrency arbiter. The lock
+    serializes this adapter's callbacks on one connection; the UNIQUE key also
+    makes competing processes deterministic.
+    """
+
+    def __init__(self, path: str, ttl_s: int = DEFAULT_DEDUP_TTL_S,
+                 lease_s: int = DEFAULT_DEDUP_LEASE_S) -> None:
+        if path != ":memory:" and ttl_s < MIN_DEDUP_TTL_S:
+            raise ValueError("durable dedup TTL must be at least the 7-day stream max_age")
+        if path != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        # WAL, matching the TypeScript port. Rollback-journal mode costs ~5ms
+        # per claim+complete against ~2.6ms on WAL — per inbound envelope, on
+        # the event-loop thread that also serves NATS callbacks — and lets a
+        # writer block readers file-wide, which is the regime the concurrency
+        # claim below is counting on.
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA busy_timeout=5000")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS envelope_dedup_v2 ("
+            "envelope_id TEXT PRIMARY KEY, first_seen_s REAL NOT NULL, req_id TEXT NOT NULL, "
+            "state TEXT NOT NULL CHECK(state IN ('pending','completed')), "
+            "lease_owner TEXT NOT NULL, lease_until_s REAL NOT NULL)"
+        )
+        self._db.execute("CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_s)")
+        self._ttl_s = ttl_s
+        self._lease_s = lease_s
+        self._lock = threading.Lock()
+        self._claims = 0
+
+    def claim(self, envelope_id: str, req_id: str, now_s: float | None = None) -> tuple[bool, str, str | None]:
+        now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+        owner = uuid.uuid4().hex
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._claims += 1
+                if self._claims % DEDUP_PRUNE_EVERY == 0:
+                    self.prune(now)
+                self._db.execute(
+                    "DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND first_seen_s < ?",
+                    (envelope_id, now - self._ttl_s),
+                )
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO envelope_dedup_v2 VALUES (?,?,?,'pending',?,?)",
+                    (envelope_id, now, req_id, owner, now + self._lease_s),
+                )
+                if cursor.rowcount == 1:
+                    result = (False, req_id, owner)
+                else:
+                    row = self._db.execute(
+                        "SELECT req_id,state,lease_until_s FROM envelope_dedup_v2 WHERE envelope_id=?",
+                        (envelope_id,),
+                    ).fetchone()
+                    if row[1] == "pending" and row[2] <= now:
+                        changed = self._db.execute(
+                            "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_s=? "
+                            "WHERE envelope_id=? AND state='pending' AND lease_until_s<=?",
+                            (owner, now + self._lease_s, envelope_id, now),
+                        ).rowcount
+                        result = (False, row[0], owner) if changed else (True, row[0], None)
+                    else:
+                        result = (True, row[0], None)
+                self._db.execute("COMMIT")
+                return result
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+
+    @property
+    def lease_s(self) -> float:
+        """The lease this store issues. Callers deriving a renewal cadence MUST
+        read this rather than the module default, which this store may not use."""
+        return self._lease_s
+
+    def renew(self, envelope_id: str, owner: str, now_s: float | None = None) -> bool:
+        """Extend a live owner's lease. False means the lease was already lost.
+
+        False means another consumer has taken the envelope and anything this
+        turn still does is the duplicate, not the original.
+
+        Stated honestly: no caller can act on that today. There is no cancel
+        handle at this boundary, so `_renew_claim_until_done` records the loss
+        and stops renewing while the turn runs to completion. That is the
+        at-least-once contract working as designed, not a gap in this method —
+        closing it is yugo#24. The return value exists so a future caller with
+        a cancel handle has something to fence on.
+        """
+        now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+        with self._lock:
+            return self._db.execute(
+                "UPDATE envelope_dedup_v2 SET lease_until_s=? "
+                "WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+                (now + self._lease_s, envelope_id, owner),
+            ).rowcount == 1
+
+    def complete(self, envelope_id: str, owner: str) -> bool:
+        """Mark done. False means we no longer owned it, so we did NOT finish it.
+
+        A lost owner must not be recorded as a successful completion: the
+        in-memory fast paths key off this return, and promoting a stale claim
+        would suppress the real owner's result.
+        """
+        with self._lock:
+            # `AND state='pending'` matches the TypeScript port exactly. Without
+            # it a same-owner double-complete returns True here and False there,
+            # and the return value is now load-bearing on both sides.
+            return self._db.execute(
+                "UPDATE envelope_dedup_v2 SET state='completed' "
+                "WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+                (envelope_id, owner),
+            ).rowcount == 1
+
+    def release(self, envelope_id: str, owner: str) -> bool:
+        with self._lock:
+            return self._db.execute(
+                "DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+                (envelope_id, owner),
+            ).rowcount == 1
+
+    def prune(self, now_s: float, budget: int = DEDUP_PRUNE_BUDGET) -> int:
+        """Delete expired claims in bounded batches until drained or out of budget.
+
+        Bounded batches keep any single statement short; the loop is what makes
+        cleanup able to OUTPACE ingestion. A short batch means the expired set
+        is exhausted, so the loop stops without spending the rest of the budget.
+        """
+        cutoff = now_s - self._ttl_s
+        deleted = 0
+        while deleted < budget:
+            batch = min(DEDUP_PRUNE_LIMIT, budget - deleted)
+            n = self._db.execute(
+                "DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 "
+                "WHERE first_seen_s < ? ORDER BY first_seen_s LIMIT ?)",
+                (cutoff, batch),
+            ).rowcount
+            deleted += n
+            if n < batch:  # expired set exhausted
+                break
+        return deleted
+
+    def prune_idle(self, now_s: float | None = None) -> int:
+        """Sweep on a quiet lane, where no claim arrives to trigger the counter.
+
+        Without this, a stream that goes quiet after a burst keeps its expired
+        rows until the next arrival — the backlog survives precisely when
+        there is most capacity to clear it.
+        """
+        now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
+        with self._lock:
+            return self.prune(now)
+
+
 @dataclass(frozen=True)
 class FleetBusConfig:
     bot_name: str
@@ -1081,6 +1285,8 @@ class FleetBusConfig:
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S
     reconnect_time_wait_s: float = DEFAULT_RECONNECT_TIME_WAIT_S
     drain_timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S
+    dedup_store_path: str | None = None
+    dedup_ttl_s: int = DEFAULT_DEDUP_TTL_S
 
 
 def bus_enabled(env: dict[str, str] | None = None) -> bool:
@@ -1168,6 +1374,8 @@ def load_config_from_env(
         allowed_from=frozenset(allowed_from),
         plugin_version=plugin_version,
         audit_log_path=source.get("FLEET_BUS_AUDIT_LOG", "").strip() or DEFAULT_AUDIT_LOG,
+        dedup_store_path=(source.get("YUGO_DEDUP_STORE_PATH", "").strip()
+                          or f"/var/lib/yugo/{bot_name}-dedup.sqlite"),
     )
 
 
@@ -1221,6 +1429,9 @@ class FleetBus:
         # Reported on every heartbeat from 3b. See create_heartbeat_envelope.
         self._injection_delivered_ts: str | None = None
         self._session_last_response_ts: str | None = None
+        self._dedup = DurableEnvelopeDedupStore(
+            config.dedup_store_path or ":memory:", config.dedup_ttl_s
+        )
 
     @property
     def subjects(self) -> tuple[str, ...]:
@@ -1350,7 +1561,28 @@ class FleetBus:
             await self._publish_heartbeat()
             await asyncio.sleep(self._config.heartbeat_interval_s)
 
+    def _sweep_expired_claims(self) -> int:
+        """Quiet-lane cleanup, driven by the heartbeat.
+
+        `prune` is otherwise only reached from `claim`, so a lane that goes
+        silent after a burst keeps its expired rows until the next arrival —
+        the backlog survives exactly when there is most capacity to clear it.
+        Contained: a store fault must never stop heartbeats, which are this
+        bot's liveness signal.
+        """
+        try:
+            return self._dedup.prune_idle()
+        except Exception as e:  # noqa: BLE001 — liveness outranks cleanup
+            self._audit.record(
+                "conn", self.status_subject, event="idle_prune_failed", error=repr(e)
+            )
+            return 0
+
     async def _publish_heartbeat(self) -> None:
+        # Sweep BEFORE the connection check, matching the TypeScript port. A
+        # disconnected bot is the quietest lane there is, and returning early
+        # meant the one state this feature is named for never swept.
+        self._sweep_expired_claims()
         if self._nc is None or self._nc.is_closed:
             return
         envelope = create_heartbeat_envelope(
@@ -1655,85 +1887,242 @@ class FleetBus:
             return
 
         # Consumer-local nonce, like the TS port's `randomBytes(16)`. NOT the
-        # envelope id: ids are sender-chosen and there is no de-dup store
-        # until FB-3, so two turns may legitimately carry the same one. The
+        # envelope id: the nonce identifies what processing did with the
+        # stable wire id and is persisted by the durable de-dup store. The
         # frame contract also requires `req_id !== envelope.id`. From 3c it is
         # also the correlation key: every envelope this turn publishes carries
         # it on its `out` line — and from 3d that includes the hop-8 warning,
         # which is why the nonce is minted BEFORE the session hook is checked
         # rather than inside the branch that has one.
         req_id = uuid.uuid4().hex
+        try:
+            duplicate, original_req_id, claim_owner = self._dedup.claim(envelope["id"], req_id)
+        except Exception as e:  # store fault drops this delivery, subscription stays live
+            self._audit.record("drop", subject, reason="yugo_dedup_store_failed", id=envelope["id"], error=repr(e))
+            return
+        if duplicate:
+            self._audit.record(
+                "drop", subject, reason="yugo_duplicate_envelope",
+                id=envelope["id"], req_id=original_req_id,
+            )
+            return
+        req_id = original_req_id
 
-        if isinstance(hops, int) and hops >= BATON_HOPS_WARN_AT:
-            await self._warn_origin(subject, envelope, req_id)
+        # ONE cleanup scope for the ENTIRE claimed lifetime: the hop warning,
+        # the session turn, and the publish. Renewal starts here because
+        # `_warn_origin` awaits a publish that can stall on a full pending
+        # buffer mid-outage; the try begins here because an await outside the
+        # scope leaks the renewer, which would then extend an abandoned claim
+        # for as long as the process lives.
+        renewer = asyncio.create_task(
+            self._renew_claim_until_done(subject, envelope, req_id, claim_owner)
+        )
+        # Settled means: this envelope is finished and must not be redelivered.
+        # It stays False until the reply is actually on the wire, so every
+        # other exit — cancellation, injection failure, publish failure —
+        # RELEASES the claim and leaves the work recoverable. Under the
+        # at-least-once contract a repeated effect is permitted and a lost
+        # response is not, so "settle" is the narrow case, not the default.
+        settled = False
+        try:
+            if isinstance(hops, int) and hops >= BATON_HOPS_WARN_AT:
+                await self._warn_origin(subject, envelope, req_id)
 
-        if self._on_envelope is None:
-            # No session configured — 3a's behaviour, and the behaviour of any
-            # embedding that only wants the wire. Accepted and audited, with
-            # no req_id: the nonce above exists for what a TURN publishes, and
-            # there is no turn.
+            if self._on_envelope is None:
+                # No session configured — 3a's behaviour, and the behaviour of
+                # any embedding that only wants the wire. Accepted and audited,
+                # with no req_id: the nonce above exists for what a TURN
+                # publishes, and there is no turn. Nothing is owed on the wire,
+                # so this one IS finished.
+                self._audit.record(
+                    "in",
+                    subject,
+                    id=envelope["id"],
+                    kind=envelope["kind"],
+                    **{"from": envelope["from"]},
+                )
+                settled = True
+                return
+
+            self._injection_delivered_ts = _utc_now_iso()
+            try:
+                reply = await self._on_envelope(envelope, req_id)
+            # CancelledError is a BaseException and deliberately NOT caught: a
+            # turn interrupted by shutdown is not a failed injection, and
+            # swallowing the cancel here would stall `drain()` behind an LLM
+            # call.
+            except BaseException as e:
+                if isinstance(e, asyncio.CancelledError):
+                    raise
+                # Same reject code the TS peer writes when its
+                # `injectIntoSession` rejects. The bus stays up and the
+                # subscription stays live: this envelope is lost, the next one
+                # is not.
+                self._audit.record(
+                    "drop",
+                    subject,
+                    reason="injection_failed",
+                    id=envelope["id"],
+                    req_id=req_id,
+                    error=repr(e),
+                )
+                return
+
+            self._session_last_response_ts = _utc_now_iso()
+            # The turn is recorded before anything is published: the `in` line
+            # says a turn HAPPENED, and it stays true whether or not the answer
+            # made it onto the wire. There is no Discord path from here at all,
+            # per §8 (a bus-triggered turn is a bus-only reply).
             self._audit.record(
                 "in",
                 subject,
                 id=envelope["id"],
                 kind=envelope["kind"],
+                req_id=req_id,
+                reply_chars=len(reply) if isinstance(reply, str) else None,
                 **{"from": envelope["from"]},
             )
-            return
+            try:
+                # Settle on the REAL transport result, not merely on the
+                # absence of an exception. `publish_request` catches transport
+                # errors and returns False (and returns False when
+                # disconnected), so watching only for a raise let a genuine
+                # delivery failure stamp the claim `completed` with no answer
+                # ever sent — suppressed for the whole TTL.
+                delivered = await self._publish_turn_output(subject, envelope, req_id, reply)
+            except Exception as e:  # noqa: BLE001 — the subscription outlives one turn
+                # `publish_request` already absorbs every per-envelope fault, so
+                # reaching here means a fault in the parse-and-dispatch code
+                # itself. It still must not kill the callback: nats-py would
+                # route the exception to `error_cb` and this bot would go on
+                # looking healthy while every subsequent envelope died the same
+                # way. The claim is NOT settled — the answer never went out, so
+                # a redelivery must be able to run it again.
+                self._audit.record(
+                    "drop",
+                    subject,
+                    reason=REJECT_PUBLISH_FAILED,
+                    id=envelope["id"],
+                    req_id=req_id,
+                    error=repr(e),
+                )
+                return
+            if not delivered:
+                # Output owed and not delivered. Leave the claim recoverable:
+                # under at-least-once a repeated effect is permitted and a lost
+                # response is not. Partial sends land here too — a turn whose
+                # tag reached its peer but whose answer did not is unfinished.
+                #
+                # No audit line here on purpose: `publish_request` already
+                # recorded the failure that produced this, and a second
+                # `yugo_publish_failed` for one event would double-count in
+                # the terminal-path audit sets.
+                return
+            settled = True
+        finally:
+            # SETTLE FIRST, then stop renewing. Both settle calls are
+            # synchronous, so no cancellation point exists between here and
+            # the store write.
+            #
+            # Precisely what this ordering fixes, because the comment here
+            # previously over-claimed: a bare `await _cancel_task(renewer)`
+            # above the settle was ALREADY safe, since `_cancel_task` absorbs
+            # CancelledError around its only await. What broke was wrapping
+            # that in `asyncio.shield`, whose CancelledError is raised OUTSIDE
+            # the helper's guard and so escaped the `finally` before the
+            # decision ran — shield protects the awaited task, not the
+            # awaiting coroutine. Settling first removes the question rather
+            # than depending on a helper's swallow behaviour.
+            #
+            # Renewing past the settle is harmless: `renew` requires
+            # state='pending', so a completed claim ends the renewal loop on
+            # its own and a released row no longer exists.
+            #
+            # The nested try/finally makes the cancel unconditional: a fault
+            # escaping the settle — the audit write sits outside the helpers'
+            # own guards — would otherwise leak the renewer, which would then
+            # extend an abandoned claim for the life of the process.
+            try:
+                if settled:
+                    self._complete_claim(subject, envelope, req_id, claim_owner)
+                else:
+                    # Unfinished outbound work stays recoverable. Completing
+                    # here would stamp a tombstone over an answer that never
+                    # shipped and suppress redelivery for the whole TTL — the
+                    # lost-response bug this ordering exists to prevent,
+                    # reached by cancellation instead of process death.
+                    self._release_claim(subject, envelope, req_id, claim_owner)
+            finally:
+                await _cancel_task(renewer)
 
-        self._injection_delivered_ts = _utc_now_iso()
+    def _complete_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
+        """Promote a claim, surviving a store fault and reporting owner loss.
+
+        Every durable operation on this path is contained per message. A
+        SQLite fault here must not reject the handler and end the lane — that
+        was the whole point of the claim-fault guard, and completion is the
+        same class of risk.
+        """
         try:
-            reply = await self._on_envelope(envelope, req_id)
-        # CancelledError is a BaseException and deliberately NOT caught: a
-        # turn interrupted by shutdown is not a failed injection, and
-        # swallowing the cancel here would stall `drain()` behind an LLM call.
-        except Exception as e:  # noqa: BLE001 — any turn fault is one envelope's problem
-            # Same reject code the TS peer writes when its `injectIntoSession`
-            # rejects. The bus stays up and the subscription stays live: this
-            # envelope is lost, the next one is not.
+            won = self._dedup.complete(envelope["id"], owner)
+        except Exception as e:
             self._audit.record(
-                "drop",
-                subject,
-                reason="injection_failed",
-                id=envelope["id"],
-                req_id=req_id,
-                error=repr(e),
+                "drop", subject, reason="yugo_dedup_complete_failed",
+                id=envelope["id"], req_id=req_id, error=repr(e),
             )
-            return
-        self._session_last_response_ts = _utc_now_iso()
-        # Success is `dir="in"` carrying envelope identity AND the nonce —
-        # the shape the TS port records from `injectIntoSession`. The audit
-        # schema has three traffic lanes (`in`/`out`/`drop`) plus `conn` for
-        # lifecycle; a session turn does not get a fourth.
-        self._audit.record(
-            "in",
-            subject,
-            id=envelope["id"],
-            kind=envelope["kind"],
-            req_id=req_id,
-            reply_chars=len(reply) if isinstance(reply, str) else None,
-            **{"from": envelope["from"]},
-        )
-        # The turn is recorded before anything is published: the `in` line
-        # says a turn HAPPENED, and it stays true whether or not the answer
-        # made it onto the wire. There is no Discord path from here at all,
-        # per §8 (a bus-triggered turn is a bus-only reply).
+            return False
+        if not won:
+            # Not an error path for THIS delivery — the work is done. It does
+            # mean another consumer holds the claim, so the caller must not
+            # record this as the authoritative completion.
+            self._audit.record(
+                "drop", subject, reason="yugo_dedup_owner_lost",
+                id=envelope["id"], req_id=req_id,
+            )
+        return won
+
+    def _release_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
         try:
-            await self._publish_turn_output(subject, envelope, req_id, reply)
-        except Exception as e:  # noqa: BLE001 — the subscription outlives one turn
-            # `publish_request` already absorbs every per-envelope fault, so
-            # reaching here means a fault in the parse-and-dispatch code
-            # itself. It still must not kill the callback: nats-py would route
-            # the exception to `error_cb` and this bot would go on looking
-            # healthy while every subsequent envelope died the same way.
+            return self._dedup.release(envelope["id"], owner)
+        except Exception as e:
             self._audit.record(
-                "drop",
-                subject,
-                reason=REJECT_PUBLISH_FAILED,
-                id=envelope["id"],
-                req_id=req_id,
-                error=repr(e),
+                "drop", subject, reason="yugo_dedup_release_failed",
+                id=envelope["id"], req_id=req_id, error=repr(e),
             )
+            return False
+
+    async def _renew_claim_until_done(
+        self, subject: str, envelope: dict, req_id: str, owner: str,
+    ) -> None:
+        """Hold the lease for as long as this turn is actually running.
+
+        Cadence comes off the event loop's MONOTONIC clock, so a wall-clock
+        step cannot stretch or skip the interval. The stored deadline stays
+        wall-clock because competing consumers compare it across processes.
+        Cancelled by the caller on both exits.
+        """
+        # The STORE's lease, not the module default — they are the same by
+        # default but a test or embedder can hand us a store with its own.
+        interval = max(0.05, self._dedup.lease_s * DEDUP_LEASE_RENEW_RATIO)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                held = self._dedup.renew(envelope["id"], owner)
+            except Exception as e:
+                self._audit.record(
+                    "drop", subject, reason="yugo_dedup_renew_failed",
+                    id=envelope["id"], req_id=req_id, error=repr(e),
+                )
+                return
+            if not held:
+                # Lease taken by another consumer. Nothing to cancel the turn
+                # with at this boundary; record it so the duplicate is visible
+                # rather than silent.
+                self._audit.record(
+                    "drop", subject, reason="yugo_dedup_lease_lost",
+                    id=envelope["id"], req_id=req_id,
+                )
+                return
 
     async def _warn_origin(self, subject: str, envelope: dict, req_id: str) -> None:
         """Tell `origin` that its baton has passed hop 8. v0.3d.
@@ -1827,8 +2216,20 @@ class FleetBus:
 
     async def _publish_turn_output(
         self, subject: str, envelope: dict, req_id: str, reply: Any
-    ) -> None:
+    ) -> bool:
         """Send a completed bus turn: third-party `<BUS>` tags, then the reply.
+
+        Returns whether every outbound act this turn OWED actually reached the
+        wire. The caller settles the durable claim on that answer, so it must
+        be the real transport result: `publish_request` CATCHES transport
+        errors and returns False rather than raising, and it also returns False
+        when disconnected. An earlier version only watched for exceptions
+        escaping this function, so a genuine transport failure returned
+        normally, the claim was stamped `completed`, and the envelope was
+        suppressed for the whole TTL with no answer ever sent.
+
+        A deliberately suppressed reply (`in_reply_to` set, or an all-tags
+        turn) returns True: nothing was owed, so nothing failed.
 
         TWO different outbound acts, and keeping them separate is the whole
         design:
@@ -1888,10 +2289,14 @@ class FleetBus:
         Suppressions are audited rather than silent. "My bot received it, ran a
         turn and said nothing" is otherwise unexplainable from the log.
         """
+        # Every outbound act that FAILED flips this. Starts True because a
+        # turn that owes nothing has delivered everything it owed.
+        delivered = True
+
         if not isinstance(reply, str):
             # The hook contract is `str | None`; None is a turn with nothing
             # to say. Anything else is a caller bug, not an envelope.
-            return
+            return delivered
 
         baton = next_baton_fields(envelope)
         tags = find_bus_tags(reply)
@@ -1946,13 +2351,17 @@ class FleetBus:
                     raw=_audit_excerpt(reply[tag.start : tag.end]),
                 )
                 continue
-            await self.publish_request(
+            if not await self.publish_request(
                 tag.attrs.get("to"),
                 {"text": body},
                 baton=baton,
                 req_id=req_id,
                 source_subject=subject,
-            )
+            ):
+                # A tag that never reached its peer is undelivered output. The
+                # turn is not settled on a partial send; under at-least-once a
+                # repeat is permitted and a silent loss is not.
+                delivered = False
 
         if envelope.get("in_reply_to") is not None:
             self._audit.record(
@@ -1963,7 +2372,7 @@ class FleetBus:
                 req_id=req_id,
                 cause="in_reply_to",
             )
-            return
+            return delivered
 
         answer = strip_bus_tags(reply, tags).strip()
         if not answer:
@@ -1977,15 +2386,17 @@ class FleetBus:
                 req_id=req_id,
                 cause="empty_reply",
             )
-            return
-        await self.publish_request(
+            return delivered
+        if not await self.publish_request(
             envelope["from"],
             {"text": answer},
             in_reply_to=envelope["id"],
             baton=baton,
             req_id=req_id,
             source_subject=subject,
-        )
+        ):
+            delivered = False
+        return delivered
 
     async def _teardown(self) -> None:
         nats = _lazy_nats()
