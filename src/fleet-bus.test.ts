@@ -535,6 +535,7 @@ describe('request session injection', () => {
     }, allowlist)
     bus.attachFakeNc(nc)
     const seen: string[] = []
+    const tokens: Array<string | undefined> = []
     bus.runSubscribe('fleet.vec.request', async (message: Msg) => {
       const id = (jc.decode(message.data) as { id: string }).id
       seen.push(id)
@@ -675,10 +676,11 @@ describe('request session injection', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-undeliv-')), 'dedup.sqlite')
     const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
     let reqId = ''
+    let token: string | undefined
     const bus = new TestFleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       dedupStore: store,
-      injectIntoSession: async event => { reqId = event.reqId },
+      injectIntoSession: async event => { reqId = event.reqId; token = event.replyToken },
     }, allowlist)
     const nc = new FakeNatsConnection()
     bus.attachFakeNc(nc)
@@ -686,7 +688,7 @@ describe('request session injection', () => {
     expect(reqId).not.toBe('')
 
     nc.failPublish = true
-    const result = bus.publishReply(reqId, { text: 'an answer' })
+    const result = bus.publishReply(reqId, { text: 'an answer' }, 'result', token)
     expect(result.ok).toBe(false)
 
     // Well past several lease periods: a still-renewing claim would keep the
@@ -705,16 +707,17 @@ describe('request session injection', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-evict-')), 'dedup.sqlite')
     const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
     const seen: string[] = []
+    const tokens: Array<string | undefined> = []
     const bus = new TestFleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       dedupStore: store, receiveLedgerCap: 2,
-      injectIntoSession: async event => { seen.push(event.reqId) },
+      injectIntoSession: async event => { seen.push(event.reqId); tokens.push(event.replyToken) },
     }, allowlist)
     bus.attachFakeNc(new FakeNatsConnection())
 
     await bus.handleRequest(envelope({ id: 'evict-a', to: 'vec', from: 'kat' }))
     await bus.handleRequest(envelope({ id: 'evict-b', to: 'vec', from: 'kat' }))
-    expect(bus.publishReply(seen[0]!, { text: 'reply to A' }).ok).toBe(true)
+    expect(bus.publishReply(seen[0]!, { text: 'reply to A' }, 'result', tokens[0]).ok).toBe(true)
     await bus.handleRequest(envelope({ id: 'evict-c', to: 'vec', from: 'kat' }))
 
     // Deliberately do NOT call publishReply for B. The eviction itself must
@@ -726,7 +729,7 @@ describe('request session injection', () => {
 
     // And the guard in publishReply covers the same condition when the reply
     // IS attempted — defence in depth, not a duplicate of the above.
-    expect(bus.publishReply(seen[1]!, { text: 'reply to B' }).ok).toBe(false)
+    expect(bus.publishReply(seen[1]!, { text: 'reply to B' }, 'result', tokens[1]).ok).toBe(false)
   })
 
   test('baton hop exhaustion abandons the claim instead of renewing it', async () => {
@@ -735,10 +738,11 @@ describe('request session injection', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-hops-')), 'dedup.sqlite')
     const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
     let reqId = ''
+    let token: string | undefined
     const bus = new TestFleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       dedupStore: store,
-      injectIntoSession: async event => { reqId = event.reqId },
+      injectIntoSession: async event => { reqId = event.reqId; token = event.replyToken },
     }, allowlist)
     bus.attachFakeNc(new FakeNatsConnection())
 
@@ -748,7 +752,7 @@ describe('request session injection', () => {
     }))
     expect(reqId).not.toBe('')
     // Derivation increments to 16 and throws BatonHopsExhausted.
-    expect(bus.publishReply(reqId, { text: 'an answer' }).ok).toBe(false)
+    expect(bus.publishReply(reqId, { text: 'an answer' }, 'result', token).ok).toBe(false)
 
     await new Promise(resolve => setTimeout(resolve, 900))
     const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
@@ -767,7 +771,7 @@ describe('request session injection', () => {
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       dedupStore: store,
       injectIntoSession: async event => {
-        replyResult = bus.publishReply(event.reqId, { text: 'done' })
+        replyResult = bus.publishReply(event.reqId, { text: 'done' }, 'result', event.replyToken)
       },
     }, allowlist)
     bus.attachFakeNc(new FakeNatsConnection())
@@ -790,7 +794,7 @@ describe('request session injection', () => {
       dedupStore: store,
       injectIntoSession: async event => {
         nc.failPublish = true
-        bus.publishReply(event.reqId, { text: 'done' })
+        bus.publishReply(event.reqId, { text: 'done' }, 'result', event.replyToken)
       },
     }, allowlist)
     bus.attachFakeNc(nc)
@@ -978,6 +982,96 @@ describe('request session injection', () => {
 
     // The NEW attempt returns normally, still owing its out-of-band reply. It
     // must remain pending and renewing, untouched by the stale failure.
+    releaseNew?.()
+    await newTurn
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+  })
+
+  test('reply authority requires attempt identity: missing, stale and current token', async () => {
+    // Ohm's matrix. An ABSENT token must withhold authority, not grant it —
+    // treating undefined as a wildcard preserved the exact defect the token
+    // exists to fix, for precisely the callers not yet migrated.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-matrix-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const events: FleetBusSessionEvent[] = []
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        events.push(event)
+        if (events.length === 1) await new Promise<void>(resolve => { releaseOld = resolve })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({ id: 'token-matrix', to: 'vec', from: 'kat' })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('token-matrix')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toHaveLength(2)
+
+    const reqId = events[0]!.reqId
+    // MISSING token: refused outright rather than publishing and stranding.
+    expect(bus.publishReply(reqId, { text: 'no token' }).error)
+      .toBe('claude_discord_adapter_reply_token_mismatch')
+    // STALE token: same refusal.
+    expect(bus.publishReply(reqId, { text: 'stale' }, 'result', events[0]!.replyToken).error)
+      .toBe('claude_discord_adapter_reply_token_mismatch')
+    // Neither may have touched the replacement's claim.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    // CURRENT token: settles the right attempt.
+    expect(bus.publishReply(reqId, { text: 'real' }, 'result', events[1]!.replyToken).ok).toBe(true)
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+
+    releaseOld?.(); releaseNew?.()
+    await oldTurn; await newTurn
+  })
+
+  test('a stale token cannot abandon via the baton-derivation path', async () => {
+    // The catch called abandonRepliedClaim(reqId, …) directly, bypassing the
+    // fence — so supplying a stale token did not protect the replacement.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-dedup-hoptok-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const events: FleetBusSessionEvent[] = []
+    let releaseOld: (() => void) | undefined
+    let releaseNew: (() => void) | undefined
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      dedupStore: store,
+      injectIntoSession: async event => {
+        events.push(event)
+        if (events.length === 1) await new Promise<void>(resolve => { releaseOld = resolve })
+        else await new Promise<void>(resolve => { releaseNew = resolve })
+      },
+    }, allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({
+      id: 'hop-token', to: 'vec', from: 'kat',
+      root_id: 'hop-token', origin: 'kat', owner: 'kat', hops: 15,
+    })
+    const oldTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('hop-token')
+    raw.close()
+    const newTurn = bus.handleRequest(wire)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(events).toHaveLength(2)
+
+    // Old attempt replies with its own (now stale) token; derivation hits the
+    // hop ceiling. The replacement's claim must be untouched.
+    bus.publishReply(events[0]!.reqId, { text: 'done' }, 'result', events[0]!.replyToken)
+    releaseOld?.()
+    await oldTurn
     releaseNew?.()
     await newTurn
     expect(bus.pendingReplyClaimCount()).toBe(1)
@@ -1503,7 +1597,7 @@ describe('request / publishReply / onResult', () => {
     expect(events).toHaveLength(1)
     const reqId = events[0]!.reqId
 
-    const result = bus.publishReply(reqId, { done: true }, 'pr_review_result')
+    const result = bus.publishReply(reqId, { done: true }, 'pr_review_result', events[0]!.replyToken)
     expect(result.ok).toBe(true)
     expect(nc.publishes.map(p => p.subject)).toEqual(['fleet.ohm.request'])
     expect(nc.publishes.some(p => p.subject.endsWith('.result'))).toBe(false)
@@ -1570,7 +1664,7 @@ describe('request / publishReply / onResult', () => {
     const reqId = events[0]!.reqId
     // Also verify nested case here — round-2 P2 was specifically about the
     // nested-undefined silent-drop the top-level guard missed.
-    const result = bus.publishReply(reqId, { ok: true, data: undefined })
+    const result = bus.publishReply(reqId, { ok: true, data: undefined }, 'result', events[0]!.replyToken)
     expect(result.ok).toBe(false)
     expect(result.error).toBe('claude_discord_adapter_payload_not_json_serializable')
     expect(nc.publishes).toHaveLength(0)

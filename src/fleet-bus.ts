@@ -1179,7 +1179,11 @@ export class FleetBus {
     const claimFor = (): PendingReplyClaim | undefined => {
       const pending = this.pendingReplyClaims.get(reqId)
       if (pending === undefined) return undefined
-      if (replyToken !== undefined && pending.token !== replyToken) return undefined
+      // SAFE BY DEFAULT. An absent token is not a wildcard: omitting it must
+      // WITHHOLD authority, not grant it. Treating `undefined` as "matches
+      // anything" preserved exactly the defect the token exists to fix, for
+      // precisely the callers not yet migrated.
+      if (pending.token !== replyToken) return undefined
       return pending
     }
     const abandonOwn = (reason: string): void => {
@@ -1192,6 +1196,20 @@ export class FleetBus {
     if (!this.nc || this.nc.isClosed()) {
       abandonOwn('claude_discord_adapter_fleet_bus_not_connected')
       return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
+    }
+    // A live claim exists for this envelope but this caller cannot prove it
+    // owns the attempt. Refuse rather than publish while leaving that claim
+    // renewing with nothing able to settle it — a silent success here strands
+    // the envelope until its TTL. Replies with NO pending claim (unsolicited
+    // and late-reply paths) are unaffected: they mutate no claim.
+    const claimAtKey = this.pendingReplyClaims.get(reqId)
+    if (claimAtKey !== undefined && claimAtKey.token !== replyToken) {
+      this.recordAudit({
+        dir: 'drop', subject: claimAtKey.subject,
+        reason: 'claude_discord_adapter_reply_token_mismatch',
+        envelope_id: claimAtKey.envelopeId, req_id: reqId,
+      })
+      return { ok: false, error: 'claude_discord_adapter_reply_token_mismatch', req_id: reqId }
     }
     const inbound = this.receiveLedger.get(reqId)
     if (inbound === undefined) {
@@ -1226,7 +1244,10 @@ export class FleetBus {
       // Terminal for this reply: hop exhaustion and derivation failure are
       // not retried here. Respecting the hop ceiling is correct; holding a
       // live lease for a reply that will never be sent is not a disposition.
-      this.abandonRepliedClaim(reqId, reason)
+      // Through the fence like every other failure path — this one was missed
+      // when the others were routed, which is why the claim "every failure
+      // path is fenced" was false when made.
+      abandonOwn(reason)
       return { ok: false, error: reason, req_id: reqId }
     }
     const envelope: Envelope = {
