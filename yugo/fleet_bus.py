@@ -147,9 +147,20 @@ DEDUP_PRUNE_BUDGET = 4 * DEDUP_PRUNE_EVERY
 # Renewal cadence for a live owner, as a fraction of the lease. Driven by a
 # MONOTONIC timer in-process: the stored lease_until_s stays wall-clock
 # because it is compared across processes, and a monotonic value is not
-# comparable outside the process that read it. What renewal buys is that a
-# healthy owner keeps pushing its own deadline forward, so neither a slow turn
-# nor a forward clock step can hand its envelope to a second worker.
+# comparable outside the process that read it.
+#
+# What renewal buys: a turn that simply outlives its lease is no longer handed
+# to a second worker while the first is still executing.
+#
+# What it does NOT buy, stated plainly because the opposite was claimed here
+# before: it does not defend against a forward wall-clock step. The stored
+# deadline is wall-clock, so a jump forward makes a live claim instantly
+# expired and a rival can take it before the owner's next renewal tick, with
+# the owner's callback still running. A monotonic CADENCE does not change the
+# wall-clock PREDICATE that admits the competitor. Closing that needs a real
+# clock domain — boot id plus monotonic deadlines, with reboot recovery — and
+# is tracked as yugo#26. Until then a clock-step-induced overlap is an
+# accepted duplicate under the at-least-once contract.
 DEDUP_LEASE_RENEW_RATIO = 0.4
 
 _BOT_NAME_PATTERN = re.compile(r"[a-z0-9_-]+")
@@ -1892,103 +1903,114 @@ class FleetBus:
             return
         req_id = original_req_id
 
-        # Renew from the moment the claim exists, not from the moment the
-        # session turn starts. `_warn_origin` awaits a publish that can stall
-        # on a full pending buffer mid-outage, and until this task existed the
-        # claim was held across it unrenewed.
+        # ONE cleanup scope for the ENTIRE claimed lifetime: the hop warning,
+        # the session turn, and the publish. Renewal starts here because
+        # `_warn_origin` awaits a publish that can stall on a full pending
+        # buffer mid-outage; the try begins here because an await outside the
+        # scope leaks the renewer, which would then extend an abandoned claim
+        # for as long as the process lives.
         renewer = asyncio.create_task(
             self._renew_claim_until_done(subject, envelope, req_id, claim_owner)
         )
+        # Settled means: this envelope is finished and must not be redelivered.
+        # It stays False until the reply is actually on the wire, so every
+        # other exit — cancellation, injection failure, publish failure —
+        # RELEASES the claim and leaves the work recoverable. Under the
+        # at-least-once contract a repeated effect is permitted and a lost
+        # response is not, so "settle" is the narrow case, not the default.
+        settled = False
+        try:
+            if isinstance(hops, int) and hops >= BATON_HOPS_WARN_AT:
+                await self._warn_origin(subject, envelope, req_id)
 
-        if isinstance(hops, int) and hops >= BATON_HOPS_WARN_AT:
-            await self._warn_origin(subject, envelope, req_id)
+            if self._on_envelope is None:
+                # No session configured — 3a's behaviour, and the behaviour of
+                # any embedding that only wants the wire. Accepted and audited,
+                # with no req_id: the nonce above exists for what a TURN
+                # publishes, and there is no turn. Nothing is owed on the wire,
+                # so this one IS finished.
+                self._audit.record(
+                    "in",
+                    subject,
+                    id=envelope["id"],
+                    kind=envelope["kind"],
+                    **{"from": envelope["from"]},
+                )
+                settled = True
+                return
 
-        if self._on_envelope is None:
-            # No session configured — 3a's behaviour, and the behaviour of any
-            # embedding that only wants the wire. Accepted and audited, with
-            # no req_id: the nonce above exists for what a TURN publishes, and
-            # there is no turn.
+            self._injection_delivered_ts = _utc_now_iso()
+            try:
+                reply = await self._on_envelope(envelope, req_id)
+            # CancelledError is a BaseException and deliberately NOT caught: a
+            # turn interrupted by shutdown is not a failed injection, and
+            # swallowing the cancel here would stall `drain()` behind an LLM
+            # call.
+            except BaseException as e:
+                if isinstance(e, asyncio.CancelledError):
+                    raise
+                # Same reject code the TS peer writes when its
+                # `injectIntoSession` rejects. The bus stays up and the
+                # subscription stays live: this envelope is lost, the next one
+                # is not.
+                self._audit.record(
+                    "drop",
+                    subject,
+                    reason="injection_failed",
+                    id=envelope["id"],
+                    req_id=req_id,
+                    error=repr(e),
+                )
+                return
+
+            self._session_last_response_ts = _utc_now_iso()
+            # The turn is recorded before anything is published: the `in` line
+            # says a turn HAPPENED, and it stays true whether or not the answer
+            # made it onto the wire. There is no Discord path from here at all,
+            # per §8 (a bus-triggered turn is a bus-only reply).
             self._audit.record(
                 "in",
                 subject,
                 id=envelope["id"],
                 kind=envelope["kind"],
+                req_id=req_id,
+                reply_chars=len(reply) if isinstance(reply, str) else None,
                 **{"from": envelope["from"]},
             )
-            await _cancel_task(renewer)
-            self._complete_claim(subject, envelope, req_id, claim_owner)
-            return
-
-        self._injection_delivered_ts = _utc_now_iso()
-        try:
-            reply = await self._on_envelope(envelope, req_id)
-        # CancelledError is a BaseException and deliberately NOT caught: a
-        # turn interrupted by shutdown is not a failed injection, and
-        # swallowing the cancel here would stall `drain()` behind an LLM call.
-        except BaseException as e:
-            await _cancel_task(renewer)
-            self._release_claim(subject, envelope, req_id, claim_owner)
-            if isinstance(e, asyncio.CancelledError):
-                raise
-            # Same reject code the TS peer writes when its `injectIntoSession`
-            # rejects. The bus stays up and the subscription stays live: this
-            # envelope is lost, the next one is not.
-            self._audit.record(
-                "drop",
-                subject,
-                reason="injection_failed",
-                id=envelope["id"],
-                req_id=req_id,
-                error=repr(e),
-            )
-            return
-        # The claim is NOT completed here. Completing before the reply is on
-        # the wire means a crash in this window leaves a `completed` row with
-        # no answer sent, and the redelivery is then suppressed for the full
-        # TTL — turning the documented at-least-once duplicate into a
-        # permanently LOST response, which is strictly worse. The lease stays
-        # held (and renewed) across publishing, and completion happens after.
-        self._session_last_response_ts = _utc_now_iso()
-        # Success is `dir="in"` carrying envelope identity AND the nonce —
-        # the shape the TS port records from `injectIntoSession`. The audit
-        # schema has three traffic lanes (`in`/`out`/`drop`) plus `conn` for
-        # lifecycle; a session turn does not get a fourth.
-        self._audit.record(
-            "in",
-            subject,
-            id=envelope["id"],
-            kind=envelope["kind"],
-            req_id=req_id,
-            reply_chars=len(reply) if isinstance(reply, str) else None,
-            **{"from": envelope["from"]},
-        )
-        # The turn is recorded before anything is published: the `in` line
-        # says a turn HAPPENED, and it stays true whether or not the answer
-        # made it onto the wire. There is no Discord path from here at all,
-        # per §8 (a bus-triggered turn is a bus-only reply).
-        try:
-            await self._publish_turn_output(subject, envelope, req_id, reply)
-        except Exception as e:  # noqa: BLE001 — the subscription outlives one turn
-            # `publish_request` already absorbs every per-envelope fault, so
-            # reaching here means a fault in the parse-and-dispatch code
-            # itself. It still must not kill the callback: nats-py would route
-            # the exception to `error_cb` and this bot would go on looking
-            # healthy while every subsequent envelope died the same way.
-            self._audit.record(
-                "drop",
-                subject,
-                reason=REJECT_PUBLISH_FAILED,
-                id=envelope["id"],
-                req_id=req_id,
-                error=repr(e),
-            )
+            try:
+                await self._publish_turn_output(subject, envelope, req_id, reply)
+            except Exception as e:  # noqa: BLE001 — the subscription outlives one turn
+                # `publish_request` already absorbs every per-envelope fault, so
+                # reaching here means a fault in the parse-and-dispatch code
+                # itself. It still must not kill the callback: nats-py would
+                # route the exception to `error_cb` and this bot would go on
+                # looking healthy while every subsequent envelope died the same
+                # way. The claim is NOT settled — the answer never went out, so
+                # a redelivery must be able to run it again.
+                self._audit.record(
+                    "drop",
+                    subject,
+                    reason=REJECT_PUBLISH_FAILED,
+                    id=envelope["id"],
+                    req_id=req_id,
+                    error=repr(e),
+                )
+                return
+            settled = True
         finally:
-            # Outbound processing is over, one way or the other: stop renewing
-            # and settle the claim. A publish fault still completes — the turn
-            # ran and its side effects happened, so replaying it would burn a
-            # second model call for an answer the peer may already have.
-            await _cancel_task(renewer)
-            self._complete_claim(subject, envelope, req_id, claim_owner)
+            # Renewal stops on EVERY exit, cancellation included. Shielded so a
+            # second cancel arriving here cannot skip the settle decision below
+            # and strand the claim pending-but-unrenewed.
+            await asyncio.shield(_cancel_task(renewer))
+            if settled:
+                self._complete_claim(subject, envelope, req_id, claim_owner)
+            else:
+                # Unfinished outbound work stays recoverable. Completing here
+                # would stamp a tombstone over an answer that never shipped and
+                # suppress redelivery for the whole TTL — the lost-response bug
+                # this ordering exists to prevent, reached by cancellation
+                # instead of by process death.
+                self._release_claim(subject, envelope, req_id, claim_owner)
 
     def _complete_claim(self, subject: str, envelope: dict, req_id: str, owner: str) -> bool:
         """Promote a claim, surviving a store fault and reporting owner loss.

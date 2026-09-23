@@ -341,3 +341,128 @@ def test_a_sweep_fault_never_stops_the_heartbeat(tmp_path):
 
     bus._dedup = ExplodingPrune(":memory:")
     assert bus._sweep_expired_claims() == 0  # must not raise
+
+
+def _bus_config(path, **overrides):
+    base = dict(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec", "kat"}), plugin_version="test",
+        audit_log_path=None, dedup_store_path=str(path),
+    )
+    base.update(overrides)
+    return fleet_bus.FleetBusConfig(**base)
+
+
+def _wire(envelope_id):
+    return {
+        "envelope_version": 1, "id": envelope_id, "from": "kat", "to": "vec",
+        "kind": "text_message", "ts": datetime.now(timezone.utc).isoformat(),
+        "payload": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_publish_leaves_the_claim_recoverable(tmp_path):
+    """A cancel mid-publish must NOT stamp `completed`.
+
+    Moving completion after `_publish_turn_output` was meant to stop a crash
+    in that window from losing the reply. A `finally` that completes
+    unconditionally recreates exactly that tombstone, reached by an orderly
+    shutdown instead of a hard kill: the answer never went out, yet the row
+    says done and redelivery is suppressed for the whole TTL. Under the
+    at-least-once contract a repeated effect is permitted; a lost response is
+    not.
+    """
+    path = tmp_path / "dedup.sqlite"
+    bus = fleet_bus.FleetBus(
+        _bus_config(path), fleet_bus.AuditLog(None),
+        on_envelope=lambda _e, _r: asyncio.sleep(0, result="an answer"),
+    )
+    publishing = asyncio.Event()
+
+    async def block_before_sending(*_args, **_kwargs):
+        publishing.set()
+        await asyncio.sleep(3600)  # nothing has gone on the wire yet
+
+    bus._publish_turn_output = block_before_sending
+    task = asyncio.create_task(bus._on_request("fleet.vec.request", _wire("cancelled-publish")))
+    await asyncio.wait_for(publishing.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    row = bus._dedup._db.execute(
+        "SELECT state FROM envelope_dedup_v2 WHERE envelope_id=?", ("cancelled-publish",)
+    ).fetchone()
+    assert row is None or row[0] != "completed", (
+        "a cancel before the reply was sent stamped the claim completed — the "
+        "response is lost and redelivery is suppressed for the full TTL"
+    )
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert rival.claim("cancelled-publish", "retry")[0] is False, (
+        "the envelope is not recoverable after an interrupted publish"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_publish_failure_leaves_the_claim_recoverable(tmp_path):
+    """Same rule for an ordinary outbound fault, not only cancellation.
+
+    The previous version completed deliberately here, reasoning that replaying
+    burns a second model call. That trades a LOST answer for a saved call,
+    which is backwards under a contract that accepts duplicates and not losses.
+    """
+    path = tmp_path / "dedup.sqlite"
+    bus = fleet_bus.FleetBus(
+        _bus_config(path), fleet_bus.AuditLog(None),
+        on_envelope=lambda _e, _r: asyncio.sleep(0, result="an answer"),
+    )
+
+    async def explode(*_args, **_kwargs):
+        raise RuntimeError("publish dispatch blew up")
+
+    bus._publish_turn_output = explode
+    await bus._on_request("fleet.vec.request", _wire("failed-publish"))
+
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert rival.claim("failed-publish", "retry")[0] is False, (
+        "an answer that never reached the wire was stamped completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_the_hop_warning_does_not_orphan_the_renewer(tmp_path):
+    """The renewer must die with the turn, wherever the turn is interrupted.
+
+    Renewal starts before `_warn_origin` so the claim is covered across that
+    publish. If the await sits outside the cleanup scope, a cancel there leaks
+    the task, which then extends an abandoned pending claim for as long as the
+    process lives — nothing else can ever recover that envelope.
+    """
+    path = tmp_path / "dedup.sqlite"
+    bus = fleet_bus.FleetBus(_bus_config(path), fleet_bus.AuditLog(None), on_envelope=None)
+    warning = asyncio.Event()
+
+    async def block_warning(*_args, **_kwargs):
+        warning.set()
+        await asyncio.sleep(3600)
+
+    bus._warn_origin = block_warning
+    wire = _wire("cancelled-warning")
+    wire["hops"] = fleet_bus.BATON_HOPS_WARN_AT
+
+    before = len(asyncio.all_tasks())
+    task = asyncio.create_task(bus._on_request("fleet.vec.request", wire))
+    await asyncio.wait_for(warning.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    leaked = [t for t in asyncio.all_tasks() if not t.done() and "_renew_claim_until_done" in repr(t)]
+    assert not leaked, f"renewal task outlived the cancelled turn: {leaked}"
+    assert len(asyncio.all_tasks()) <= before + 1
+    rival = fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert rival.claim("cancelled-warning", "retry")[0] is False, (
+        "the envelope is not recoverable after a cancel during the hop warning"
+    )

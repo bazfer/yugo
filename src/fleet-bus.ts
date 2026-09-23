@@ -1313,9 +1313,20 @@ export class FleetBus {
    *
    * The cadence runs off a timer, so it cannot be stretched or skipped by a
    * wall-clock step; the STORED deadline stays wall-clock because competing
-   * consumers in other processes compare it. What renewal buys is that a
-   * healthy owner keeps pushing its own deadline forward, so neither a slow
-   * turn nor a forward clock jump hands its envelope to a second worker.
+   * consumers in other processes compare it.
+   *
+   * What renewal buys: a turn that simply outlives its lease is no longer
+   * handed to a second worker while the first is still executing.
+   *
+   * What it does NOT buy, stated plainly because the opposite was claimed
+   * here before: it does not defend against a forward wall-clock step. The
+   * stored deadline is wall-clock, so a jump forward makes a live claim
+   * instantly expired and a rival can take it before the owner's next tick,
+   * with the owner's callback still running. A monotonic CADENCE does not
+   * change the wall-clock PREDICATE that admits the competitor. Closing that
+   * needs a real clock domain (boot id + monotonic deadlines, with reboot
+   * recovery) and is tracked as yugo#26. Until then a clock-step-induced
+   * overlap is an accepted duplicate under the at-least-once contract.
    */
   private renewWhileRunning(subject: string, envelopeId: string, reqId: string, owner: string): () => void {
     // The STORE's lease, not the module default. An embedder can inject a
