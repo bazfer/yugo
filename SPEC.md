@@ -291,7 +291,15 @@ and are recorded here so the next reader does not reintroduce them.
 > pending claim remains present and its lease is valid.**
 
 Both qualifiers are load-bearing. If the row is gone, or the lease is not valid,
-nothing is suppressed. Precisely what holds:
+nothing is suppressed.
+
+**"Functioning store"** means: the same logical database and key space for every
+participant, each participant following the claim protocol, and SQLite's
+transaction, uniqueness and locking guarantees intact. The Python adapter's
+default of `:memory:` satisfies none of this across processes — there is no
+shared store, so no cross-process suppression exists at all.
+
+Precisely what holds:
 
 - **Duplicate execution is possible.** Redelivery, a peer's retry or a publisher
   restart may cause the same envelope to be executed **more than once**.
@@ -347,14 +355,16 @@ idempotent. **Say which layer you mean, every time.**
   #24.
 - **Do not request a test proving no duplicate execution across an arbitrary
   crash window.** No implementation can pass it. The testable property is the
-  fencing one, with its qualifiers: against a shared store, a second consumer
-  must not start while the first is alive and renewal is succeeding.
-- **A duplicate execution is not automatically a defect.** It is permitted. A
-  competing admission is a defect **only when the invariant's preconditions held
-  at the moment of admission** — a functioning shared store, the pending claim
-  still present, and its lease still valid. Any of the cases above defeats one of
-  those preconditions, so a duplicate arising from them is a **known gap**, not a
-  new bug. Do not file it as one; reference #26.
+  deterministic invariant above: consumers sharing a functioning store suppress
+  competing admission while the pending claim remains present and its lease is
+  valid.
+- **A duplicate execution is not automatically a defect.** Competing admission
+  **while those preconditions hold** violates this contract. Overlap **after
+  protection is lost** does not by itself establish an admission defect —
+  **investigate why protection was lost.** A bug that deletes a claim or breaks
+  renewal removes the preconditions itself, and is a real defect even though the
+  resulting overlap is not an admission defect. Known clock-step and pending-row
+  pruning limitations are tracked in #26.
 - **Do not rely on eventual execution for correctness** without establishing that
   a redelivery path actually exists for that envelope. Today it may not.
 
