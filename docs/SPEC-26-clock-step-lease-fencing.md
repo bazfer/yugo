@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: APPROVED for implementation — v3.2, Release 1 MERGED, Release 2 gated (2026-09-24)
+status: v3.3 — Release 1 MERGED (undeployed); Release 2 gated; §8 pending review (2026-09-24)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -77,7 +77,10 @@ expired row — the dominant real case) or **concurrent** (two `primary` instanc
 of one bot on one host, which `publish-only` mode exists to prevent).
 
 **Four conditions. Violating any one FAILS CONSUMER STARTUP — it does not fall
-back to legacy behaviour.** Corrected in v3.2 at Ohm's direction, 2026-09-24: the
+back to legacy behaviour.** **The evidence each condition is checked against is
+specified in §8** — added after Vec correctly refused to implement this section
+without it.
+ Corrected in v3.2 at Ohm's direction, 2026-09-24: the
 original "falls back to legacy" wording contradicted §2, which forbids arbitrating
 an existing new-format row by wall clock. A per-row fallback would require a
 consumer that cannot trust its own clock domain to nevertheless classify every row
@@ -454,3 +457,161 @@ check behind it, which is the honest version.
   apply. Narrowed to the file-locality and WAL checks only. Also restated the
   port-schema divergence as a prohibition rather than an impossibility — a
   misconfiguration can still point both ports at one path.
+
+## 8. Deployment verification record — the startup input §1 was missing
+
+Added 2026-09-24 after **Vec refused to implement §1 without it**, and correctly:
+§1 makes locality and clock domain *startup preconditions that fail startup when
+unmet*, while §2 states the system cannot detect them itself. That is only
+coherent if something supplies the evidence. I specified the check and never
+specified its input. Direction accepted by Ohm; this section is the concrete
+interface he asked for.
+
+### 8.0 What this is, stated before the mechanism
+
+**Operator-attested deployment verification with drift detection.** It is **not**:
+
+- proof of storage locality,
+- protection against a privileged actor changing the environment,
+- continuous enforcement — every check below happens at startup.
+
+Any wording that upgrades it beyond that is wrong. Ohm's phrasing, kept verbatim
+because it is the load-bearing caveat.
+
+### 8.1 The clock domain needs no attestation — it is measurable
+
+Ohm asked how startup matches the verified clock context, noting that file
+identity cannot substitute for it. It turns out not to need attestation at all.
+
+**`/proc/self/timens_offsets` answers the precondition directly.** A process in
+the initial time namespace reads:
+
+```
+monotonic           0         0
+boottime            0         0
+```
+
+A process in an offset time namespace reads its own non-zero offsets. So:
+
+- **Non-zero `monotonic` or `boottime` offset → REFUSE consumption.** This
+  consumer's `CLOCK_MONOTONIC` is displaced from the host's and its deadlines are
+  not comparable with any other participant's.
+- **File absent (kernel without `CONFIG_TIME_NS`) → REFUSE.** The domain cannot be
+  established, which §1 already says fails startup.
+
+**Why this is sufficient and needs no cross-participant coordination:** each
+participant independently verifying a zero offset establishes that *every*
+verifying participant shares the host's monotonic clock. The property is
+transitive through the host, so no participant needs to learn anything about the
+others.
+
+**Measured on this fleet, 2026-09-24:** host, the `vec` container and the
+`yugo-coordinator` container all read `monotonic 0 0` / `boottime 0 0`. Docker
+does not create time namespaces without `--time-offset`.
+
+This also means **the record below carries no clock binding.** It attests storage
+topology only.
+
+### 8.2 Record input
+
+- **Configuration:** `YUGO_DEDUP_VERIFICATION_RECORD` in both ports — an explicit
+  path to an operator-provisioned file.
+- **A consumer MUST NOT create, refresh, or repair its own record.** Self-
+  attestation is not attestation. There is no "accept current values on mismatch"
+  path, no `--force`, and no first-run auto-generation.
+- Unset while a file-backed store is configured → **refuse consumption.**
+
+### 8.3 Record bindings
+
+Versioned JSON. `record_version` is required and an unknown version refuses.
+
+| Field | Purpose |
+|---|---|
+| `record_version` | Schema version; unknown → refuse |
+| `canonical_path` | `realpath()` of the store at provisioning time |
+| `fs_uuid` | Filesystem UUID from `/proc/self/mountinfo` |
+| `mount_point` | The mount the store resides on |
+| `inode` | Store file inode |
+| `port` | `typescript` or `python` — the two schemas differ (§1) |
+| `schema_fingerprint` | Ordered column names and declared types |
+| `storage_evidence` | The **backing-storage inspection**, not `local=true` |
+| `participant_inventory` | Accessors enumerated by §3's method |
+| `attested_by`, `attested_at` | Who and when |
+
+**`fs_uuid` rather than `st_dev`.** Ohm accepted `st_dev` + inode as a drift check;
+it is a weak one, because device numbers are not stable across reboots, so a
+record bound to `st_dev` would demand operator re-attestation after every reboot.
+The filesystem UUID is stable, and combined with `mount_point` and `inode` it
+detects the realistic drift — the store later living on a different filesystem —
+without forcing re-attestation on a schedule that guarantees the record goes stale
+or gets automated, which defeats the purpose.
+
+**`storage_evidence` must record what was inspected.** `local=true` is a claim, not
+evidence. The field holds the device, its backing type, and how that was
+determined.
+
+### 8.4 Startup validation sequence — ordered, fail-closed
+
+1. Clock domain per §8.1. Fail → refuse.
+2. Load the record. Missing, unreadable, malformed, or unknown `record_version` →
+   refuse.
+3. `realpath()` the configured store; compare to `canonical_path`.
+4. Resolve the filesystem UUID and mount point from `/proc/self/mountinfo`;
+   compare to `fs_uuid` and `mount_point`.
+5. `stat()` the store; compare `inode`. **Record this value.**
+6. Verify WAL is actually active by reading back `PRAGMA journal_mode` (§2), and
+   that boot identity is readable (§2).
+7. Open the database.
+8. **Re-`stat()` the path after opening** and compare against both the record and
+   the value from step 5. Any change → close and refuse.
+9. Compare the live schema against `schema_fingerprint`.
+10. Only now admit envelopes.
+
+**Step 8 narrows a TOCTOU window; it does not close it.** Ohm's point stands:
+`stat(path)` describes the object at a pathname, not the object SQLite
+subsequently opened. Between step 5 and step 7 the path can be replaced. Step 8
+detects the common case — a swap that leaves a different inode — and detects
+nothing if an attacker restores the original inode. **Storage topology must remain
+unchanged during operation; that is an operational requirement, not an enforced
+one.** Do not document step 8 as a security control.
+
+### 8.5 Provisioning and lifecycle
+
+**Vec's boundary case: first startup has no database file, so there is no inode to
+bind.** Provisioning is therefore explicitly two-phase and operator-driven:
+
+- **Phase A — provision.** An operator command creates the store with schema only
+  and no claims, performs the backing-storage inspection and the §3 accessor
+  enumeration, then writes the record binding the now-existing inode. Structured
+  as its own command precisely so it cannot happen implicitly during startup.
+- **Phase B — run.** Normal startup validates §8.4 and never writes the record.
+
+Dispositions, all fail-closed:
+
+| Situation | Disposition |
+|---|---|
+| No store file, no record | Refuse. Error names the provisioning command. |
+| No store file, record present | Refuse — a record cannot bind a nonexistent inode. Re-provision. |
+| Store restored from backup or recreated | Inode changed → refuse. **Re-provision.** |
+| Container recreated, same bind-mounted store | Bindings unchanged → passes. Nothing to do. |
+| **Reboot** | **Nothing to do.** Every binding is reboot-stable by design (§8.3). |
+| Store moved to another filesystem | `fs_uuid` mismatch → refuse. Re-provision. |
+| Accessor set changed | Record is stale. Re-provision — §3's inventory is part of the evidence. |
+
+**`:memory:` keeps its narrowly scoped exception (§2):** no record is required,
+because there is no file, no filesystem and no inode. The §8.1 clock check and the
+boot-identity check **still apply**, and a fresh claim still requires complete
+new-protocol metadata.
+
+### 8.6 Consequence for reboot recovery
+
+Ohm flagged the tradeoff: binding evidence to the current boot ID would require
+re-attestation after every reboot, and "immediate reboot recovery" would then have
+to be qualified as *eligible on the next claim after startup verification
+succeeds*.
+
+**This design does not bind the record to boot identity**, so that qualification
+is not needed. Boot ID stays where it belongs — in the row metadata, as the
+takeover discriminator — and never in the attestation. A rebooted host's consumer
+validates against the same record it validated against before, and reboot recovery
+keeps the immediacy §2 describes.
