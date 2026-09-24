@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: APPROVED for implementation — v3.1 + Ohm's three boundary cases (2026-09-24)
+status: APPROVED for implementation — v3.2, Release 1 MERGED, Release 2 gated (2026-09-24)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -27,9 +27,11 @@ instant after an NTP correction, well before the owner's next 24 s tick.
 
 ## Scope note — what this is and is not
 
-The settled contract is **at-least-once effects with live-owner fencing**. A
-wrongful takeover produces a duplicate execution, which that contract already
-permits. So this is a **quality-of-implementation** fix, not a violation of a
+The settled contract, as approved in SPEC §6.4, is **deduplicated admission;
+effects may repeat; eventual execution is not guaranteed.** A wrongful takeover
+produces a repeated effect, which that contract already permits. (The earlier
+phrasing here, "at-least-once effects with live-owner fencing", promised more
+than the system delivers and was superseded by §6.4 in PR #30.) So this is a **quality-of-implementation** fix, not a violation of a
 promise. Worth doing; not worth doing before #22, #28 or #23. (Deet's view,
 stated 2026-09-24; Fernando chose to proceed anyway, which is his call.)
 
@@ -49,8 +51,20 @@ Contention is either **sequential** (a process dies, a replacement finds the
 expired row — the dominant real case) or **concurrent** (two `primary` instances
 of one bot on one host, which `publish-only` mode exists to prevent).
 
-**Four conditions. Violating any one disables the new predicate and falls back to
-legacy behaviour:**
+**Four conditions. Violating any one FAILS CONSUMER STARTUP — it does not fall
+back to legacy behaviour.** Corrected in v3.2 at Ohm's direction, 2026-09-24: the
+original "falls back to legacy" wording contradicted §2, which forbids arbitrating
+an existing new-format row by wall clock. A per-row fallback would require a
+consumer that cannot trust its own clock domain to nevertheless classify every row
+correctly before touching it. Making this a startup condition removes the decision
+rather than arbitrating it.
+
+A consumer that cannot establish these refuses to consume at all. Non-consuming
+functionality may remain available **provided it neither acquires claims nor
+mutates lease metadata.** The `:memory:` store is the standing exception to the
+file-locality and WAL checks (see §2) — no file, no sharing, nothing to verify.
+
+The four conditions:
 
 1. One host-local SQLite database. Not a network mount, not a replicated copy.
 2. All participants read the same boot-ID source:
@@ -128,13 +142,21 @@ the bug it fixes — but so is a fabricated *downgrade*.
 - **Non-empty row boot ID + missing or invalid monotonic deadline is MALFORMED
   METADATA, not a legacy row.** Refuse takeover and report it. Treating it as
   legacy is exactly the downgrade this section exists to prevent.
+- **An EMPTY `lease_boot_id` is the explicitly supported legacy discriminator, not
+  corruption.** Malformed-metadata refusal applies to **new-format** rows only.
+  Added at Ohm's direction, 2026-09-24.
+- **An invalid non-empty boot ID must NEVER be counted as a reboot mismatch.** A
+  mismatch authorises immediate takeover, so reading an unparseable value as
+  "different boot" manufactures exactly the fabricated mismatch this design treats
+  as its worst failure mode. Invalid means malformed: refuse and report.
 
 A legacy row's documented vulnerability stays acceptable during migration.
 Deliberately downgrading an existing new-format row does not.
 
 **Verify, don't infer:** `PRAGMA journal_mode=WAL` can leave the previous mode
-unchanged. Check the returned value; if WAL is not active the same-host inference
-is unsupported and the store stays on the legacy predicate.
+unchanged. Check the returned value; if WAL is not active on a file-backed store
+the same-host inference is unsupported and **consumer startup fails** per §1. It
+does not fall back to the legacy predicate. (`:memory:` is exempt — see below.)
 
 **But WAL success is not a locality detector.** SQLite documents same-host
 operation as a *requirement*, not something it enforces. So for this rollout:
@@ -236,7 +258,7 @@ clock-gated one** — separate issue, not this one.
 **Not** "no effect on a non-legacy row" — completed-row TTL remains
 wall-clock-sensitive, so a step still moves when a completed row is pruned.
 
-## 6. Tests — fifteen, each mutation-verified
+## 6. Tests — sixteen, each mutation-verified
 
 Remove the guard, watch the named test go red. A green suite proves the tests pass,
 never that they test anything.
@@ -251,10 +273,37 @@ never that they test anything.
 7. Takeover loses to a renewal interleaved between read and write.
 8. Named-column INSERT works against both the 6-column and 8-column schema.
 9. Both ports, same behaviour.
-10. **Mixed-version deletion:** an old participant must not delete a new-format
-    live claim *(documents the hazard the cutover prevents)*.
-11. **Stale-metadata takeover:** monotonic columns left by an old takeover are not
-    read as the current owner's.
+10. **Mixed-version deletion — an executable DEMONSTRATION, not a detection
+    guarantee.** Reproduce an old participant deleting a new-format live claim,
+    then assert the concrete observable outcome: the resulting absent row is
+    **byte-for-byte the state of a never-seen envelope**, and the protocol carries
+    no field that distinguishes the two. Do not assert detection or prevention —
+    neither is possible here.
+11. **Stale-metadata takeover — same shape.** Reproduce an old takeover leaving
+    monotonic columns behind, then assert that the resulting row is
+    **syntactically well-formed and indistinguishable from a live claim under a
+    valid lease** by any discriminator this protocol defines.
+
+    **Why these two assert the negative.** Corrected 2026-09-24 after Vec caught
+    the error and Ohm ruled. My first disposition required these tests to assert
+    that new code *detects* the damage. It cannot: a deleted row leaves nothing to
+    inspect, and stale takeover metadata parses cleanly. That disposition claimed a
+    capability the protocol does not have. Tests 10 and 11 instead **demonstrate
+    the unsupported-overlap hazard**, which is why the stop-all-accessors cutover
+    is the **required mitigation for this protocol** — not because "no code fix
+    exists" (a future protocol could add a discriminator and enforce it), but
+    because *this* protocol defines none. Name the cutover in each test name so a
+    later reader does not "fix" the test by adding runtime prevention this design
+    cannot provide.
+
+    Note the limit of what a test can claim: these assert that the produced state
+    matches a specific legitimate state and that no discriminator exists, which is
+    checkable. They do not and cannot prove universal indistinguishability.
+
+11a. **Malformed-metadata refusal stays a SEPARATE test** from the two above — it
+    covers the detectable case (non-empty boot ID with a missing or invalid
+    monotonic deadline on a new-format row) and asserts a real runtime guarantee:
+    refuse and report. Empty `lease_boot_id` must pass as legacy, not refuse.
 12. **Rollback:** Release 1 against a migrated file still functions, with the
     safety property absent and that absence asserted.
 13. **Cross-port clock agreement:** TS and Python read the same monotonic domain
@@ -299,3 +348,20 @@ check behind it, which is the honest version.
   acquisition blocked without boot identity; malformed metadata distinguished from
   legacy; claim success requires one affected row plus successful commit.
   **Release gates retained: per-file accessor shutdown and verified locality.**
+- **v3.2 — 2026-09-24, after Release 1 shipped.** Two contradictions in v3.1 found
+  by Vec during implementation, both mine, both ruled on by Ohm:
+  1. §1's "violating any one disables the new predicate and falls back to legacy"
+     contradicted §2's rule that an existing new-format row must refuse rather than
+     use wall time. §1 was written before the boot-read correction and never
+     propagated backwards. **Resolved: precondition failure fails consumer
+     startup**, with the `:memory:` exception preserved. Both legacy-fallback
+     statements removed, including the separate WAL paragraph.
+  2. Tests 10–11 required detection the protocol cannot perform — a deleted row
+     leaves nothing to inspect, stale takeover metadata parses cleanly. **Resolved:
+     they reproduce the hazard and assert concrete observable outcomes**, with
+     malformed-metadata refusal split into its own test. Two wording constraints
+     from Ohm folded in: empty `lease_boot_id` is the supported legacy
+     discriminator, and an invalid non-empty boot ID is never a reboot mismatch.
+  Scope note updated to the approved §6.4 contract wording.
+  **Release 1 (named-column INSERTs) merged as PR #32, Ohm-approved at `b5d7f15`,
+  all CI green. Release 2 remains gated on rollout of Release 1.**
