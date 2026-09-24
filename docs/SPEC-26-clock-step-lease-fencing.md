@@ -202,7 +202,7 @@ consumer that cannot establish boot identity must still fail startup regardless
 of where its rows live.
 
 **`:memory:` is NOT the Python default** — v3.1 said so and was wrong (see §1). It
-means a single process with no coordination at all, which is a deliberate
+means a single process with no cross-process coordination, which is a deliberate
 configuration, not the norm.
 
 **Invariant, independent of the above:** on **every** ownership change of a
@@ -263,7 +263,21 @@ Only after Release 1 has reached **every accessor of a given file**.
 **Per-file protocol cutover: ALL ACTUAL FILE ACCESSORS must be STOPPED before
 Release 2 operates on that file** — including prune jobs and restartable old
 instances. The default filename alone does **not** establish that inventory;
-enumerate real accessors. Not optional — Ohm's finding B proves an old participant
+enumerate real accessors.
+
+**How to enumerate — measure, do not infer** (Ohm, v3.2c). Trace **running
+processes, loaded modules, effective configuration, and open database files**, and
+follow each container path **through its mounts to host backing storage**. Locality
+is not exclusively a container-level question.
+
+Specifically, none of the following is evidence that a store does not exist:
+a missing default directory, a package that will not import in the image's default
+interpreter, or an unset environment variable. A path override, a `:memory:`
+configuration, a different deployed adapter, or a mount namespace each explain an
+absent path while a real accessor is running. *(I made the missing-directory
+inference during the first inventory pass and Ohm corrected it. The constructor
+does `mkdir` its parent — but that only tells you what happens when the constructor
+runs, not whether it ran.)* Not optional — Ohm's finding B proves an old participant
 can damage new-format rows two ways:
 
 1. It still prunes pending rows by wall-clock, so a forward step lets it **delete a
