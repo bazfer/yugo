@@ -569,41 +569,56 @@ the first draft asserted otherwise. Its fields are mount ID, parent ID,
 `major:minor`, root, mount point, options, optional fields, separator, filesystem
 type, source, super options. No UUID anywhere.
 
-The resolver, specified rather than assumed:
+**The resolver takes no path-matching step at all.** Corrected in v3.4 after Ohm
+rejected the previous rule.
 
-1. Read `/proc/self/mountinfo` and select the governing mount for the store's
-   `realpath()`. Three things this step must get right, all flagged by Ohm:
+v3.3 selected a mount by finding the longest mountinfo mount point matching the
+store's path, resolving ties by taking the last entry in file order. **That rule
+is invalid.** Mount visibility follows the mount-ID/parent-ID topology — an
+ancestor overmount hides its descendants — and file order does not encode it. A
+resolver built on line order gives a different answer when the entries are
+reordered, which is a bug waiting on a kernel version bump. Test 29 enshrined the
+wrong rule and is replaced below.
 
-   - **Match on path components, not string prefix.** `/home/deetson` is not under
-     `/home/deet`. Compare component lists, and the mount point `/` matches
-     everything.
-   - **Unescape before comparing.** `mountinfo` escapes space, tab, newline and
-     backslash as `\040`, `\011`, `\012`, `\134` in the root and mount-point
-     fields. Compare decoded values, or a path containing a space silently fails
-     to match.
-   - **Handle stacked mounts.** The same mount point can be mounted more than
-     once; the **last** matching entry in file order governs. Take that one, not
-     the first.
+The fix is not a topology-aware path resolver. It is to stop resolving by path:
 
-   Take the governing entry's `major:minor` and filesystem type.
-2. Reverse-resolve a UUID: for each entry in `/dev/disk/by-uuid/`, `stat()` its
-   target and compare `st_rdev` to that `major:minor`. A match yields the UUID.
+1. **`stat()` the store file. `st_dev` IS the governing device**, by definition —
+   the kernel resolved the path already, including every overmount, and reports
+   the device the file actually lives on. Take `major(st_dev)` and `minor(st_dev)`.
+2. **Reverse-resolve a UUID:** for each entry in `/dev/disk/by-uuid/`, `stat()` its
+   target and compare `st_rdev` to that device. A match yields the UUID.
 
-**Dependencies and support limits, since this resolver has real ones:**
+Two `stat()` calls. No mountinfo parsing, no longest-prefix rule, no tie-break, no
+escape decoding, and **no dependence on entry order** — the order-independence
+Ohm asked for is structural rather than tested-for.
+
+**Verified on this host, 2026-09-24:** the store's `st_dev` is 2049 → major 8,
+minor 1; `/dev/disk/by-uuid/038e83cc-8b2a-4b94-a1a8-1bae5c97779a` has `st_rdev`
+major 8, minor 1. Exact match.
+
+**`mount_point` and `fstype` move out of the compared binding** and into
+`storage_evidence` as descriptive fields (§8.3.3). They are useful to a human
+reading a record and they are **never compared at startup**, so no topology
+question can affect the verdict. Where the kernel offers `statx()` with
+`STATX_MNT_ID` (Linux 5.8+), provisioning uses the returned mount ID to select the
+mountinfo entry by **exact mount-ID match** — unique and order-independent — and
+otherwise records them as unresolved. Neither outcome changes a startup decision.
+
+**Dependencies and support limits of the UUID half, which are real:**
 
 - `/dev/disk/by-uuid` is populated by udev. It is frequently **absent inside
   containers**, and absent on systems not running udev.
 - Stacked and virtual filesystems — LVM, btrfs subvolumes, overlayfs, ZFS — may
-  present a `major:minor` with no `by-uuid` entry, or one that does not identify
-  the underlying storage.
+  present a device with no `by-uuid` entry, or one that does not identify the
+  underlying storage.
 - A tmpfs or other non-persistent filesystem has no UUID by design.
 
 Therefore the record carries **two binding strengths**, and says which it has:
 
 | `device.binding` | Contents | Reboot behaviour |
 |---|---|---|
-| `"uuid"` (**strong**, preferred) | `fs_uuid`, `mount_point`, `fstype` | Stable. **No re-attestation after reboot.** |
-| `"devno"` (**weak**, fallback) | `major`, `minor`, `mount_point`, `fstype`, **`attested_boot_id`** | **Requires re-attestation after reboot — and that requirement is ENFORCED, not documented.** See below. |
+| `"uuid"` (**strong**, preferred) | `fs_uuid` | Stable. **No re-attestation after reboot.** |
+| `"devno"` (**weak**, fallback) | `major`, `minor`, **`attested_boot_id`** | **Requires re-attestation after reboot — and that requirement is ENFORCED, not documented.** See below. |
 
 **Blocker 1 (Ohm, v3): `devno` could not detect a reboot.** Device numbers often
 come back identical, so a weak record would silently pass and nobody would
@@ -640,18 +655,14 @@ variant permitted**.
 | Field | Type | Validation |
 |---|---|---|
 | `binding` | string | Exactly `"uuid"`. |
-| `fs_uuid` | string | Non-empty; compared case-insensitively, since `by-uuid` casing varies by filesystem. |
-| `mount_point` | string | Absolute, unescaped. |
-| `fstype` | string | Non-empty; compared exactly. |
+| `fs_uuid` | string | Non-empty; compared case-insensitively, since `by-uuid` casing varies by filesystem. **The only compared field in this variant.** |
 
 `binding: "devno"` —
 
 | Field | Type | Validation |
 |---|---|---|
 | `binding` | string | Exactly `"devno"`. |
-| `major`, `minor` | integer | Non-negative. Integers, not a `"8:1"` string — that form invites sloppy parsing. |
-| `mount_point` | string | Absolute, unescaped. |
-| `fstype` | string | Non-empty; compared exactly. |
+| `major`, `minor` | integer | Non-negative. Integers, not a `"8:1"` string — that form invites sloppy parsing. Compared against `major(st_dev)` / `minor(st_dev)` of the store. |
 | `attested_boot_id` | string | The boot ID at provisioning time. Mismatch at startup refuses. |
 
 Any other `binding` value refuses. A `"uuid"` record whose UUID cannot be resolved
@@ -669,6 +680,9 @@ Nested and specific. `local=true` is a claim, not evidence.
 ```json
 {
   "device_path": "/dev/sda1",
+  "mount_point": "/",
+  "fstype": "ext4",
+  "mount_id_source": "statx STATX_MNT_ID",
   "backing": "local-block",
   "determined_by": "lsblk -o NAME,TYPE,TRAN + findmnt -T <path>",
   "uuid_resolution": "resolved via /dev/disk/by-uuid",
@@ -691,8 +705,8 @@ handle after it:
 2. **Load the record.** Missing, unreadable, malformed, unknown `record_version`,
    or carrying an unknown field → refuse.
 3. `realpath()` the configured store; compare to `canonical_path`.
-4. Resolve the device per §8.3.1; compare against `device` according to its
-   `binding`.
+4. `stat()` the store and resolve the device per §8.3.1 — two `stat()` calls, no
+   path matching; compare against `device` according to its `binding`.
 5. `stat()` the store; compare `inode`. **Retain this value.**
 6. **Open the database with `SQLITE_OPEN_READWRITE` and WITHOUT
    `SQLITE_OPEN_CREATE`.** One handle, used for everything below. No creation, no
@@ -804,6 +818,13 @@ the original six-column schema, which then **refuses at step 10** against the
 port's constant — a clean, retryable state rather than a half-migrated one. The
 operator re-runs the migration.
 
+**Crash after `COMMIT` but before attestation** (Ohm, non-blocking) leaves a
+correctly migrated eight-column store with a stale six-column record. Recovery is
+**record-only re-attestation — do NOT rerun the `ALTER`s**, which would fail
+against columns that already exist and might tempt someone into a destructive
+"clean slate" instead. Step 10's three-way check catches this state: live schema
+and the port's constant agree, the record disagrees.
+
 Should a store nonetheless be found matching neither the old nor the supported
 schema, it **refuses**, and recovery is operator-driven: complete the migration
 and re-attest, or restore the step-3 backup. **Never auto-repair a schema
@@ -846,9 +867,13 @@ standard — delete the guard, watch the named test go red.
       fall back to comparing device numbers;
     - a `device` object mixing fields from both variants refuses;
     - `major:minor` supplied as the string `"8:1"` refuses.
-29. **Mount resolution:** a store under `/home/deetson` does not match a
-    `/home/deet` mount; a mount point containing an escaped space matches once
-    decoded; with the same mount point stacked twice, the **last** entry governs.
+29. **Device resolution is order-independent by construction.** Reordering the
+    `/proc/self/mountinfo` entries does not change the verdict, and neither does
+    an ancestor overmount hiding a descendant — because resolution reads
+    `st_dev` and never parses mountinfo on the startup path. Fixtures: reordered
+    entries, and a hidden-descendant topology. **This replaces the v3.3 test,
+    which asserted that the last matching mountinfo entry governs — an invalid
+    rule that would have locked the bug in.**
 30. **Three-way schema check:** a six-column store with a matching six-column
     record still **refuses**, because the port's constant expects eight. This is
     the test that would have caught the hole in §8 v2.
