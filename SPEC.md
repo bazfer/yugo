@@ -268,6 +268,114 @@ Per-user NATS permissions:
 
 NATS client MUST pass `inboxPrefix: '_INBOX_<botname>'` on connect. Without this, `nc.request()` uses `_INBOX.<random>` and fails the per-user subscribe permission with `Permissions Violation` — this kills the connection.
 
+### 6.4 — The execution-boundary delivery contract
+
+Sections 6.1 to 6.3 describe how an envelope *travels*. This section states what
+is guaranteed at the moment a consumer *executes* it. That distinction is the one
+this document previously left to inference, at a measurable cost — see the note
+at the end.
+
+**The contract is: deduplicated admission; effects may repeat; eventual
+execution is not guaranteed.**
+
+Note what that does *not* say. It makes no claim about the number of effects,
+because one callback invocation can itself produce repeated effects — the
+boundary controls *admission*, not what an admitted turn does. Two earlier drafts
+of this section claimed more than the code delivers ("at-least-once with
+live-owner fencing", then "at-most-once-per-admission effects"); both were wrong
+and are recorded here so the next reader does not reintroduce them.
+
+**The deterministic invariant**, which is the part you can rely on:
+
+> Consumers sharing a functioning store suppress competing admission **while the
+> pending claim remains present and its lease is valid.**
+
+Both qualifiers are load-bearing. If the row is gone, or the lease is not valid,
+nothing is suppressed.
+
+**"Functioning store"** means: the same logical database and key space for every
+participant, each participant following the claim protocol, and SQLite's
+transaction, uniqueness and locking guarantees intact. The Python adapter's
+default of `:memory:` satisfies none of this across processes — there is no
+shared store, so no cross-process suppression exists at all.
+
+Precisely what holds:
+
+- **Duplicate execution is possible.** Redelivery, a peer's retry or a publisher
+  restart may cause the same envelope to be executed **more than once**.
+- **Zero executions are also possible.** A consumer that crashes **after claiming
+  an envelope but before injecting it** produces no effects at all. **Retry
+  requires a subsequent delivery, which is not guaranteed.** Both adapters
+  currently use **core NATS subscriptions**; JetStream stream capture (§6.3)
+  persists messages but does **not** by itself supply durable execution retries.
+- **Admission suppression holds only while the claim is present and its lease
+  valid.** It does **not** guarantee that two executions never overlap. Known
+  cases where the invariant's preconditions fail — **this list is not claimed to
+  be exhaustive**:
+  - **Renewal failure.** The lease expires while the original work continues.
+    Both implementations explicitly acknowledge they **cannot cancel** that work
+    — there is no cancel handle at this boundary.
+  - **Event-loop stall.** A stalled consumer misses renewal ticks with its effect
+    still in flight.
+  - **TTL pruning of a live pending row (#26).** Current pruning can delete a
+    pending claim **despite renewal succeeding**, and needs **no clock step at
+    all** to do it. Once the row is gone the invariant's first precondition is
+    simply absent.
+  - **Wall-clock step (#26, open).** A forward step can hand a live claim to a
+    rival. **Renewal succeeding before the step does not prevent a takeover
+    after it** — a past success is not a continuing guarantee.
+- **Reply tokens fence replies, not effects.** The per-attempt token prevents a
+  stale attempt from *settling or abandoning* a claim it no longer owns. It has
+  no power over side effects that attempt has already performed.
+- **Not exactly-once.** Exactly-once execution is **not offered and is not
+  achievable** at this boundary.
+
+#### Why exactly-once is unachievable here
+
+Exactly-once at an execution boundary requires the side effect and the record of
+the side effect to commit together. Neither side of this boundary is a
+transactional resource:
+
+- `injectIntoSession` hands work to an LLM session. There is no transaction to
+  enlist and no rollback.
+- `_ask_bus` performs network I/O whose completion cannot be tied to a local
+  commit.
+
+So for any ordering of "do the work" and "record that the work was done", there
+is a window in which a crash leaves the two disagreeing. Moving the commit
+earlier converts duplicate execution into **lost** execution, which is worse. The
+dedup store suppresses duplicate *delivery*; it does not and cannot make effects
+idempotent. **Say which layer you mean, every time.**
+
+#### What this means for anyone writing a ticket against this area
+
+- **Do not scope work that requires universal exactly-once semantics at this
+  boundary.** It cannot be delivered here. Where a behaviour genuinely needs it,
+  the mechanism is idempotent effects at the application layer — the subject of
+  #24.
+- **Do not request a test proving no duplicate execution across an arbitrary
+  crash window.** No implementation can pass it. The testable property is the
+  deterministic invariant above: consumers sharing a functioning store suppress
+  competing admission while the pending claim remains present and its lease is
+  valid.
+- **A duplicate execution is not automatically a defect.** Competing admission
+  **while those preconditions hold** violates this contract. Overlap **after
+  protection is lost** does not by itself establish an admission defect —
+  **investigate why protection was lost.** A bug that deletes a claim or breaks
+  renewal removes the preconditions itself, and is a real defect even though the
+  resulting overlap is not an admission defect. Known clock-step and pending-row
+  pruning limitations are tracked in #26.
+- **Do not rely on eventual execution for correctness** without establishing that
+  a redelivery path actually exists for that envelope. Today it may not.
+
+#### Why this clause exists
+
+This section was added because its absence cost three review rounds on #21, where
+a reviewer demanded a property a coder correctly said was unachievable. Neither
+was wrong; the document that would have settled it did not exist. Filed as #23.
+
+Full history is in issue #23 and PR #30, not here.
+
 ## 7 — Injection frame (for consumers that surface envelopes to an LLM session)
 
 When a consumer injects a received envelope into an LLM session as a channel frame, the frame MUST include:
