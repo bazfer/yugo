@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: APPROVED for implementation — v3.2, Release 1 MERGED, Release 2 gated (2026-09-24)
+status: v3.3 — Release 1 MERGED (undeployed); Release 2 gated; §8 pending review (2026-09-24)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -77,7 +77,10 @@ expired row — the dominant real case) or **concurrent** (two `primary` instanc
 of one bot on one host, which `publish-only` mode exists to prevent).
 
 **Four conditions. Violating any one FAILS CONSUMER STARTUP — it does not fall
-back to legacy behaviour.** Corrected in v3.2 at Ohm's direction, 2026-09-24: the
+back to legacy behaviour.** **The evidence each condition is checked against is
+specified in §8** — added after Vec correctly refused to implement this section
+without it.
+ Corrected in v3.2 at Ohm's direction, 2026-09-24: the
 original "falls back to legacy" wording contradicted §2, which forbids arbitrating
 an existing new-format row by wall clock. A per-row fallback would require a
 consumer that cannot trust its own clock domain to nevertheless classify every row
@@ -94,10 +97,19 @@ The four conditions:
 1. One host-local SQLite database. Not a network mount, not a replicated copy.
 2. All participants read the same boot-ID source:
    `/proc/sys/kernel/random/boot_id`.
-3. All participants share one monotonic clock domain — **no time namespace
-   between them.** Linux time namespaces can offset `CLOCK_MONOTONIC` even on one
-   host, and these bots are containers, so this is a live concern rather than a
-   theoretical one.
+3. All participants share one monotonic clock domain — **each reads a zero
+   `monotonic` offset**, per §8.1. Linux time namespaces can offset
+   `CLOCK_MONOTONIC` even on one host, and these bots are containers, so this is a
+   live concern rather than a theoretical one.
+
+   **Reconciled in v3.3 at Ohm's direction.** This condition previously read "no
+   time namespace between them", which a zero offset does not prove: a process can
+   sit in a *distinct* time namespace that happens to carry a zero offset. The
+   requirement is offset equality, not namespace identity — and offset equality is
+   the property that actually matters, since two participants each unoffset from
+   the initial clock read the same `CLOCK_MONOTONIC` regardless of which namespace
+   object they belong to. Stating it as namespace identity claimed more than the
+   check delivers and more than the design needs.
 4. Clock API named explicitly, not "monotonic milliseconds":
    **TS `process.hrtime.bigint()`**, **Python `time.monotonic_ns()`**. Both are
    `CLOCK_MONOTONIC`; both survive a wall-clock step; neither is process-relative.
@@ -324,7 +336,7 @@ clock-gated one** — separate issue, not this one.
 **Not** "no effect on a non-legacy row" — completed-row TTL remains
 wall-clock-sensitive, so a step still moves when a completed row is pruned.
 
-## 6. Tests — sixteen, each mutation-verified
+## 6. Tests — sixteen on the lease protocol (below) plus sixteen on the startup interface (§8.7), each mutation-verified
 
 Remove the guard, watch the named test go red. A green suite proves the tests pass,
 never that they test anything.
@@ -454,3 +466,432 @@ check behind it, which is the honest version.
   apply. Narrowed to the file-locality and WAL checks only. Also restated the
   port-schema divergence as a prohibition rather than an impossibility — a
   misconfiguration can still point both ports at one path.
+
+## 8. Deployment verification record — the startup input §1 was missing
+
+Added 2026-09-24 after **Vec refused to implement §1 without it**, and correctly:
+§1 makes locality and clock domain *startup preconditions that fail startup when
+unmet*, while §2 states the system cannot detect them itself. That is only
+coherent if something supplies the evidence. I specified the check and never
+specified its input.
+
+Revised once already, after Ohm found four implementation blockers in the first
+draft — including a validation sequence that queried SQLite before opening it.
+Each is marked below where it applies.
+
+### 8.0 What this is, stated before the mechanism
+
+**Operator-attested deployment verification with drift detection.** It is **not**:
+
+- proof of storage locality,
+- protection against a privileged actor changing the environment,
+- continuous enforcement — every check below happens at startup.
+
+Any wording that upgrades it beyond that is wrong.
+
+### 8.1 The clock domain needs no attestation — it is measurable
+
+`/proc/self/timens_offsets` reports this process's offsets from the initial time
+namespace's clocks:
+
+```
+monotonic           0         0
+boottime            0         0
+```
+
+Rules:
+
+- **Non-zero `monotonic` offset → REFUSE consumption.** This consumer's
+  `CLOCK_MONOTONIC` is displaced from the initial namespace's and its deadlines
+  are not comparable with a participant reading zero.
+- **File absent** (kernel built without `CONFIG_TIME_NS`) **→ REFUSE.** The domain
+  cannot be established, which §1 already fails startup for.
+- **Parse strictly, in the consuming process.** Read it in the process that will
+  do the consuming — not a wrapper, not an entrypoint script, not a health check.
+  A parse that does not yield an exact integer pair per line refuses; do not
+  treat an unparseable line as zero.
+
+**What a zero offset does and does not establish** (Ohm, v3.3): it establishes
+*offset equality with the initial namespace*, **not namespace identity**. A
+process can occupy a distinct time namespace carrying a zero offset. That is
+fine, and it is why §1 now states the condition as offset equality: two
+participants each unoffset from the initial clock read the same
+`CLOCK_MONOTONIC`, whichever namespace object they belong to.
+
+**Transitivity is the whole argument.** Each participant independently verifying a
+zero offset establishes that all verifying participants share one monotonic
+domain, through the initial namespace as the common reference. No participant
+learns anything about any other, and no cross-participant coordination exists.
+
+**The offset must not change afterwards.** A startup check is not continuous
+enforcement (§8.0). A consumer's time namespace must not be altered while it runs;
+that is an operational requirement and is not enforced.
+
+**Measured on this fleet, 2026-09-24:** host, the `vec` container and the
+`yugo-coordinator` container all read `monotonic 0 0` / `boottime 0 0`. Docker
+does not create time namespaces without `--time-offset`.
+
+Consequence: **the record carries no clock binding.** It attests storage topology
+only.
+
+### 8.2 Record input
+
+- **Configuration:** `YUGO_DEDUP_VERIFICATION_RECORD` in both ports — an explicit
+  path to an operator-provisioned file.
+- **A consumer MUST NOT create, refresh, or repair its own record.** Self-
+  attestation is not attestation. There is no "accept current values on mismatch"
+  path, no `--force`, and no first-run auto-generation.
+- Unset while a file-backed store is configured → **refuse consumption.**
+
+### 8.3 Record schema — concrete types
+
+**Blocker 4 (Ohm): the first draft gave a field list, not a schema.** JSON object;
+every field required unless marked optional; unknown top-level fields refuse
+rather than being ignored.
+
+| Field | Type | Validation |
+|---|---|---|
+| `record_version` | integer | Exactly `1`. Any other value refuses. Not a string. |
+| `canonical_path` | string | Absolute. Compared to `realpath()` of the configured store, byte-for-byte. |
+| `device` | object | Tagged union on `binding`. See §8.3.1 and §8.3.1a. |
+| `inode` | **string** | Decimal digits only. **A string because inodes are unsigned 64-bit and JSON numbers lose precision above 2^53.** Compared as a big integer, never as a float. |
+| `port` | string | Closed enum: exactly `"typescript"` or `"python"`. Compared with exact string equality against the running port's own constant — never inferred, never matched case-insensitively. A mismatch refuses, because the two schemas differ (§1). |
+| `schema_fingerprint` | object | See §8.3.2. |
+| `storage_evidence` | object | See §8.3.3. Nested, not a boolean. |
+| `participant_inventory` | array of objects | Non-empty. Each: `{process, user, path, method}` — `method` states how it was observed, per §3. |
+| `attested_by` | string | Non-empty. |
+| `attested_at` | string | RFC 3339 with offset. |
+
+#### 8.3.1 `device` — and the UUID problem
+
+**Blocker 1 (Ohm): `/proc/self/mountinfo` contains no filesystem UUID.** True, and
+the first draft asserted otherwise. Its fields are mount ID, parent ID,
+`major:minor`, root, mount point, options, optional fields, separator, filesystem
+type, source, super options. No UUID anywhere.
+
+**The resolver takes no path-matching step at all.** Corrected in v3.4 after Ohm
+rejected the previous rule.
+
+v3.3 selected a mount by finding the longest mountinfo mount point matching the
+store's path, resolving ties by taking the last entry in file order. **That rule
+is invalid.** Mount visibility follows the mount-ID/parent-ID topology — an
+ancestor overmount hides its descendants — and file order does not encode it. A
+resolver built on line order gives a different answer when the entries are
+reordered, which is a bug waiting on a kernel version bump. Test 29 enshrined the
+wrong rule and is replaced below.
+
+The fix is not a topology-aware path resolver. It is to stop resolving by path:
+
+1. **`stat()` the store file. `st_dev` IS the governing device**, by definition —
+   the kernel resolved the path already, including every overmount, and reports
+   the device the file actually lives on. Take `major(st_dev)` and `minor(st_dev)`.
+2. **Reverse-resolve a UUID:** for each entry in `/dev/disk/by-uuid/`, `stat()` its
+   target and compare `st_rdev` to that device. A match yields the UUID.
+
+Two `stat()` calls. No mountinfo parsing, no longest-prefix rule, no tie-break, no
+escape decoding, and **no dependence on entry order** — the order-independence
+Ohm asked for is structural rather than tested-for.
+
+**Verified on this host, 2026-09-24:** the store's `st_dev` is 2049 → major 8,
+minor 1; `/dev/disk/by-uuid/038e83cc-8b2a-4b94-a1a8-1bae5c97779a` has `st_rdev`
+major 8, minor 1. Exact match.
+
+**`mount_point` and `fstype` move out of the compared binding** and into
+`storage_evidence` as descriptive fields (§8.3.3). They are useful to a human
+reading a record and they are **never compared at startup**, so no topology
+question can affect the verdict. Where the kernel offers `statx()` with
+`STATX_MNT_ID` (Linux 5.8+), provisioning uses the returned mount ID to select the
+mountinfo entry by **exact mount-ID match** — unique and order-independent — and
+otherwise records them as unresolved. Neither outcome changes a startup decision.
+
+**Dependencies and support limits of the UUID half, which are real:**
+
+- `/dev/disk/by-uuid` is populated by udev. It is frequently **absent inside
+  containers**, and absent on systems not running udev.
+- Stacked and virtual filesystems — LVM, btrfs subvolumes, overlayfs, ZFS — may
+  present a device with no `by-uuid` entry, or one that does not identify the
+  underlying storage.
+- A tmpfs or other non-persistent filesystem has no UUID by design.
+
+Therefore the record carries **two binding strengths**, and says which it has:
+
+| `device.binding` | Contents | Reboot behaviour |
+|---|---|---|
+| `"uuid"` (**strong**, preferred) | `fs_uuid` | Stable. **No re-attestation after reboot.** |
+| `"devno"` (**weak**, fallback) | `major`, `minor`, **`attested_boot_id`** | **Requires re-attestation after reboot — and that requirement is ENFORCED, not documented.** See below. |
+
+**Blocker 1 (Ohm, v3): `devno` could not detect a reboot.** Device numbers often
+come back identical, so a weak record would silently pass and nobody would
+re-attest. The rule existed only in prose.
+
+A `"devno"` record therefore carries **`attested_boot_id`**, read from
+`/proc/sys/kernel/random/boot_id` at provisioning time. Startup compares it to the
+current boot ID; **a mismatch refuses** and the error names the provisioning
+command. This is the one place boot identity enters the record, and it is doing a
+different job from §2's row metadata — there it discriminates takeover, here it
+detects that a weak binding's assumptions may no longer hold.
+
+**A `"uuid"` record is NEVER downgraded to `"devno"`.** If a record declares
+`"uuid"` and resolution fails at startup, that **refuses** — it does not fall back.
+Silent downgrade would convert a strong binding into a weak one at exactly the
+moment the environment changed underneath it, which is when the binding matters
+most.
+
+The provisioning command attempts `"uuid"` first and falls back to `"devno"` only
+when the resolver fails, recording *why* in `storage_evidence.uuid_resolution`. It
+never silently downgrades.
+
+This is the honest version of the trade I argued for in the first draft. I claimed
+UUID binding avoided a re-attestation treadmill; that holds **only where a UUID is
+resolvable**, and Ohm was right that I had not specified how it would be.
+
+#### 8.3.1a `device` variant types
+
+A tagged union on `binding`; validated as a whole, with **no field from the other
+variant permitted**.
+
+`binding: "uuid"` —
+
+| Field | Type | Validation |
+|---|---|---|
+| `binding` | string | Exactly `"uuid"`. |
+| `fs_uuid` | string | Non-empty; compared case-insensitively, since `by-uuid` casing varies by filesystem. **The only compared field in this variant.** |
+
+`binding: "devno"` —
+
+| Field | Type | Validation |
+|---|---|---|
+| `binding` | string | Exactly `"devno"`. |
+| `major`, `minor` | integer | Non-negative. Integers, not a `"8:1"` string — that form invites sloppy parsing. Compared against `major(st_dev)` / `minor(st_dev)` of the store. |
+| `attested_boot_id` | string | The boot ID at provisioning time. Mismatch at startup refuses. |
+
+Any other `binding` value refuses. A `"uuid"` record whose UUID cannot be resolved
+at startup refuses rather than falling back to a device-number comparison.
+
+#### 8.3.2 `schema_fingerprint`
+
+`{columns: [{name, declared_type}], table: "envelope_dedup_v2"}` — ordered, taken
+from `PRAGMA table_info`. Compared by exact ordered equality.
+
+#### 8.3.3 `storage_evidence`
+
+Nested and specific. `local=true` is a claim, not evidence.
+
+```json
+{
+  "device_path": "/dev/sda1",
+  "mount_point": "/",
+  "fstype": "ext4",
+  "mount_id_source": "statx STATX_MNT_ID",
+  "backing": "local-block",
+  "determined_by": "lsblk -o NAME,TYPE,TRAN + findmnt -T <path>",
+  "uuid_resolution": "resolved via /dev/disk/by-uuid",
+  "inspected_at": "2026-09-24T19:00:00-05:00"
+}
+```
+
+`backing` is a closed enum: `local-block`, `local-virtual`, `network`, `unknown`.
+**`network` and `unknown` refuse** — §1 rejects known network-backed stores, and an
+uninspected store is not an inspected one.
+
+### 8.4 Startup validation sequence — ordered, fail-closed
+
+**Blocker 2 (Ohm): the first draft's step 6 queried `PRAGMA journal_mode` before
+step 7 opened the database.** Impossible as written. Corrected — identity is
+established before opening, and everything requiring a connection happens on one
+handle after it:
+
+1. **Clock domain** per §8.1.
+2. **Load the record.** Missing, unreadable, malformed, unknown `record_version`,
+   or carrying an unknown field → refuse.
+3. `realpath()` the configured store; compare to `canonical_path`.
+4. `stat()` the store and resolve the device per §8.3.1 — two `stat()` calls, no
+   path matching; compare against `device` according to its `binding`.
+5. `stat()` the store; compare `inode`. **Retain this value.**
+6. **Open the database with `SQLITE_OPEN_READWRITE` and WITHOUT
+   `SQLITE_OPEN_CREATE`.** One handle, used for everything below. No creation, no
+   migration, no schema bootstrap on this path — a store that does not exist
+   refuses (§8.5) rather than being created.
+7. **Re-`stat()` the path and compare against both the record and the value
+   retained in step 5.** Any change → close and refuse.
+8. Read back `PRAGMA journal_mode`; WAL must be active (§2).
+9. Verify boot identity is readable (§2).
+10. **Three-way schema agreement.** Compare `PRAGMA table_info` against
+    `schema_fingerprint` **and against the port's own compiled-in constant for the
+    supported schema**. All three must agree; any disagreement refuses.
+
+    **Blocker 3 (Ohm, v3), and the sharpest of the four.** The first draft compared
+    the live schema only to the record. A six-column database with a matching
+    six-column record agreed with itself and **passed**, letting Release 2 code run
+    against a pre-migration store — the exact condition Release 2 exists to avoid.
+    A record attests what an operator saw; it cannot attest what the running code
+    requires. The port's constant is the authority on that, and the record is
+    checked against it, not consulted in its place.
+11. Only now admit envelopes.
+
+**Step 7 narrows a TOCTOU window; it does not close it.** `stat(path)` describes
+the object at a pathname, not the object SQLite opened. Between steps 5 and 6 the
+path can be replaced, and an actor who restores the original inode defeats the
+comparison entirely. **Storage topology must remain unchanged during operation —
+an operational requirement, not an enforced one. Do not document step 7 as a
+security control.**
+
+### 8.5 Provisioning and lifecycle
+
+**Vec's boundary case: first startup has no database file, so there is no inode to
+bind.** Provisioning is therefore two-phase and operator-driven:
+
+- **Phase A — `yugo dedup provision`.** Its own command precisely so it cannot
+  happen implicitly during startup. Arguments:
+
+  | Argument | Meaning |
+  |---|---|
+  | `--store <path>` | The database. Required. |
+  | `--record <path>` | Where to write the record. Required. |
+  | `--port typescript\|python` | **Required, never inferred.** It is written into `port` and decides which schema is created. Making the operator state it keeps a Python operator from provisioning a TypeScript-shaped store. |
+  | `--record-only` | Do not create or modify the database; attest the one already there. Used by §8.6 step 5 after a migration, and it is the ONLY mode that touches an existing store. |
+  | `--attested-by <name>` | Written to `attested_by`. Required. |
+
+  Without `--record-only` it creates the store with the **full supported schema for
+  `--port`** and no claims, runs the §8.3.3 inspection and the §3 accessor
+  enumeration, resolves the device binding, then writes the record.
+
+  **`--record-only` MUST reject a partial schema** (Ohm). If the store it is asked
+  to attest does not match the port's compiled-in supported schema exactly, it
+  refuses and writes nothing. Otherwise it would mint a record blessing a
+  half-migrated store, and step 10's three-way check would then be comparing two
+  agreeing wrong answers against the one right one.
+- **Phase B — run.** Startup validates §8.4 and never writes the record.
+
+| Situation | Disposition |
+|---|---|
+| No store file, no record | Refuse. Error names the provisioning command. |
+| No store file, record present | Refuse — a record cannot bind a nonexistent inode. Re-provision. |
+| **Store restored from backup, or recreated** | **Re-attestation REQUIRED, operationally. Restoration is NOT reliably detectable.** An in-place restore can preserve the inode and every binding, and then passes every check in §8.4. The first draft promised automatic detection here; it cannot deliver it. Codex found this independently. |
+| Container recreated, same bind-mounted store | Bindings unchanged → passes. |
+| **Reboot, `binding: "uuid"`** | **No manual re-attestation while the bindings still match.** Takeover eligibility follows successful startup validation like any other claim. |
+| **Reboot, `binding: "devno"`** | Device numbers may have changed → **re-attestation required.** |
+| Store moved to another filesystem | Device mismatch → refuse. Re-provision. |
+| Accessor set changed | Record is stale — the inventory is part of the evidence. Re-provision. |
+| **Release 2 column migration** | See §8.6. |
+
+**`:memory:` keeps its narrowly scoped exception (§2):** no record is required —
+no file, no filesystem, no inode. The §8.1 clock check and the boot-identity check
+**still apply**, and a fresh claim still requires complete new-protocol metadata.
+
+### 8.6 Migrating an existing store to the Release 2 schema
+
+**Blocker 3 (Ohm): unspecified, and a six-column store cannot match an
+eight-column fingerprint.** So every existing store fails step 10 the moment
+Release 2 ships. That is correct behaviour and a complete outage if nobody wrote
+down the path through it.
+
+Ordered, and it is the §3 cutover with two steps added:
+
+1. **Stop every accessor of this file** (§3), and prevent restart. For the
+   TypeScript stores that means no Claude Code session for that user may start
+   until step 6 — the launch path is a user action, not a service.
+2. **Confirm stopped**, by the §3 method, not by assumption.
+3. **Back up the store — including committed WAL state.** **Blocker 4 (Ohm):
+   copying the main database file alone loses transactions that are committed but
+   not yet checkpointed, and WAL mode means that is the normal steady state.** Use
+   SQLite's [backup API](https://sqlite.org/backup.html), or checkpoint and close
+   the database and **verify the checkpoint succeeded** before copying. A blind
+   `cp` of the `.sqlite` file is not a backup of a WAL database. Copying the
+   `-wal` and `-shm` files alongside it is not a substitute — it is a copy of a
+   torn state unless the database is closed.
+4. **Migrate in ONE transaction:** `BEGIN`, every
+   `ALTER TABLE envelope_dedup_v2 ADD COLUMN`, `COMMIT`. Each column is `DEFAULT`ed
+   so existing rows become well-formed **legacy** rows — empty `lease_boot_id`,
+   which §2 defines as the supported legacy discriminator. **No row is deleted,
+   rewritten or re-owned.**
+
+   SQLite has transactional DDL, so this makes the schema change atomic and
+   removes the half-migrated state the first draft had to write recovery prose
+   for. Ohm's preference, and it is strictly better than sequencing the `ALTER`s.
+5. **Re-attest.** The fingerprint has changed and the inode has not, so the
+   operator re-runs provisioning in record-only mode against the migrated store.
+6. **Start Release 2**, which validates §8.4 against the new record.
+
+**Partial failure.** With step 4 in one transaction an interruption rolls back to
+the original six-column schema, which then **refuses at step 10** against the
+port's constant — a clean, retryable state rather than a half-migrated one. The
+operator re-runs the migration.
+
+**Crash after `COMMIT` but before attestation** (Ohm, non-blocking) leaves a
+correctly migrated eight-column store with a stale six-column record. Recovery is
+**record-only re-attestation — do NOT rerun the `ALTER`s**, which would fail
+against columns that already exist and might tempt someone into a destructive
+"clean slate" instead. Step 10's three-way check catches this state: live schema
+and the port's constant agree, the record disagrees.
+
+Should a store nonetheless be found matching neither the old nor the supported
+schema, it **refuses**, and recovery is operator-driven: complete the migration
+and re-attest, or restore the step-3 backup. **Never auto-repair a schema
+mismatch** — that is the "accept current values" path §8.2 forbids, wearing a
+different hat, and it is how this would get added later by someone fixing an
+outage at 3am.
+
+**Rollback after migration** is §3's rollback: structurally compatible, silently
+without the safety property. The migrated store still works under Release 1
+because the added columns are `DEFAULT`ed. Say so, and never call it a safe
+rollback unqualified.
+
+### 8.7 Tests for the startup interface
+
+**Ohm: the existing lease tests do not cover these gates.** Added to §6, same
+standard — delete the guard, watch the named test go red.
+
+17. Non-zero `monotonic` offset refuses consumption.
+18. Absent `timens_offsets` refuses; an unparseable line refuses and is **not**
+    treated as zero.
+19. Missing record refuses; malformed refuses; unknown `record_version` refuses;
+    an unknown top-level field refuses.
+20. `inode` round-trips a value above 2^53 without precision loss, and a
+    one-off inode refuses.
+21. `port` mismatch refuses — a Python consumer against a `"typescript"` record.
+22. Store absent refuses and never creates the file, proving
+    `SQLITE_OPEN_CREATE` is genuinely unset.
+23. Inode replaced between the step-5 `stat()` and the step-7 re-`stat()` →
+    refuses and closes the handle.
+24. `storage_evidence.backing` of `network` or `unknown` refuses.
+25. A six-column store against an eight-column fingerprint refuses at step 10 —
+    the pre-migration state of every existing deployment.
+26. A migration interrupted between two `ALTER`s refuses, and **no row is lost**.
+27. `:memory:` runs with no record, and still refuses on a non-zero clock offset.
+28. **Binding-mode failures**, one test each:
+    - a `"devno"` record whose `attested_boot_id` differs from the current boot ID
+      refuses, **even when `major:minor` is unchanged** — the case that made the
+      reboot rule unenforced;
+    - a `"uuid"` record whose UUID cannot be resolved refuses and does **not**
+      fall back to comparing device numbers;
+    - a `device` object mixing fields from both variants refuses;
+    - `major:minor` supplied as the string `"8:1"` refuses.
+29. **Device resolution is order-independent by construction — but an overmount
+    that actually changes the resolved object must REFUSE.** Two halves, and
+    Ohm's clarification is that conflating them would be a defect:
+
+    a. **Representation changes nothing.** Reordering `/proc/self/mountinfo`
+       entries does not change the verdict, because resolution reads `st_dev` and
+       never parses mountinfo on the startup path. Fixture: the same topology,
+       entries reordered.
+    b. **A real change refuses.** An overmount that makes the configured path
+       resolve to a different device or inode **fails step 4 or step 5 against the
+       existing record**. Fixture: mount something over the store's directory so
+       the path now resolves elsewhere; startup must refuse, not adapt.
+
+    The first half says the verdict does not depend on how the kernel happens to
+    print its mount table. The second says the verdict absolutely does depend on
+    what the path resolves to. A test suite asserting only (a) could be satisfied
+    by code that ignores the environment entirely.
+
+    **This replaces the v3.3 test, which asserted that the last matching mountinfo
+    entry governs — an invalid rule that would have locked the bug in rather than
+    catching it.**
+30. **Three-way schema check:** a six-column store with a matching six-column
+    record still **refuses**, because the port's constant expects eight. This is
+    the test that would have caught the hole in §8 v2.
+31. `--record-only` against a half-migrated store refuses and writes no record.
+32. **WAL-aware backup:** a store with committed-but-uncheckpointed transactions,
+    backed up per §8.6 step 3, restores with those rows present — and a
+    main-file-only copy is shown to lose them.
