@@ -275,32 +275,47 @@ is guaranteed at the moment a consumer *executes* it. That distinction is the on
 this document previously left to inference, at a measurable cost — see the note
 at the end.
 
-**The contract is: at-most-once-per-admission effects, with best-effort
-live-owner fencing, and delivery-dependent retry.**
+**The contract is: deduplicated admission; effects may repeat; eventual
+execution is not guaranteed.**
 
-That is deliberately weaker than "at-least-once with live-owner fencing", which
-is what an earlier draft of this section claimed. Both halves of that phrasing
-were overstated. Precisely what holds:
+Note what that does *not* say. It makes no claim about the number of effects,
+because one callback invocation can itself produce repeated effects — the
+boundary controls *admission*, not what an admitted turn does. Two earlier drafts
+of this section claimed more than the code delivers ("at-least-once with
+live-owner fencing", then "at-most-once-per-admission effects"); both were wrong
+and are recorded here so the next reader does not reintroduce them.
+
+**The deterministic invariant**, which is the part you can rely on:
+
+> Consumers sharing a functioning store suppress competing admission **while the
+> pending claim remains present and its lease is valid.**
+
+Both qualifiers are load-bearing. If the row is gone, or the lease is not valid,
+nothing is suppressed. Precisely what holds:
 
 - **Duplicate execution is possible.** Redelivery, a peer's retry or a publisher
   restart may cause the same envelope to be executed **more than once**.
 - **Zero executions are also possible.** A consumer that crashes **after claiming
-  an envelope but before injecting it** produces no effects at all unless
-  something redelivers it. Both adapters currently use **core NATS
-  subscriptions**; JetStream stream capture (§6.3) persists messages but does
-  **not** by itself supply durable execution retries. **"At least once" therefore
-  requires a redelivery mechanism this system does not yet guarantee end to end.**
-- **Fencing is best-effort, not absolute.** The durable claim, owner lease,
-  renewal and per-attempt reply token make a *second consumer starting* unlikely
-  while the first is healthy. They do **not** guarantee that two executions never
-  overlap. Three known cases where they don't:
-  - **Renewal failure.** If renewal fails, the lease expires while the original
-    work continues. Both implementations explicitly acknowledge they **cannot
-    cancel** that work — there is no cancel handle at this boundary.
-  - **Event-loop stall.** A stalled consumer can miss renewal ticks while its
-    effect is still in flight, with the same result.
-  - **Wall-clock step (#26, open).** A forward clock step can hand a live claim
-    to a rival before the owner's next renewal tick.
+  an envelope but before injecting it** produces no effects at all. **Retry
+  requires a subsequent delivery, which is not guaranteed.** Both adapters
+  currently use **core NATS subscriptions**; JetStream stream capture (§6.3)
+  persists messages but does **not** by itself supply durable execution retries.
+- **Admission suppression holds only while the claim is present and its lease
+  valid.** It does **not** guarantee that two executions never overlap. Known
+  cases where the invariant's preconditions fail — **this list is not claimed to
+  be exhaustive**:
+  - **Renewal failure.** The lease expires while the original work continues.
+    Both implementations explicitly acknowledge they **cannot cancel** that work
+    — there is no cancel handle at this boundary.
+  - **Event-loop stall.** A stalled consumer misses renewal ticks with its effect
+    still in flight.
+  - **TTL pruning of a live pending row (#26).** Current pruning can delete a
+    pending claim **despite renewal succeeding**, and needs **no clock step at
+    all** to do it. Once the row is gone the invariant's first precondition is
+    simply absent.
+  - **Wall-clock step (#26, open).** A forward step can hand a live claim to a
+    rival. **Renewal succeeding before the step does not prevent a takeover
+    after it** — a past success is not a continuing guarantee.
 - **Reply tokens fence replies, not effects.** The per-attempt token prevents a
   stale attempt from *settling or abandoning* a claim it no longer owns. It has
   no power over side effects that attempt has already performed.
@@ -334,15 +349,14 @@ idempotent. **Say which layer you mean, every time.**
   crash window.** No implementation can pass it. The testable property is the
   fencing one, with its qualifiers: against a shared store, a second consumer
   must not start while the first is alive and renewal is succeeding.
-- **A duplicate execution is not automatically a defect.** It is permitted by
-  this contract. A duplicate execution *while the original owner was alive and
-  **successfully renewing**, against a **shared** dedup store* **is** a defect.
-  Note all three qualifiers: renewal must have been succeeding, not merely
-  attempted, and the two consumers must share a store — the Python adapter
-  defaults to `:memory:`, in which case no fencing exists between processes at
-  all.
-- **Do not rely on "at least once" for correctness** without establishing that a
-  redelivery path actually exists for that envelope. Today it may not.
+- **A duplicate execution is not automatically a defect.** It is permitted. A
+  competing admission is a defect **only when the invariant's preconditions held
+  at the moment of admission** — a functioning shared store, the pending claim
+  still present, and its lease still valid. Any of the cases above defeats one of
+  those preconditions, so a duplicate arising from them is a **known gap**, not a
+  new bug. Do not file it as one; reference #26.
+- **Do not rely on eventual execution for correctness** without establishing that
+  a redelivery path actually exists for that envelope. Today it may not.
 
 #### Why this clause exists
 
