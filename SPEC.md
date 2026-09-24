@@ -268,6 +268,70 @@ Per-user NATS permissions:
 
 NATS client MUST pass `inboxPrefix: '_INBOX_<botname>'` on connect. Without this, `nc.request()` uses `_INBOX.<random>` and fails the per-user subscribe permission with `Permissions Violation` — this kills the connection.
 
+### 6.4 — The execution-boundary delivery contract
+
+Sections 6.1 to 6.3 describe how an envelope *travels*. This section states what
+is guaranteed at the moment a consumer *executes* it. That distinction is the one
+this document previously left to inference, at a measurable cost — see the note
+at the end.
+
+**The contract is: at-least-once effects, with live-owner fencing.**
+
+Precisely:
+
+- **At least once.** An envelope that is admitted for execution will be executed
+  at least once. Redelivery, a peer's retry, a publisher restart or a consumer
+  crash may cause it to be executed **more than once**.
+- **Live-owner fencing.** Two consumers will not execute the same envelope
+  **while both are alive and both believe they hold it**. This is what the
+  durable claim, the owner lease, lease renewal and the per-attempt reply token
+  provide.
+- **Not exactly-once.** Exactly-once execution is **not offered and is not
+  achievable** at this boundary.
+
+#### Why exactly-once is unachievable here
+
+Exactly-once at an execution boundary requires the side effect and the record of
+the side effect to commit together. Neither side of this boundary is a
+transactional resource:
+
+- `injectIntoSession` hands work to an LLM session. There is no transaction to
+  enlist and no rollback.
+- `_ask_bus` performs network I/O whose completion cannot be tied to a local
+  commit.
+
+So for any ordering of "do the work" and "record that the work was done", there
+is a window in which a crash leaves the two disagreeing. Moving the commit
+earlier converts duplicate execution into **lost** execution, which is worse. The
+dedup store suppresses duplicate *delivery*; it does not and cannot make effects
+idempotent. **Say which layer you mean, every time.**
+
+#### What this means for anyone writing a ticket against this area
+
+- **Do not scope work that requires exactly-once.** It cannot be delivered and
+  the PR will stall. If a behaviour genuinely needs it, the fix is idempotent
+  effects at the application layer, not stronger delivery here — that is the
+  subject of #24.
+- **Do not request a test proving no duplicate execution across a crash.** No
+  implementation can pass it. The testable property is the fencing one: a second
+  consumer must not start while the first is alive and renewing.
+- **A duplicate execution is not automatically a defect.** It is permitted by
+  this contract. A duplicate execution *while the original owner was alive and
+  renewing* **is** a defect, because that violates fencing.
+
+#### Why this clause exists
+
+Three review rounds were spent on #21 because it was missing. The reviewer asked
+for a passing test for "a real crash after side effects but before completion".
+The coder refused to ship, saying the property was unachievable. **Both were
+correct.** The disagreement was not between them — it was with a document that
+did not exist. Issue #23 filed that gap as the root cause; this section closes it.
+
+The tell, for next time: when a competent reviewer demands a property and an
+equally competent coder says it cannot be built, stop arbitrating and go looking
+for the clause that should settle it. If the clause is missing, **that** is the
+finding.
+
 ## 7 — Injection frame (for consumers that surface envelopes to an LLM session)
 
 When a consumer injects a received envelope into an LLM session as a channel frame, the frame MUST include:
