@@ -867,13 +867,27 @@ standard — delete the guard, watch the named test go red.
       fall back to comparing device numbers;
     - a `device` object mixing fields from both variants refuses;
     - `major:minor` supplied as the string `"8:1"` refuses.
-29. **Device resolution is order-independent by construction.** Reordering the
-    `/proc/self/mountinfo` entries does not change the verdict, and neither does
-    an ancestor overmount hiding a descendant — because resolution reads
-    `st_dev` and never parses mountinfo on the startup path. Fixtures: reordered
-    entries, and a hidden-descendant topology. **This replaces the v3.3 test,
-    which asserted that the last matching mountinfo entry governs — an invalid
-    rule that would have locked the bug in.**
+29. **Device resolution is order-independent by construction — but an overmount
+    that actually changes the resolved object must REFUSE.** Two halves, and
+    Ohm's clarification is that conflating them would be a defect:
+
+    a. **Representation changes nothing.** Reordering `/proc/self/mountinfo`
+       entries does not change the verdict, because resolution reads `st_dev` and
+       never parses mountinfo on the startup path. Fixture: the same topology,
+       entries reordered.
+    b. **A real change refuses.** An overmount that makes the configured path
+       resolve to a different device or inode **fails step 4 or step 5 against the
+       existing record**. Fixture: mount something over the store's directory so
+       the path now resolves elsewhere; startup must refuse, not adapt.
+
+    The first half says the verdict does not depend on how the kernel happens to
+    print its mount table. The second says the verdict absolutely does depend on
+    what the path resolves to. A test suite asserting only (a) could be satisfied
+    by code that ignores the environment entirely.
+
+    **This replaces the v3.3 test, which asserted that the last matching mountinfo
+    entry governs — an invalid rule that would have locked the bug in rather than
+    catching it.**
 30. **Three-way schema check:** a six-column store with a matching six-column
     record still **refuses**, because the port's constant expects eight. This is
     the test that would have caught the hole in §8 v2.
