@@ -62,6 +62,12 @@ Read off the code, not assumed:
   units. This narrows the cutover: "all accessors of this file" is per bot **and**
   per port.
 
+  **Read this as a prohibition, not an impossibility** (Ohm, v3.2c): the ports
+  **must not** share a file. Nothing stops a misconfiguration pointing both at one
+  path, and the failure would be silent-ish rather than loud — which is one more
+  reason the accessor inventory in §3 is enumerated from reality rather than
+  inferred from the default filename.
+
 - SQLite WAL is enabled, and WAL participants must share a host.
 
 **Therefore: processes sharing one SQLite file on one host. Never cross-host.**
@@ -183,11 +189,21 @@ operation as a *requirement*, not something it enforces. So for this rollout:
 bot, and reject known network-backed stores.** A generic filesystem classifier is
 useful defence-in-depth, not proof of the topology.
 
-**`:memory:` is treated separately** from the file-backed WAL requirement. No
-file, no sharing, no WAL locality question, so the startup checks in §1 have
-nothing to verify and are skipped. **It is NOT the Python default** — v3.1 said so
-and was wrong (see §1). A `:memory:` store means a single process with no
-coordination at all, which is a deliberate configuration, not the norm.
+**`:memory:` is treated separately** from the file-backed WAL requirement.
+**Only the file-locality and WAL checks are skipped** — there is no file, no
+sharing, and nothing to verify. **Boot-identity and the applicable
+monotonic-clock checks still apply, and a fresh claim still requires complete
+new-protocol metadata.**
+
+Narrowed in v3.2c at Ohm's direction. My v3.2b wording said "the startup checks
+in §1 have nothing to verify and are skipped", which exempted far more than
+intended: an in-memory store still mints claims that must be defensible, so a
+consumer that cannot establish boot identity must still fail startup regardless
+of where its rows live.
+
+**`:memory:` is NOT the Python default** — v3.1 said so and was wrong (see §1). It
+means a single process with no coordination at all, which is a deliberate
+configuration, not the norm.
 
 **Invariant, independent of the above:** on **every** ownership change of a
 new-protocol claim, **atomically replace owner, boot ID and monotonic deadline
@@ -418,3 +434,9 @@ check behind it, which is the honest version.
      means the two ports can never share a dedup file.
   Test 7 reworded per Ohm's non-blocking note: serialized transaction orderings,
   not a renewal committing inside another writer's `BEGIN IMMEDIATE`.
+- **v3.2c — 2026-09-24.** One contradiction introduced by the v3.2b fix itself and
+  caught by Ohm on re-review: the `:memory:` paragraph said the §1 startup checks
+  "are skipped", exempting boot-identity and monotonic-clock checks that still
+  apply. Narrowed to the file-locality and WAL checks only. Also restated the
+  port-schema divergence as a prohibition rather than an impossibility — a
+  misconfiguration can still point both ports at one path.
