@@ -406,67 +406,6 @@ must be *recorded and checked* per bot rather than inferred from WAL succeeding 
 see §2. That converts an unproven assumption into a stated precondition with a
 check behind it, which is the honest version.
 
-## Review history
-
-- **v1** — local-monotonic observation cache. **Rejected, six counts.** Mixed-fleet
-  safety claim false; migration broke the existing INSERT; observation identity
-  insufficient (seq reuse); cross-host premise wrong; prune paths unaddressed;
-  recovery bound unestablished.
-- **v2** — boot_id + monotonic, observation cache abandoned. **Rejected.** Mixed-
-  version damage not confined to legacy rows; schema compatibility ≠ protocol
-  compatibility.
-- **v3** — clock/boot domain measured and stated as preconditions; per-file
-  cutover specified; pruning scope corrected; recovery narrowed. **Rejected on one
-  count:** boot-ID read failure downgraded arbitration of an existing monotonic
-  claim, allowing a forward step to steal a live claim with no fabricated mismatch.
-- **v3.1** — this document. Boot-read fallback corrected (legacy ROW vs legacy
-  READER); ownership change made atomic across all three fields; storage locality
-  recorded per bot rather than inferred from WAL; accessor inventory made explicit;
-  `:memory:` separated; cross-port test bound to the real clock APIs.
-  **Ohm: "The architecture holds with those rules."** No cache redesign, no third
-  release.
-- **v3.1 APPROVED 2026-09-24** — *"APPROVE — v3.1 design, for implementation. The
-  boot-read downgrade blocker is closed."* Design approval only, explicitly **not**
-  code or release approval. Three boundary cases added on approval: fresh-claim
-  acquisition blocked without boot identity; malformed metadata distinguished from
-  legacy; claim success requires one affected row plus successful commit.
-  **Release gates retained: per-file accessor shutdown and verified locality.**
-- **v3.2 — 2026-09-24, after Release 1 shipped.** Two contradictions in v3.1 found
-  by Vec during implementation, both mine, both ruled on by Ohm:
-  1. §1's "violating any one disables the new predicate and falls back to legacy"
-     contradicted §2's rule that an existing new-format row must refuse rather than
-     use wall time. §1 was written before the boot-read correction and never
-     propagated backwards. **Resolved: precondition failure fails consumer
-     startup**, with the `:memory:` exception preserved. Both legacy-fallback
-     statements removed, including the separate WAL paragraph.
-  2. Tests 10–11 required detection the protocol cannot perform — a deleted row
-     leaves nothing to inspect, stale takeover metadata parses cleanly. **Resolved:
-     they reproduce the hazard and assert concrete observable outcomes**, with
-     malformed-metadata refusal split into its own test. Two wording constraints
-     from Ohm folded in: empty `lease_boot_id` is the supported legacy
-     discriminator, and an invalid non-empty boot ID is never a reboot mismatch.
-  Scope note updated to the approved §6.4 contract wording.
-  **Release 1 (named-column INSERTs) merged as PR #32, Ohm-approved at `b5d7f15`,
-  all CI green. Release 2 remains gated on rollout of Release 1.**
-- **v3.2b — 2026-09-24, same day.** Two further corrections, found by Codex and
-  confirmed by Ohm on the v3.2 push, both errors of mine:
-  1. **Python's production dedup store is file-backed**, not `:memory:`. v3.1 cited
-     a constructor fallback as the production default without following the call
-     path through `load_config_from_env`. This materially widens the locality
-     question: every Python bot is a real file accessor.
-  2. **Per-port SQL examples.** The single displayed statement used TypeScript's
-     `_ms` columns; Python's are `_s` and REAL-typed. Both ports now shown
-     separately, and the schema divergence is stated as a precondition, since it
-     means the two ports can never share a dedup file.
-  Test 7 reworded per Ohm's non-blocking note: serialized transaction orderings,
-  not a renewal committing inside another writer's `BEGIN IMMEDIATE`.
-- **v3.2c — 2026-09-24.** One contradiction introduced by the v3.2b fix itself and
-  caught by Ohm on re-review: the `:memory:` paragraph said the §1 startup checks
-  "are skipped", exempting boot-identity and monotonic-clock checks that still
-  apply. Narrowed to the file-locality and WAL checks only. Also restated the
-  port-schema divergence as a prohibition rather than an impossibility — a
-  misconfiguration can still point both ports at one path.
-
 ## 8. Deployment verification record — the startup input §1 was missing
 
 Added 2026-09-24 after **Vec refused to implement §1 without it**, and correctly:
@@ -895,3 +834,64 @@ standard — delete the guard, watch the named test go red.
 32. **WAL-aware backup:** a store with committed-but-uncheckpointed transactions,
     backed up per §8.6 step 3, restores with those rows present — and a
     main-file-only copy is shown to lose them.
+
+## Review history
+
+- **v1** — local-monotonic observation cache. **Rejected, six counts.** Mixed-fleet
+  safety claim false; migration broke the existing INSERT; observation identity
+  insufficient (seq reuse); cross-host premise wrong; prune paths unaddressed;
+  recovery bound unestablished.
+- **v2** — boot_id + monotonic, observation cache abandoned. **Rejected.** Mixed-
+  version damage not confined to legacy rows; schema compatibility ≠ protocol
+  compatibility.
+- **v3** — clock/boot domain measured and stated as preconditions; per-file
+  cutover specified; pruning scope corrected; recovery narrowed. **Rejected on one
+  count:** boot-ID read failure downgraded arbitration of an existing monotonic
+  claim, allowing a forward step to steal a live claim with no fabricated mismatch.
+- **v3.1** — this document. Boot-read fallback corrected (legacy ROW vs legacy
+  READER); ownership change made atomic across all three fields; storage locality
+  recorded per bot rather than inferred from WAL; accessor inventory made explicit;
+  `:memory:` separated; cross-port test bound to the real clock APIs.
+  **Ohm: "The architecture holds with those rules."** No cache redesign, no third
+  release.
+- **v3.1 APPROVED 2026-09-24** — *"APPROVE — v3.1 design, for implementation. The
+  boot-read downgrade blocker is closed."* Design approval only, explicitly **not**
+  code or release approval. Three boundary cases added on approval: fresh-claim
+  acquisition blocked without boot identity; malformed metadata distinguished from
+  legacy; claim success requires one affected row plus successful commit.
+  **Release gates retained: per-file accessor shutdown and verified locality.**
+- **v3.2 — 2026-09-24, after Release 1 shipped.** Two contradictions in v3.1 found
+  by Vec during implementation, both mine, both ruled on by Ohm:
+  1. §1's "violating any one disables the new predicate and falls back to legacy"
+     contradicted §2's rule that an existing new-format row must refuse rather than
+     use wall time. §1 was written before the boot-read correction and never
+     propagated backwards. **Resolved: precondition failure fails consumer
+     startup**, with the `:memory:` exception preserved. Both legacy-fallback
+     statements removed, including the separate WAL paragraph.
+  2. Tests 10–11 required detection the protocol cannot perform — a deleted row
+     leaves nothing to inspect, stale takeover metadata parses cleanly. **Resolved:
+     they reproduce the hazard and assert concrete observable outcomes**, with
+     malformed-metadata refusal split into its own test. Two wording constraints
+     from Ohm folded in: empty `lease_boot_id` is the supported legacy
+     discriminator, and an invalid non-empty boot ID is never a reboot mismatch.
+  Scope note updated to the approved §6.4 contract wording.
+  **Release 1 (named-column INSERTs) merged as PR #32, Ohm-approved at `b5d7f15`,
+  all CI green. Release 2 remains gated on rollout of Release 1.**
+- **v3.2b — 2026-09-24, same day.** Two further corrections, found by Codex and
+  confirmed by Ohm on the v3.2 push, both errors of mine:
+  1. **Python's production dedup store is file-backed**, not `:memory:`. v3.1 cited
+     a constructor fallback as the production default without following the call
+     path through `load_config_from_env`. This materially widens the locality
+     question: every Python bot is a real file accessor.
+  2. **Per-port SQL examples.** The single displayed statement used TypeScript's
+     `_ms` columns; Python's are `_s` and REAL-typed. Both ports now shown
+     separately, and the schema divergence is stated as a precondition, since it
+     means the two ports can never share a dedup file.
+  Test 7 reworded per Ohm's non-blocking note: serialized transaction orderings,
+  not a renewal committing inside another writer's `BEGIN IMMEDIATE`.
+- **v3.2c — 2026-09-24.** One contradiction introduced by the v3.2b fix itself and
+  caught by Ohm on re-review: the `:memory:` paragraph said the §1 startup checks
+  "are skipped", exempting boot-identity and monotonic-clock checks that still
+  apply. Narrowed to the file-locality and WAL checks only. Also restated the
+  port-schema divergence as a prohibition rather than an impossibility — a
+  misconfiguration can still point both ports at one path.
