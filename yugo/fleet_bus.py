@@ -1163,7 +1163,7 @@ class DurableEnvelopeDedupStore:
                     (envelope_id, now - self._ttl_s),
                 )
                 cursor = self._db.execute(
-                    "INSERT OR IGNORE INTO envelope_dedup_v2 VALUES (?,?,?,'pending',?,?)",
+                    "INSERT OR IGNORE INTO envelope_dedup_v2 (envelope_id,first_seen_s,req_id,state,lease_owner,lease_until_s) VALUES (?,?,?,'pending',?,?)",
                     (envelope_id, now, req_id, owner, now + self._lease_s),
                 )
                 if cursor.rowcount == 1:
