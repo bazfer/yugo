@@ -156,7 +156,7 @@ export class DurableEnvelopeDedupStore {
       this.db.query('DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND first_seen_ms < ?')
         .run(envelopeId, nowMs - this.ttlMs)
       const inserted = this.db.query(
-        "INSERT OR IGNORE INTO envelope_dedup_v2 VALUES (?,?,?,'pending',?,?)",
+        "INSERT OR IGNORE INTO envelope_dedup_v2 (envelope_id,first_seen_ms,req_id,state,lease_owner,lease_until_ms) VALUES (?,?,?,'pending',?,?)",
       ).run(envelopeId, nowMs, reqId, owner, nowMs + this.leaseMsValue)
       if (inserted.changes === 1) return { duplicate: false, reqId, owner }
       const row = this.db.query('SELECT req_id,state,lease_until_ms FROM envelope_dedup_v2 WHERE envelope_id=?')
