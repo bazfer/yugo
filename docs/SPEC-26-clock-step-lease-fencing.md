@@ -336,7 +336,7 @@ clock-gated one** — separate issue, not this one.
 **Not** "no effect on a non-legacy row" — completed-row TTL remains
 wall-clock-sensitive, so a step still moves when a completed row is pruned.
 
-## 6. Tests — sixteen on the lease protocol (below) plus eleven on the startup interface (§8.7), each mutation-verified
+## 6. Tests — sixteen on the lease protocol (below) plus sixteen on the startup interface (§8.7), each mutation-verified
 
 Remove the guard, watch the named test go red. A green suite proves the tests pass,
 never that they test anything.
@@ -553,7 +553,7 @@ rather than being ignored.
 |---|---|---|
 | `record_version` | integer | Exactly `1`. Any other value refuses. Not a string. |
 | `canonical_path` | string | Absolute. Compared to `realpath()` of the configured store, byte-for-byte. |
-| `device` | object | See §8.3.1. |
+| `device` | object | Tagged union on `binding`. See §8.3.1 and §8.3.1a. |
 | `inode` | **string** | Decimal digits only. **A string because inodes are unsigned 64-bit and JSON numbers lose precision above 2^53.** Compared as a big integer, never as a float. |
 | `port` | string | Closed enum: exactly `"typescript"` or `"python"`. Compared with exact string equality against the running port's own constant — never inferred, never matched case-insensitively. A mismatch refuses, because the two schemas differ (§1). |
 | `schema_fingerprint` | object | See §8.3.2. |
@@ -571,8 +571,21 @@ type, source, super options. No UUID anywhere.
 
 The resolver, specified rather than assumed:
 
-1. Read `/proc/self/mountinfo`; find the longest mount point that is a prefix of
-   the store's `realpath()`. Take its `major:minor` and filesystem type.
+1. Read `/proc/self/mountinfo` and select the governing mount for the store's
+   `realpath()`. Three things this step must get right, all flagged by Ohm:
+
+   - **Match on path components, not string prefix.** `/home/deetson` is not under
+     `/home/deet`. Compare component lists, and the mount point `/` matches
+     everything.
+   - **Unescape before comparing.** `mountinfo` escapes space, tab, newline and
+     backslash as `\040`, `\011`, `\012`, `\134` in the root and mount-point
+     fields. Compare decoded values, or a path containing a space silently fails
+     to match.
+   - **Handle stacked mounts.** The same mount point can be mounted more than
+     once; the **last** matching entry in file order governs. Take that one, not
+     the first.
+
+   Take the governing entry's `major:minor` and filesystem type.
 2. Reverse-resolve a UUID: for each entry in `/dev/disk/by-uuid/`, `stat()` its
    target and compare `st_rdev` to that `major:minor`. A match yields the UUID.
 
@@ -590,7 +603,24 @@ Therefore the record carries **two binding strengths**, and says which it has:
 | `device.binding` | Contents | Reboot behaviour |
 |---|---|---|
 | `"uuid"` (**strong**, preferred) | `fs_uuid`, `mount_point`, `fstype` | Stable. **No re-attestation after reboot.** |
-| `"devno"` (**weak**, fallback) | `major`, `minor`, `mount_point`, `fstype` | **Device numbers are not stable across reboots. Requires re-attestation after reboot**, and the provisioning command must say so when it writes a weak record. |
+| `"devno"` (**weak**, fallback) | `major`, `minor`, `mount_point`, `fstype`, **`attested_boot_id`** | **Requires re-attestation after reboot — and that requirement is ENFORCED, not documented.** See below. |
+
+**Blocker 1 (Ohm, v3): `devno` could not detect a reboot.** Device numbers often
+come back identical, so a weak record would silently pass and nobody would
+re-attest. The rule existed only in prose.
+
+A `"devno"` record therefore carries **`attested_boot_id`**, read from
+`/proc/sys/kernel/random/boot_id` at provisioning time. Startup compares it to the
+current boot ID; **a mismatch refuses** and the error names the provisioning
+command. This is the one place boot identity enters the record, and it is doing a
+different job from §2's row metadata — there it discriminates takeover, here it
+detects that a weak binding's assumptions may no longer hold.
+
+**A `"uuid"` record is NEVER downgraded to `"devno"`.** If a record declares
+`"uuid"` and resolution fails at startup, that **refuses** — it does not fall back.
+Silent downgrade would convert a strong binding into a weak one at exactly the
+moment the environment changed underneath it, which is when the binding matters
+most.
 
 The provisioning command attempts `"uuid"` first and falls back to `"devno"` only
 when the resolver fails, recording *why* in `storage_evidence.uuid_resolution`. It
@@ -599,6 +629,33 @@ never silently downgrades.
 This is the honest version of the trade I argued for in the first draft. I claimed
 UUID binding avoided a re-attestation treadmill; that holds **only where a UUID is
 resolvable**, and Ohm was right that I had not specified how it would be.
+
+#### 8.3.1a `device` variant types
+
+A tagged union on `binding`; validated as a whole, with **no field from the other
+variant permitted**.
+
+`binding: "uuid"` —
+
+| Field | Type | Validation |
+|---|---|---|
+| `binding` | string | Exactly `"uuid"`. |
+| `fs_uuid` | string | Non-empty; compared case-insensitively, since `by-uuid` casing varies by filesystem. |
+| `mount_point` | string | Absolute, unescaped. |
+| `fstype` | string | Non-empty; compared exactly. |
+
+`binding: "devno"` —
+
+| Field | Type | Validation |
+|---|---|---|
+| `binding` | string | Exactly `"devno"`. |
+| `major`, `minor` | integer | Non-negative. Integers, not a `"8:1"` string — that form invites sloppy parsing. |
+| `mount_point` | string | Absolute, unescaped. |
+| `fstype` | string | Non-empty; compared exactly. |
+| `attested_boot_id` | string | The boot ID at provisioning time. Mismatch at startup refuses. |
+
+Any other `binding` value refuses. A `"uuid"` record whose UUID cannot be resolved
+at startup refuses rather than falling back to a device-number comparison.
 
 #### 8.3.2 `schema_fingerprint`
 
@@ -645,7 +702,17 @@ handle after it:
    retained in step 5.** Any change → close and refuse.
 8. Read back `PRAGMA journal_mode`; WAL must be active (§2).
 9. Verify boot identity is readable (§2).
-10. Compare `PRAGMA table_info` against `schema_fingerprint`.
+10. **Three-way schema agreement.** Compare `PRAGMA table_info` against
+    `schema_fingerprint` **and against the port's own compiled-in constant for the
+    supported schema**. All three must agree; any disagreement refuses.
+
+    **Blocker 3 (Ohm, v3), and the sharpest of the four.** The first draft compared
+    the live schema only to the record. A six-column database with a matching
+    six-column record agreed with itself and **passed**, letting Release 2 code run
+    against a pre-migration store — the exact condition Release 2 exists to avoid.
+    A record attests what an operator saw; it cannot attest what the running code
+    requires. The port's constant is the authority on that, and the record is
+    checked against it, not consulted in its place.
 11. Only now admit envelopes.
 
 **Step 7 narrows a TOCTOU window; it does not close it.** `stat(path)` describes
@@ -660,17 +727,33 @@ security control.**
 **Vec's boundary case: first startup has no database file, so there is no inode to
 bind.** Provisioning is therefore two-phase and operator-driven:
 
-- **Phase A — `yugo dedup provision --store <path> --record <path>`.** Creates the
-  store with schema only and no claims, performs the §8.3.3 inspection and the §3
-  accessor enumeration, resolves the device binding, then writes the record. Its
-  own command precisely so it cannot happen implicitly during startup.
+- **Phase A — `yugo dedup provision`.** Its own command precisely so it cannot
+  happen implicitly during startup. Arguments:
+
+  | Argument | Meaning |
+  |---|---|
+  | `--store <path>` | The database. Required. |
+  | `--record <path>` | Where to write the record. Required. |
+  | `--port typescript\|python` | **Required, never inferred.** It is written into `port` and decides which schema is created. Making the operator state it keeps a Python operator from provisioning a TypeScript-shaped store. |
+  | `--record-only` | Do not create or modify the database; attest the one already there. Used by §8.6 step 5 after a migration, and it is the ONLY mode that touches an existing store. |
+  | `--attested-by <name>` | Written to `attested_by`. Required. |
+
+  Without `--record-only` it creates the store with the **full supported schema for
+  `--port`** and no claims, runs the §8.3.3 inspection and the §3 accessor
+  enumeration, resolves the device binding, then writes the record.
+
+  **`--record-only` MUST reject a partial schema** (Ohm). If the store it is asked
+  to attest does not match the port's compiled-in supported schema exactly, it
+  refuses and writes nothing. Otherwise it would mint a record blessing a
+  half-migrated store, and step 10's three-way check would then be comparing two
+  agreeing wrong answers against the one right one.
 - **Phase B — run.** Startup validates §8.4 and never writes the record.
 
 | Situation | Disposition |
 |---|---|
 | No store file, no record | Refuse. Error names the provisioning command. |
 | No store file, record present | Refuse — a record cannot bind a nonexistent inode. Re-provision. |
-| Store restored from backup or recreated | Inode changed → refuse. **Re-provision.** |
+| **Store restored from backup, or recreated** | **Re-attestation REQUIRED, operationally. Restoration is NOT reliably detectable.** An in-place restore can preserve the inode and every binding, and then passes every check in §8.4. The first draft promised automatic detection here; it cannot deliver it. Codex found this independently. |
 | Container recreated, same bind-mounted store | Bindings unchanged → passes. |
 | **Reboot, `binding: "uuid"`** | **No manual re-attestation while the bindings still match.** Takeover eligibility follows successful startup validation like any other claim. |
 | **Reboot, `binding: "devno"`** | Device numbers may have changed → **re-attestation required.** |
@@ -695,23 +778,38 @@ Ordered, and it is the §3 cutover with two steps added:
    TypeScript stores that means no Claude Code session for that user may start
    until step 6 — the launch path is a user action, not a service.
 2. **Confirm stopped**, by the §3 method, not by assumption.
-3. **Back up the store file.** Rows are the point; the schema change is not.
-4. **Migrate:** `ALTER TABLE envelope_dedup_v2 ADD COLUMN` per new column, each
-   `DEFAULT`ed so existing rows become well-formed **legacy** rows — empty
-   `lease_boot_id`, which §2 defines as the supported legacy discriminator. **No
-   row is deleted, rewritten or re-owned.**
+3. **Back up the store — including committed WAL state.** **Blocker 4 (Ohm):
+   copying the main database file alone loses transactions that are committed but
+   not yet checkpointed, and WAL mode means that is the normal steady state.** Use
+   SQLite's [backup API](https://sqlite.org/backup.html), or checkpoint and close
+   the database and **verify the checkpoint succeeded** before copying. A blind
+   `cp` of the `.sqlite` file is not a backup of a WAL database. Copying the
+   `-wal` and `-shm` files alongside it is not a substitute — it is a copy of a
+   torn state unless the database is closed.
+4. **Migrate in ONE transaction:** `BEGIN`, every
+   `ALTER TABLE envelope_dedup_v2 ADD COLUMN`, `COMMIT`. Each column is `DEFAULT`ed
+   so existing rows become well-formed **legacy** rows — empty `lease_boot_id`,
+   which §2 defines as the supported legacy discriminator. **No row is deleted,
+   rewritten or re-owned.**
+
+   SQLite has transactional DDL, so this makes the schema change atomic and
+   removes the half-migrated state the first draft had to write recovery prose
+   for. Ohm's preference, and it is strictly better than sequencing the `ALTER`s.
 5. **Re-attest.** The fingerprint has changed and the inode has not, so the
    operator re-runs provisioning in record-only mode against the migrated store.
 6. **Start Release 2**, which validates §8.4 against the new record.
 
-**Partial failure.** `ALTER TABLE ADD COLUMN` is individually atomic, but a
-sequence of them is not, so an interrupted migration can leave a store matching
-neither fingerprint. That state **refuses at step 10**, which is the designed
-outcome: a consumer that cannot identify its schema must not admit envelopes.
-Recovery is operator-driven — complete the remaining `ALTER`s and re-attest, or
-restore the step-3 backup and start over. **Never auto-repair a fingerprint
-mismatch**; that is the "accept current values" path §8.2 forbids, wearing a
-different hat.
+**Partial failure.** With step 4 in one transaction an interruption rolls back to
+the original six-column schema, which then **refuses at step 10** against the
+port's constant — a clean, retryable state rather than a half-migrated one. The
+operator re-runs the migration.
+
+Should a store nonetheless be found matching neither the old nor the supported
+schema, it **refuses**, and recovery is operator-driven: complete the migration
+and re-attest, or restore the step-3 backup. **Never auto-repair a schema
+mismatch** — that is the "accept current values" path §8.2 forbids, wearing a
+different hat, and it is how this would get added later by someone fixing an
+outage at 3am.
 
 **Rollback after migration** is §3's rollback: structurally compatible, silently
 without the safety property. The migrated store still works under Release 1
@@ -740,3 +838,21 @@ standard — delete the guard, watch the named test go red.
     the pre-migration state of every existing deployment.
 26. A migration interrupted between two `ALTER`s refuses, and **no row is lost**.
 27. `:memory:` runs with no record, and still refuses on a non-zero clock offset.
+28. **Binding-mode failures**, one test each:
+    - a `"devno"` record whose `attested_boot_id` differs from the current boot ID
+      refuses, **even when `major:minor` is unchanged** — the case that made the
+      reboot rule unenforced;
+    - a `"uuid"` record whose UUID cannot be resolved refuses and does **not**
+      fall back to comparing device numbers;
+    - a `device` object mixing fields from both variants refuses;
+    - `major:minor` supplied as the string `"8:1"` refuses.
+29. **Mount resolution:** a store under `/home/deetson` does not match a
+    `/home/deet` mount; a mount point containing an escaped space matches once
+    decoded; with the same mount point stacked twice, the **last** entry governs.
+30. **Three-way schema check:** a six-column store with a matching six-column
+    record still **refuses**, because the port's constant expects eight. This is
+    the test that would have caught the hole in §8 v2.
+31. `--record-only` against a half-migrated store refuses and writes no record.
+32. **WAL-aware backup:** a store with committed-but-uncheckpointed transactions,
+    backed up per §8.6 step 3, restores with those rows present — and a
+    main-file-only copy is shown to lose them.
