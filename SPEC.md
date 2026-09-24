@@ -275,17 +275,35 @@ is guaranteed at the moment a consumer *executes* it. That distinction is the on
 this document previously left to inference, at a measurable cost — see the note
 at the end.
 
-**The contract is: at-least-once effects, with live-owner fencing.**
+**The contract is: at-most-once-per-admission effects, with best-effort
+live-owner fencing, and delivery-dependent retry.**
 
-Precisely:
+That is deliberately weaker than "at-least-once with live-owner fencing", which
+is what an earlier draft of this section claimed. Both halves of that phrasing
+were overstated. Precisely what holds:
 
-- **At least once.** An envelope that is admitted for execution will be executed
-  at least once. Redelivery, a peer's retry, a publisher restart or a consumer
-  crash may cause it to be executed **more than once**.
-- **Live-owner fencing.** Two consumers will not execute the same envelope
-  **while both are alive and both believe they hold it**. This is what the
-  durable claim, the owner lease, lease renewal and the per-attempt reply token
-  provide.
+- **Duplicate execution is possible.** Redelivery, a peer's retry or a publisher
+  restart may cause the same envelope to be executed **more than once**.
+- **Zero executions are also possible.** A consumer that crashes **after claiming
+  an envelope but before injecting it** produces no effects at all unless
+  something redelivers it. Both adapters currently use **core NATS
+  subscriptions**; JetStream stream capture (§6.3) persists messages but does
+  **not** by itself supply durable execution retries. **"At least once" therefore
+  requires a redelivery mechanism this system does not yet guarantee end to end.**
+- **Fencing is best-effort, not absolute.** The durable claim, owner lease,
+  renewal and per-attempt reply token make a *second consumer starting* unlikely
+  while the first is healthy. They do **not** guarantee that two executions never
+  overlap. Three known cases where they don't:
+  - **Renewal failure.** If renewal fails, the lease expires while the original
+    work continues. Both implementations explicitly acknowledge they **cannot
+    cancel** that work — there is no cancel handle at this boundary.
+  - **Event-loop stall.** A stalled consumer can miss renewal ticks while its
+    effect is still in flight, with the same result.
+  - **Wall-clock step (#26, open).** A forward clock step can hand a live claim
+    to a rival before the owner's next renewal tick.
+- **Reply tokens fence replies, not effects.** The per-attempt token prevents a
+  stale attempt from *settling or abandoning* a claim it no longer owns. It has
+  no power over side effects that attempt has already performed.
 - **Not exactly-once.** Exactly-once execution is **not offered and is not
   achievable** at this boundary.
 
@@ -308,29 +326,31 @@ idempotent. **Say which layer you mean, every time.**
 
 #### What this means for anyone writing a ticket against this area
 
-- **Do not scope work that requires exactly-once.** It cannot be delivered and
-  the PR will stall. If a behaviour genuinely needs it, the fix is idempotent
-  effects at the application layer, not stronger delivery here — that is the
-  subject of #24.
-- **Do not request a test proving no duplicate execution across a crash.** No
-  implementation can pass it. The testable property is the fencing one: a second
-  consumer must not start while the first is alive and renewing.
+- **Do not scope work that requires universal exactly-once semantics at this
+  boundary.** It cannot be delivered here. Where a behaviour genuinely needs it,
+  the mechanism is idempotent effects at the application layer — the subject of
+  #24.
+- **Do not request a test proving no duplicate execution across an arbitrary
+  crash window.** No implementation can pass it. The testable property is the
+  fencing one, with its qualifiers: against a shared store, a second consumer
+  must not start while the first is alive and renewal is succeeding.
 - **A duplicate execution is not automatically a defect.** It is permitted by
   this contract. A duplicate execution *while the original owner was alive and
-  renewing* **is** a defect, because that violates fencing.
+  **successfully renewing**, against a **shared** dedup store* **is** a defect.
+  Note all three qualifiers: renewal must have been succeeding, not merely
+  attempted, and the two consumers must share a store — the Python adapter
+  defaults to `:memory:`, in which case no fencing exists between processes at
+  all.
+- **Do not rely on "at least once" for correctness** without establishing that a
+  redelivery path actually exists for that envelope. Today it may not.
 
 #### Why this clause exists
 
-Three review rounds were spent on #21 because it was missing. The reviewer asked
-for a passing test for "a real crash after side effects but before completion".
-The coder refused to ship, saying the property was unachievable. **Both were
-correct.** The disagreement was not between them — it was with a document that
-did not exist. Issue #23 filed that gap as the root cause; this section closes it.
+This section was added because its absence cost three review rounds on #21, where
+a reviewer demanded a property a coder correctly said was unachievable. Neither
+was wrong; the document that would have settled it did not exist. Filed as #23.
 
-The tell, for next time: when a competent reviewer demands a property and an
-equally competent coder says it cannot be built, stop arbitrating and go looking
-for the clause that should settle it. If the clause is missing, **that** is the
-finding.
+Full history is in issue #23 and PR #30, not here.
 
 ## 7 — Injection frame (for consumers that surface envelopes to an LLM session)
 
