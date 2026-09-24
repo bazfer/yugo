@@ -41,8 +41,27 @@ Read off the code, not assumed:
 
 - **TypeScript** defaults to `~/.claude/fleet-bus-dedup-<botName>.sqlite`
   (`src/fleet-bus.ts:903`). Per bot, per home directory.
-- **Python** defaults to **`:memory:`** (`yugo/fleet_bus.py:1433`) unless
-  `YUGO_DEDUP_STORE_PATH` is set — i.e. no cross-process coordination at all.
+- **Python** defaults to **`/var/lib/yugo/<bot_name>-dedup.sqlite`**
+  (`yugo/fleet_bus.py:1377-1378`, via `load_config_from_env`, which `bot.py:152`
+  uses), overridable with `YUGO_DEDUP_STORE_PATH`. **File-backed, per bot.**
+
+  **CORRECTED in v3.2** after Codex and Ohm both flagged it. v3.1 said Python
+  "defaults to `:memory:` — i.e. no cross-process coordination at all", citing
+  `fleet_bus.py:1433`. That line is the **constructor fallback** for a config with
+  no path set; it is not the production startup path, which always supplies one.
+  I read one line without following the call path. The practical consequence is
+  the opposite of what v3.1 claimed: **every Python bot is a real file accessor
+  with a live locality question**, so `:memory:` is a rare configuration rather
+  than the norm, and the `:memory:` exception below applies to far fewer
+  deployments than v3.1 implied.
+
+- **The two ports do not share a schema, so they can never share a file.**
+  TypeScript stores `first_seen_ms` / `lease_until_ms` as INTEGER milliseconds
+  (`src/fleet-bus.ts:133-137`); Python stores `first_seen_s` / `lease_until_s` as
+  REAL seconds (`yugo/fleet_bus.py:1142-1144`). Different names and different
+  units. This narrows the cutover: "all accessors of this file" is per bot **and**
+  per port.
+
 - SQLite WAL is enabled, and WAL participants must share a host.
 
 **Therefore: processes sharing one SQLite file on one host. Never cross-host.**
@@ -164,8 +183,11 @@ operation as a *requirement*, not something it enforces. So for this rollout:
 bot, and reject known network-backed stores.** A generic filesystem classifier is
 useful defence-in-depth, not proof of the topology.
 
-**`:memory:` is treated separately** from the file-backed WAL requirement — the
-Python default. No file, no sharing, no WAL locality question.
+**`:memory:` is treated separately** from the file-backed WAL requirement. No
+file, no sharing, no WAL locality question, so the startup checks in §1 have
+nothing to verify and are skipped. **It is NOT the Python default** — v3.1 said so
+and was wrong (see §1). A `:memory:` store means a single process with no
+coordination at all, which is a deliberate configuration, not the norm.
 
 **Invariant, independent of the above:** on **every** ownership change of a
 new-protocol claim, **atomically replace owner, boot ID and monotonic deadline
@@ -195,10 +217,24 @@ INSERT OR IGNORE INTO envelope_dedup_v2 VALUES (?,?,?,?,?,?)
 Adding a seventh column makes this fail on six values **regardless of DEFAULT**.
 Ohm reproduced it: `table envelope_dedup_v2 has 7 columns but 6 values were supplied`.
 
+**The column names differ per port — one example each, not one shared statement.**
+Corrected in v3.2; v3.1 showed the TypeScript names for both, which would have been
+wrong if copied into the Python port. PR #32 already implemented both correctly.
+
+TypeScript (INTEGER milliseconds):
+
 ```sql
 INSERT OR IGNORE INTO envelope_dedup_v2
   (envelope_id, first_seen_ms, req_id, state, lease_owner, lease_until_ms)
-VALUES (?,?,?,?,?,?)
+VALUES (?,?,?,'pending',?,?)
+```
+
+Python (REAL seconds):
+
+```sql
+INSERT OR IGNORE INTO envelope_dedup_v2
+  (envelope_id, first_seen_s, req_id, state, lease_owner, lease_until_s)
+VALUES (?,?,?,'pending',?,?)
 ```
 
 **This ships first, on its own, in both ports, and nothing else.** A named-column
@@ -270,7 +306,12 @@ never that they test anything.
 4. Empty `boot_id` (legacy row) → wall-clock behaviour, unchanged.
 5. Backward clock step does not extend a hold.
 6. **A forward clock step does not prune a live pending row.**
-7. Takeover loses to a renewal interleaved between read and write.
+7. Takeover loses to a renewal under a **serialized transaction ordering** —
+    two writers, each in its own `BEGIN IMMEDIATE`, committed in a defined order.
+    Reworded in v3.2 on Ohm's non-blocking note: "a renewal interleaved between
+    read and write" describes a renewal committing inside another writer's
+    `BEGIN IMMEDIATE`, which SQLite's write lock makes impossible. Test the
+    orderings that can actually occur, or the test asserts against a fiction.
 8. Named-column INSERT works against both the 6-column and 8-column schema.
 9. Both ports, same behaviour.
 10. **Mixed-version deletion — an executable DEMONSTRATION, not a detection
@@ -365,3 +406,15 @@ check behind it, which is the honest version.
   Scope note updated to the approved §6.4 contract wording.
   **Release 1 (named-column INSERTs) merged as PR #32, Ohm-approved at `b5d7f15`,
   all CI green. Release 2 remains gated on rollout of Release 1.**
+- **v3.2b — 2026-09-24, same day.** Two further corrections, found by Codex and
+  confirmed by Ohm on the v3.2 push, both errors of mine:
+  1. **Python's production dedup store is file-backed**, not `:memory:`. v3.1 cited
+     a constructor fallback as the production default without following the call
+     path through `load_config_from_env`. This materially widens the locality
+     question: every Python bot is a real file accessor.
+  2. **Per-port SQL examples.** The single displayed statement used TypeScript's
+     `_ms` columns; Python's are `_s` and REAL-typed. Both ports now shown
+     separately, and the schema divergence is stated as a precondition, since it
+     means the two ports can never share a dedup file.
+  Test 7 reworded per Ohm's non-blocking note: serialized transaction orderings,
+  not a renewal committing inside another writer's `BEGIN IMMEDIATE`.
