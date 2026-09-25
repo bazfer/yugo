@@ -1482,10 +1482,17 @@ export class FleetBus {
         // unsolicited routing below.
         //
         // `onResult` calls `injectUnsolicited` explicitly here. This lane does
-        // not need to: falling through reaches the same call one block down AND
-        // picks up late-reply tagging on the way. An explicit call here was
-        // written first and removed after mutation testing showed it could not
-        // be killed — it was unreachable-equivalent dead weight.
+        // not need to: falling through reaches the same call one block down.
+        // An explicit call here was written first and removed after mutation
+        // testing could not kill it.
+        //
+        // Note the fall-through's `evictedLedger` lookup is a NO-OP on this
+        // branch, and the first version of this comment wrongly claimed it as a
+        // benefit. An id cannot be in `outboundLedger` and `evictedLedger` at
+        // once — both writers remove it from the former first — and we only
+        // reach here with `match !== undefined`. So `lateReplyEnvId` is always
+        // `undefined` here, which is correct: an anti-hijack frame is not a
+        // late reply to anything.
         this.recordAudit({
           dir: 'drop',
           subject,
@@ -1516,7 +1523,24 @@ export class FleetBus {
       // or a reply arriving after its waiter timed out.
       //
       // `injectUnsolicited` settles at inject time, which is correct precisely
-      // because no reply is owed. The model still sees the frame.
+      // because no reply is owed. The model still sees the frame, and can even
+      // answer it — `publishReply` permits a null-token reply against a reqId
+      // with no pending claim.
+      //
+      // BUT NOTE WHAT THIS DOES TO THE SETTLE-POINT ARGUMENT BELOW. The long
+      // comment at the SETTLE POINT explains why `onRequest` defers its settle
+      // to `publishReply`: an inject-time settle stamps a durable tombstone for
+      // a turn whose answer might never ship, and that tombstone outlives a
+      // restart. This block routes ~84% of request-lane traffic to the
+      // inject-time settle instead, so that trade now applies to the majority
+      // of this lane, not a corner of it.
+      //
+      // The trade is accepted here and it is the same one `.result` already
+      // made (yugo#27): a crash between inject and consumption loses the frame
+      // for the full TTL, because a completed row deduplicates a retry. What it
+      // buys is the end of a claim — and a renewal timer — that otherwise lived
+      // for the life of the process, since nothing on the leaked path ever
+      // called `stopRenewing`.
       const lateReplyEnvId = this.evictedLedger.has(inReplyTo) ? inReplyTo : undefined
       if (lateReplyEnvId !== undefined) this.evictedLedger.delete(lateReplyEnvId)
       await this.injectUnsolicited(subject, result.envelope, lateReplyEnvId)

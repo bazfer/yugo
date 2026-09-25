@@ -2191,6 +2191,51 @@ describe('onResult inject path', () => {
     expect(events[0]!.unsolicited).toBe(true)
     expect(events[0]!.lateReplyEnvId).toBe(originalId)
   })
+
+  // ISSUE #39 / REVIEW GAP. The two tests above cover late-reply tagging on the
+  // `.result` lane only. The #39 fix added the same tagging to the `.request`
+  // lane and nothing covered it — stripping those two lines left the whole
+  // suite green. That lane is the MIGRATION TARGET for replies, so it is the
+  // more likely production path of the two, not a corner.
+  test('late reply on the REQUEST lane injects with lateReplyEnvId', async () => {
+    const nc = new FakeNatsConnection()
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async event => { events.push(event) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const first = await bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 20 })
+    expect(first.timed_out).toBe(true)
+    const originalId = first.envelope!.id
+    expect(bus.evictedLedgerHas(originalId)).toBe(true)
+
+    // yugo bots publish replies on `.request` (SPEC §6.2), so this is the path
+    // a late answer from a yugo peer actually takes.
+    await bus.handleRequest(envelope({ id: 'r-late-req-1', from: 'kat', in_reply_to: originalId }))
+
+    expect(events).toHaveLength(1)
+    expect(events[0]!.unsolicited).toBe(true)
+    expect(events[0]!.lateReplyEnvId).toBe(originalId)
+  })
+
+  test('a late reply on the REQUEST lane consumes its evicted-ledger entry', async () => {
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async () => {},
+    }, allowlist)
+    bus.attachFakeNc(nc)
+    const first = await bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 20 })
+    const originalId = first.envelope!.id
+    expect(bus.evictedLedgerHas(originalId)).toBe(true)
+
+    await bus.handleRequest(envelope({ id: 'r-late-req-2', from: 'kat', in_reply_to: originalId }))
+
+    // Not consuming it leaks the entry and lets a retry be re-tagged — the
+    // same leak the `.result` lane already guards against.
+    expect(bus.evictedLedgerHas(originalId)).toBe(false)
+  })
 })
 
 /* -------------------------------------------------------------------------- */
