@@ -2775,6 +2775,55 @@ describe('pending claim age deadline', () => {
     await turn
   })
 
+  // KNOWN UNTESTED INVARIANT — first-writer-wins on a deferred abandonment.
+  //
+  // `abandonRepliedClaim`'s deferred branch sets note and code together only
+  // when no note exists yet, and its comment says a later trigger must not
+  // leave the first trigger's note under its own drop code. Collapsing that
+  // guard into an unconditional last-writer-wins assignment leaves this whole
+  // suite green.
+  //
+  // A test was written for it and DELETED rather than shipped: it passed
+  // against both the real code and the mutant, so it asserted nothing. Two
+  // deferred triggers on one claim is reachable in principle — a capacity
+  // overflow plus a reply on a dead connection — but the audit line the
+  // assertion keyed on did not distinguish them, and a test that cannot fail
+  // is worse than a gap that is written down.
+  //
+  // Not a regression: main's `??=` was equally unprotected. Recorded so the
+  // next person does not mistake silence here for coverage.
+
+  test('the finishInjection FALLBACK emits the default drop code', async () => {
+    // ADDED ON REVIEW. The test below pins `abandonRepliedClaim`'s default
+    // PARAMETER. It does not reach `finishInjection`'s `??` fallback, because
+    // by then `abandonDropReason` is already a defined string.
+    //
+    // The fallback is reached by the two writers that set `abandonReason`
+    // DIRECTLY and bypass `abandonRepliedClaim` entirely — the injection-failure
+    // path, and the pending-map eviction hook. Neither sets a drop code, so the
+    // `??` supplies one. Instrumenting it showed it firing three times in this
+    // suite while mutating its string left every test green: the drop code on a
+    // path this PR rewrote was asserted by nothing.
+    //
+    // A throwing callback takes that path.
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-fallback-code-'))
+    const auditLogPath = join(dir, 'audit.jsonl')
+    const store = new DurableEnvelopeDedupStore(join(dir, 'dedup.sqlite'), DEFAULT_DEDUP_TTL_MS, 200)
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, auditLogPath,
+      injectIntoSession: async () => { throw new Error('boom') },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({ id: 'fallback-code-a', to: 'vec', from: 'kat' }))
+
+    const drops = readAudit(auditLogPath).filter(e => e.envelope_id === 'fallback-code-a' && e.dir === 'drop')
+    const fromFinish = drops.find(e => e.note === 'claude_discord_adapter_injection_failed')
+    expect(fromFinish).toBeDefined()
+    // The whole point: the code comes from the fallback, not from a parameter.
+    expect(fromFinish!.reason).toBe('claude_discord_adapter_reply_undelivered')
+  })
+
   test('a deferred abandonment still audits under the default drop code', async () => {
     // NOT in the design's list. `abandonRepliedClaim` now takes its drop code
     // as a parameter and a deferred abandonment carries that code through to

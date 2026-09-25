@@ -409,8 +409,17 @@ ended, and how".
 
 Consequences worth stating: a **released claim is not a failed one**. A reply
 arriving after release still publishes — the inbound envelope is retained for
-exactly that — so the release is not observable to the peer, and the count of
-releases over-reports the claims that genuinely went unanswered. And in neither
+exactly that — so the release is **not observable to a peer that does not retry
+the same envelope id**, and the count of releases over-reports the claims that
+genuinely went unanswered.
+
+The qualifier is load-bearing. Release `DELETE`s the durable row and does not arm
+the in-memory ledger, so a peer that **re-sends the same envelope id** after the
+deadline gets a second injection and a second answer, where the pending claim
+previously suppressed it for the store's full TTL. That is the accepted trade,
+and it rests on no same-id retry producer existing today — an assumption with a
+known expiry, since the first durable consumer bound to `FLEET_REQUEST` becomes
+exactly such a producer. And in neither
 port does a release imply the turn stopped; nothing at this boundary can cancel
 work already handed to a session.
 
