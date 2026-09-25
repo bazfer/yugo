@@ -1478,8 +1478,21 @@ export class FleetBus {
           return
         }
         // A matching id is not sufficient: only the addressed bot may answer
-        // the waiter. Preserve request-lane behavior by auditing the mismatch
-        // and falling through to ordinary fresh-turn injection.
+        // the waiter. Do NOT resolve it — audit, then fall through to the
+        // unsolicited routing below.
+        //
+        // `onResult` calls `injectUnsolicited` explicitly here. This lane does
+        // not need to: falling through reaches the same call one block down.
+        // An explicit call here was written first and removed after mutation
+        // testing could not kill it.
+        //
+        // Note the fall-through's `evictedLedger` lookup is a NO-OP on this
+        // branch, and the first version of this comment wrongly claimed it as a
+        // benefit. An id cannot be in `outboundLedger` and `evictedLedger` at
+        // once — both writers remove it from the former first — and we only
+        // reach here with `match !== undefined`. So `lateReplyEnvId` is always
+        // `undefined` here, which is correct: an anti-hijack frame is not a
+        // late reply to anything.
         this.recordAudit({
           dir: 'drop',
           subject,
@@ -1489,6 +1502,49 @@ export class FleetBus {
           expected_from: match.expectedFrom,
         })
       }
+
+      // NO LEDGER MATCH, BUT THIS IS A REPLY (issue #39).
+      //
+      // Until now this fell through to the fresh-turn path below, which claims
+      // the envelope and holds that claim open waiting for an answer THAT IS
+      // NEVER OWED — the frame is itself an answer. `onResult` has always done
+      // the opposite with the identical case, so the two lanes disagreed about
+      // what an unmatched reply is.
+      //
+      // The claim leak that produced is not theoretical. Measured 2026-09-25 on
+      // this bot: of 51 pending claims that never settled, 37 carried
+      // `origin=deet` at hops 1 or 3 — replies to our own requests — and 6 more
+      // predated baton fields with reply-shaped payloads. Roughly 84%. Only 8
+      // were genuine unanswered requests.
+      //
+      // It reaches here whenever no waiter is registered: a `wait:false`
+      // request (the common case — the whole audit log holds 7
+      // `request_timeout` drops, so almost every request is fire-and-forget),
+      // or a reply arriving after its waiter timed out.
+      //
+      // `injectUnsolicited` settles at inject time, which is correct precisely
+      // because no reply is owed. The model still sees the frame, and can even
+      // answer it — `publishReply` permits a null-token reply against a reqId
+      // with no pending claim.
+      //
+      // BUT NOTE WHAT THIS DOES TO THE SETTLE-POINT ARGUMENT BELOW. The long
+      // comment at the SETTLE POINT explains why `onRequest` defers its settle
+      // to `publishReply`: an inject-time settle stamps a durable tombstone for
+      // a turn whose answer might never ship, and that tombstone outlives a
+      // restart. This block routes ~84% of request-lane traffic to the
+      // inject-time settle instead, so that trade now applies to the majority
+      // of this lane, not a corner of it.
+      //
+      // The trade is accepted here and it is the same one `.result` already
+      // made (yugo#27): a crash between inject and consumption loses the frame
+      // for the full TTL, because a completed row deduplicates a retry. What it
+      // buys is the end of a claim — and a renewal timer — that otherwise lived
+      // for the life of the process, since nothing on the leaked path ever
+      // called `stopRenewing`.
+      const lateReplyEnvId = this.evictedLedger.has(inReplyTo) ? inReplyTo : undefined
+      if (lateReplyEnvId !== undefined) this.evictedLedger.delete(lateReplyEnvId)
+      await this.injectUnsolicited(subject, result.envelope, lateReplyEnvId)
+      return
     }
     // Envelope-id dedup (round-8 P2, class-widened from onResult). Peers can
     // retry `.request` frames for the same reasons they retry `.result` —
