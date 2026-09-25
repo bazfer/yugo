@@ -1613,7 +1613,13 @@ describe('request / publishReply / onResult', () => {
     expect((await promise).ok).toBe(true)
   })
 
-  test('unmatched in_reply_to on .request remains a fresh request', async () => {
+  // ISSUE #39. This test previously asserted the OPPOSITE behaviour, under the
+  // name 'unmatched in_reply_to on .request remains a fresh request' — and it
+  // could not have caught the change either way, because it only asserted that
+  // SOME injection happened with that envelope id. Both paths inject. The
+  // discriminators are `unsolicited`, `replyToken`, and whether a pending claim
+  // is left owing an answer.
+  test('unmatched in_reply_to on .request injects UNSOLICITED and leaves no pending claim', async () => {
     const injections: FleetBusSessionEvent[] = []
     const bus = new TestFleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
@@ -1621,8 +1627,60 @@ describe('request / publishReply / onResult', () => {
     }, allowlist)
 
     await bus.handleRequest(envelope({ id: 'unmatched-request-reply', in_reply_to: 'not-in-ledger' }))
+
     expect(injections).toHaveLength(1)
     expect(injections[0]!.envelope.id).toBe('unmatched-request-reply')
+    // The frame is an ANSWER. Nothing is owed back, so it must not arrive as a
+    // turn that owes one.
+    expect(injections[0]!.unsolicited).toBe(true)
+    expect(injections[0]!.replyToken).toBeNull()
+    // The leak this issue is about: a claim held open for a reply never owed.
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+  })
+
+  // Outcome test, not an isolating one: mutation showed the mismatch branch's
+  // own routing cannot be killed independently, because removing it falls
+  // through to the same call. Kept because the OUTCOME is worth pinning —
+  // a hijacked reply must not become a turn owing an answer — and labelled so
+  // nobody reads it as covering that specific line.
+  test('a reply whose sender is not the addressed bot injects unsolicited, not as a fresh turn', async () => {
+    const nc = new FakeNatsConnection()
+    const injections: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async event => { injections.push(event) },
+    }, allowlist)
+    bus.attachFakeNc(nc)
+
+    const pending = bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 5_000 })
+    const askedId = (nc.publishes.at(-1)!.envelope as { id: string }).id
+
+    // 'ohm' answers a question addressed to 'kat' — anti-hijack.
+    await bus.handleRequest(envelope({ id: 'hijack-attempt', from: 'ohm', in_reply_to: askedId }))
+
+    expect(injections).toHaveLength(1)
+    expect(injections[0]!.unsolicited).toBe(true)
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+    // The real waiter is untouched and still waiting.
+    expect(bus.outboundLedgerSize()).toBe(1)
+    void pending
+  })
+
+  test('a genuine request with no in_reply_to is STILL a fresh turn owing a reply', async () => {
+    const injections: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      injectIntoSession: async event => { injections.push(event) },
+    }, allowlist)
+
+    await bus.handleRequest(envelope({ id: 'a-real-question' }))
+
+    // The regression guard for #39's fix: routing replies away from the
+    // fresh-turn path must not route ACTUAL REQUESTS away from it.
+    expect(injections).toHaveLength(1)
+    expect(injections[0]!.unsolicited).toBeUndefined()
+    expect(injections[0]!.replyToken).not.toBeNull()
+    expect(bus.pendingReplyClaimCount()).toBe(1)
   })
 
   test('request({wait:true}) resolves timed_out after timeoutMs elapses', async () => {

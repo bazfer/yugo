@@ -1478,8 +1478,14 @@ export class FleetBus {
           return
         }
         // A matching id is not sufficient: only the addressed bot may answer
-        // the waiter. Preserve request-lane behavior by auditing the mismatch
-        // and falling through to ordinary fresh-turn injection.
+        // the waiter. Do NOT resolve it — audit, then fall through to the
+        // unsolicited routing below.
+        //
+        // `onResult` calls `injectUnsolicited` explicitly here. This lane does
+        // not need to: falling through reaches the same call one block down AND
+        // picks up late-reply tagging on the way. An explicit call here was
+        // written first and removed after mutation testing showed it could not
+        // be killed — it was unreachable-equivalent dead weight.
         this.recordAudit({
           dir: 'drop',
           subject,
@@ -1489,6 +1495,32 @@ export class FleetBus {
           expected_from: match.expectedFrom,
         })
       }
+
+      // NO LEDGER MATCH, BUT THIS IS A REPLY (issue #39).
+      //
+      // Until now this fell through to the fresh-turn path below, which claims
+      // the envelope and holds that claim open waiting for an answer THAT IS
+      // NEVER OWED — the frame is itself an answer. `onResult` has always done
+      // the opposite with the identical case, so the two lanes disagreed about
+      // what an unmatched reply is.
+      //
+      // The claim leak that produced is not theoretical. Measured 2026-09-25 on
+      // this bot: of 51 pending claims that never settled, 37 carried
+      // `origin=deet` at hops 1 or 3 — replies to our own requests — and 6 more
+      // predated baton fields with reply-shaped payloads. Roughly 84%. Only 8
+      // were genuine unanswered requests.
+      //
+      // It reaches here whenever no waiter is registered: a `wait:false`
+      // request (the common case — the whole audit log holds 7
+      // `request_timeout` drops, so almost every request is fire-and-forget),
+      // or a reply arriving after its waiter timed out.
+      //
+      // `injectUnsolicited` settles at inject time, which is correct precisely
+      // because no reply is owed. The model still sees the frame.
+      const lateReplyEnvId = this.evictedLedger.has(inReplyTo) ? inReplyTo : undefined
+      if (lateReplyEnvId !== undefined) this.evictedLedger.delete(lateReplyEnvId)
+      await this.injectUnsolicited(subject, result.envelope, lateReplyEnvId)
+      return
     }
     // Envelope-id dedup (round-8 P2, class-widened from onResult). Peers can
     // retry `.request` frames for the same reasons they retry `.result` —
