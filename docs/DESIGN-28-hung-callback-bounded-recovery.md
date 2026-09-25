@@ -1,187 +1,225 @@
 ---
 issue: bazfer/yugo#28
-status: DRAFT for review — no code
+status: DRAFT v2 for review — no code
 date: 2026-09-25
+supersedes: v1, which was returned REWORK. See "What v1 got wrong".
 ---
 
 # #28 — Bounded recovery for a never-completing session callback
 
-## What the issue asked, and what changed under it
+## Summary
 
-#28 lists three decisions. **Decision 3 has been overtaken by SPEC §6.4**, merged
-since the issue was written.
+**This is a TypeScript-only gap.** The Python port is already bounded, by
+construction. And the bound the TypeScript port needs is **not** on the
+`injectIntoSession` await — that await is milliseconds long in the deployed
+embedder. It belongs on the **age of the pending claim**.
 
-The issue frames decision 3 as whether a hung callback should eventually lose its
-claim, "accepting a duplicate injection as better than an indefinitely suppressed
-envelope — **which is the at-least-once-consistent choice**."
+## What v1 got wrong
 
-§6.4 now states the contract as **"deduplicated admission; effects may repeat;
-eventual execution is not guaranteed."** Eventual execution is explicitly *not*
-promised, so the contract does not oblige us to force release. It permits either
-disposition.
+Recorded rather than quietly replaced, because two of the three errors were
+errors of *scope* and the next reader should see how the design was aimed wrong.
 
-So decision 3 is no longer "which does the contract require" but **"which do we
-prefer, given it permits both."** That is a materially easier question and it
-should be answered on its merits, not by appeal to a guarantee that no longer
-exists.
+1. **v1 bounded the wrong await.** It raced `injectIntoSession` and sized a
+   deadline for "hung, not slow" work. In the deployed embedder that callback is
+   a single MCP notification write
+   (`artifice-discord/0.8.2/server.ts:980`, read off the running version). It
+   returns in milliseconds. The turn happens *afterwards*, under renewal that
+   continues until `publishReply`. So v1 left the realistic hang — **frame
+   delivered, reply never sent** — completely unbounded, while claiming to fix
+   it.
+2. **v1 made every reconnect a lease-loss event.** Its D4 stopped renewal inside
+   `disconnect()`, which `run()` calls on every reconnect cycle, not only at
+   shutdown. Healthy in-flight work would have lost its lease during ordinary
+   connection churn.
+3. **v1 assumed a retry producer that does not exist.** Its argument for
+   releasing a hung claim was that a retry could then be admitted. Nothing in
+   either port sends a same-id retry (§4 below).
+4. **v1 ignored the Python port entirely**, although #28 names `_teardown`
+   explicitly. Python turns out to be the port that already solves this.
 
-The issue's fourth paragraph — that a forward clock step is not the only cause of
-lease loss — **is already fixed**. §6.4 carries a non-exhaustive list naming
-renewal failure, event-loop stalls, TTL pruning of a live pending row and
-wall-clock steps. Nothing further owed there.
+## 1. The delivery contract already permits either answer
 
-## The mechanism, read off the code
+#28's decision 3 asks whether a hung callback should lose its claim, calling
+release "the at-least-once-consistent choice". **SPEC §6.4 has since settled the
+contract as "deduplicated admission; effects may repeat; eventual execution is
+not guaranteed."** Eventual execution is not promised, so the contract compels
+neither disposition. The decision is made on cost and benefit, below, not by
+appeal to a guarantee.
 
-`onRequest` (`src/fleet-bus.ts:1542`) starts `renewWhileRunning`, registers a
-`PendingReplyClaim` **before** awaiting, then awaits `injectIntoSession`.
+#28's fourth item — that a clock step is not the only cause of lease loss — **is
+already fixed**; §6.4 carries a non-exhaustive list.
 
-- `renewWhileRunning` (`:1639`) is a `setInterval` at
-  `max(50, leaseMs * DEDUP_LEASE_RENEW_RATIO)` that renews the lease until
-  `stopRenewing()` clears it.
-- The claim stays **PENDING** past the callback's return; it is settled by
-  `publishReply`, not by injection completing. That is deliberate and documented
-  at `:1586-1601`.
-- `finishInjection` runs in a `finally`, so a callback that returns **or throws**
-  releases correctly.
+## 2. Python is already bounded. The gap is TypeScript's.
 
-**A callback that never does either** never reaches that `finally`.
-`stopRenewing` is never called, the interval keeps renewing, and the claim is
-owned for as long as the process lives.
+`_on_request` opens **one cleanup scope for the entire claimed lifetime**
+(`yugo/fleet_bus.py`, the `settled = False` / `try` / `finally` around the claim)
+and deliberately **does not catch `CancelledError`** — the `except BaseException`
+re-raises it, with the stated reason that swallowing it would stall `drain()`
+behind an LLM call.
 
-**One real bound already exists, and it is worth stating precisely:** the renewal
-timer is `unref`'d (`:1669`). It cannot hold the event loop open, so process exit
-stops renewal and the lease lapses. **The existing bound is process lifetime.**
-Within a living process there is none.
+So on shutdown: `drain()` cancels the in-flight callback task, `CancelledError`
+propagates through the turn, and the `finally` **releases the claim** because
+`settled` is still False, then stops the renewer. That is cancellation with
+confirmed termination followed by release — precisely what #28's decision 1 asks
+for, already implemented.
 
-`disconnect()` (`:1025`) clears the heartbeat, unsubscribes, drains NATS. It does
-**not** stop renewal timers and does not cancel in-flight injections. A
-disconnected adapter goes on renewing a hung claim indefinitely.
+**Correction to the review that surfaced this:** the bound does **not** come from
+`_teardown`. `_teardown` only drains or closes the connection. The bound comes
+from asyncio cancellation semantics reaching that single `finally`. The
+distinction matters because it is the *cleanup scope*, not the teardown method,
+that would have to be preserved by any future refactor.
 
-## The constraint that decides the design
+The TypeScript port has no equivalent: `injectIntoSession` is an awaited promise
+with no cancellation channel, and `disconnect()` neither cancels it nor stops
+renewal.
 
-**An injection cannot be un-injected.** Once the envelope has reached the
-session, no signal retracts it. So cancellation cannot prevent the effect — it
-can only stop *us waiting* for a completion signal.
+**This is a `known_divergence`**, and it owes a conformance vector per #27's
+precedent. Naming it is part of this work.
 
-This matters because it rules out the shape decision 1 proposes. Requiring
-embedders to honour an `AbortSignal` would read as "cancellation prevents the
-work," and it does not. That is the same class of overclaim §6.4 was rewritten
-twice to remove.
+## 3. The bound that actually fits: pending-claim age
 
-## Proposal
+The claim is registered at `src/fleet-bus.ts:1567`, before the callback is
+awaited, and is settled only by `publishReply`. **Measure from registration.**
 
-### D1 — No required cancellation contract. An optional signal, narrowly scoped.
+One deadline on that age bounds **both** failure modes with one timer:
 
-`injectIntoSession` gains **no mandatory** cancellation contract. The event MAY
-carry an `AbortSignal` that an embedder MAY honour, documented as doing exactly
-one thing: **telling the embedder we have stopped waiting.** It does not retract
-an injection, and no part of the adapter's correctness may depend on an embedder
-honouring it.
+- the MCP write that never returns, and
+- the far likelier case where the write returns fine and the session never
+  replies.
 
-Rejected alternative: requiring embedders to honour it. It cannot be enforced, it
-cannot deliver what its name implies, and an unenforceable requirement is
-a rule in prose with nothing behind it.
+v1 needed a second mechanism for the second case and did not have one. It also
+had to agonise over "hung versus slow" because it was timing a hand-off; timing
+the claim's age makes the question tractable, because the claim's expected
+lifetime is a turn, and turn length is something an operator can observe.
 
-### D2 — Bound the await, not the work.
+**Existing bound, for completeness:** `pendingReplyClaims` capacity eviction
+(`DEFAULT_RECEIVE_LEDGER_CAP = 1000`) is a *count*, not a time. On a quiet bot it
+never fires. And the renewal timer is `unref`'d, so process exit stops renewal —
+**the only time bound today is process lifetime.**
 
-Race `injectIntoSession` against a deadline. **On expiry:**
+## 4. On expiry: audit. Do not release.
 
-1. Call `stopRenewing()`.
-2. Record an audit event — `claude_discord_adapter_injection_deadline_exceeded` —
-   naming envelope id, req id and elapsed time. The duplicate this permits must be
-   visible, matching the existing `dedup_lease_lost` precedent at `:1660`.
-3. **Leave the pending row in place.** Do not delete it, do not settle it, do not
-   abandon it. Its lease lapses naturally.
-4. Leave `injectionActive` true and the `PendingReplyClaim` captured. If the
-   callback later returns or throws, `finishInjection` still fires **against the
-   captured object**, which is already by-identity (`:1570-1578`) and therefore
-   safe after a takeover.
+**No same-id retry producer exists.** Verified across both ports:
 
-**Deleting the row is the one thing this must not do.** That is precisely the
-premature-release defect fixed in #25 rounds 8-10, and #28 says so itself.
-Letting the lease *lapse* is different in kind: the row stays, the state stays
-inspectable, and takeover goes through the normal predicate rather than a special
-path.
+- TS `request()` mints one `randomUUID()` and publishes once; on timeout it
+  resolves `timed_out` with no re-send.
+- The Python request path mints `uuid.uuid4()` per call.
+- Zero matches for `republish|resend|retry_publish` in either file.
+- Both adapters use core NATS; there is no broker redelivery.
 
-**Deadline value:** a multiple of the lease, configurable, defaulting to
-something large enough that it never fires for healthy slow work. A turn that
-legitimately runs long is the normal case; renewal exists to support it
-(`:1626`). This deadline is for *hung*, not *slow*, and a default that catches
-slow turns would convert a working feature into a duplicate generator.
+A caller who re-asks mints a **new** envelope id and is never suppressed by the
+stuck claim in the first place.
 
-### D3 — A hung callback loses its claim. Argued, not assumed.
+So releasing buys admission for a retry that nobody sends, while paying the
+duplicate-injection cost #25 closed over three rounds. **On expiry the adapter
+records an audit event — `claude_discord_adapter_claim_age_exceeded`, naming
+envelope id, req id and age — and changes nothing else.** Renewal continues. The
+row stays. The claim stays owned.
 
-**The strongest argument against**, which must be stated first: we cannot cancel
-the first callback, so releasing the claim creates a genuine concurrent duplicate
-— the exact condition #25 spent three rounds closing. If the callback is merely
-slow, this is strictly worse than waiting.
+That is a smaller deliverable than v1 promised and it is the whole honest value:
+**an 8-day silent suppression becomes an 8-day suppression that says so.**
 
-That argument is answered by the deadline being for hung rather than slow work,
-and by the fact that §6.4 already permits repeated effects. It is not answered by
-pretending the duplicate is free.
+**When to revisit:** the moment a same-id retry producer exists — durable
+execution retries, a replayer, a supervisor that re-publishes with the original
+id — release becomes worth its cost. The design should be revisited then, and
+that producer named with a file and line rather than assumed.
 
-**The argument for**, on the merits rather than by contract appeal: an
-indefinitely held claim suppresses the envelope for the full TTL — **8 days** —
-and a durable store means that survives restarts. The failure mode is silent and
-long-lived. A lapsed lease is recoverable and audited.
+## 5. No change to `disconnect()`
 
-**Honest limit, and it constrains how much this is worth.** In the deployed
-topology there is **one consuming process per store file** — measured
-2026-09-25: three accessors, three files, no sharing. So no second consumer is
-waiting to take over. Releasing buys only that a *publisher retry* can be
-admitted by the same process. If the session is still wedged, that retry hangs
-too.
+v1's D4 is **withdrawn entirely.** Renewal is a local SQLite write and has no
+business depending on the bus connection. `run()` calls `disconnect()` on every
+reconnect, so stopping renewal there would make routine churn a lease-loss event
+for healthy work.
 
-**So this is worth doing, and it is not worth overselling.** It converts a
-permanent silent suppression into a recoverable audited one. It does not
-guarantee the envelope ever executes — §6.4 already says nothing does.
+The shutdown case it was meant to serve is already handled: the plugin calls
+`stop()` then `process.exit(0)` within ~2s, and the renewal timer is `unref`'d.
 
-### D4 — `disconnect()` stops renewal; claims outlive the connection.
+**Documented consequence, unchanged from today's behaviour:** a disconnected
+adapter's claims are not released by disconnecting. They end when the process
+ends, or when their lease lapses after it.
 
-`disconnect()` stops the renewal timer for every claim whose injection is still
-active, records one audit event per claim, and **leaves the rows in place with
-lapsing leases.**
+## 6. `AbortSignal`: optional, and the reason matters
 
-Rejected: waiting with a deadline inside `disconnect()`. It makes shutdown block
-on a hung callback, which is the same hang one layer up.
+#28's decision 1 asks whether `injectIntoSession` should gain a cancellation
+contract that embedders are **required** to honour. **No.**
 
-Rejected: deleting claims on disconnect. #28 names this as not-a-fix and it is
-right — the callback is still running.
+v1 argued this from "an injection cannot be un-injected", which conflates
+retracting a delivered effect with preventing an undelivered one. The correct
+argument is narrower and port-specific:
 
-Documented consequence: **a disconnected adapter's claims are not immediately
-free.** They lapse on the normal lease timeline. Anything reasoning about
-post-shutdown state must account for that window rather than assuming disconnect
-releases ownership.
+- For the **deployed TypeScript embedder** there is nothing to prevent — the
+  callback is a single notification write, so a signal has no window to act in.
+  It would be a no-op dressed as a safety feature.
+- For the **Python port** cancellation is real and already works, through asyncio
+  rather than through any contract we would define.
 
-## Tests, each mutation-verified
+So the event MAY carry an `AbortSignal` that an embedder MAY honour, documented
+as meaning exactly one thing: **we have stopped waiting.** No adapter correctness
+may depend on it. Requiring it would be a rule with nothing able to enforce it.
 
-1. A callback that never settles → deadline fires → `stopRenewing` called, audit
-   event recorded, **row still present**.
-2. Same, then the callback returns late → `finishInjection` fires against the
-   captured claim and does not touch a replacement owner's claim under the same
-   reqId.
-3. Same, then the callback *throws* late → same, with the abandon reason recorded
-   on the captured object.
-4. A slow-but-healthy callback finishing just under the deadline → renewal
-   continues, no audit event, claim settles normally at `publishReply`.
-5. `disconnect()` with an injection active → renewal stopped, audit recorded, row
-   present, lease lapses on schedule.
-6. After the deadline, a second consumer **can** claim the envelope once the
-   lease lapses — the recovery this exists to provide.
-7. The deadline does not fire for a turn shorter than it, at a lease short enough
-   that renewal ticks many times — proves the deadline is independent of renewal
-   cadence.
+## 7. "Delayed", not "different in kind"
+
+v1 claimed that letting a lease lapse is categorically different from deleting
+the row. It is not. A second consumer claiming a lapsed pending row issues a new
+owner under the **original** `req_id`, overwrites `receiveLedger` and
+`pendingReplyClaims` under the same key, and `BoundedLru.set` on an existing key
+deletes-then-sets **without firing `onEvict`**, silently dropping the displaced
+claim.
+
+The genuine differences are narrow and worth stating accurately: **`reqId` is
+preserved, so token fencing engages** — a late `publishReply` carrying the stale
+token is rejected with `reply_token_mismatch` — and the row stays inspectable for
+up to one lease. That is a delay with a fencing benefit, not a category.
+
+This section is retained even though §4 removes the release path, because the
+reasoning is what a future revisit will need.
+
+## 8. Verified and unchanged: the late-returning callback
+
+Traced, and it holds:
+
+- **Late return** → `finishInjection` clears `injectionActive` on the captured
+  object; a replacement owner is untouched.
+- **Late throw** → `abandonReason` is set on the captured object; the identity
+  check fails so the map is not mutated, and `releaseClaim(..., originalOwner)`
+  deletes zero rows because the row belongs to the replacement.
+- **Late reply** → token mismatch, rejected.
+- **No takeover, completion after expiry** → `complete()` checks owner, not lease
+  validity, so the original owner still settles correctly.
+
+Nothing in this design changes any of that.
+
+## 9. Tests
+
+1. A claim whose age exceeds the deadline records
+   `claude_discord_adapter_claim_age_exceeded` **and keeps renewing** — mutate by
+   deleting the audit call, and by making expiry stop renewal, and watch each
+   fail separately.
+2. The deadline is measured from **registration**, not from the callback
+   returning: a fast `injectIntoSession` followed by a long silence still fires.
+   This is the case v1 could not catch and is the reason the design was rewritten.
+3. A turn that replies before the deadline records **no** event and settles
+   normally. Only meaningful paired with test 1 — stated so nobody reads it as
+   standalone coverage.
+4. The deadline is independent of renewal cadence: a short lease with many
+   renewal ticks and a turn shorter than the deadline still records nothing.
+5. `disconnect()` during an active claim leaves renewal running and the row
+   present — the regression guard for v1's withdrawn D4.
+6. **Python divergence vector:** cancelling the in-flight turn releases the claim
+   and stops the renewer, asserting the behaviour the TypeScript port does not
+   have. Registered as `known_divergence` per #27.
+
+Test 2 is the load-bearing one. If only test 1 is written, the suite passes with
+the deadline still attached to the wrong await.
 
 ## Open question for review
 
-**Should the deadline be enabled by default, or opt-in?**
+**Deadline value, and default-on or opt-in.** Now that the deadline measures a
+turn rather than a hand-off, an operator can reason about it: it should exceed
+the longest legitimate turn by a comfortable margin.
 
-Default-on bounds a failure mode nobody has reported. Opt-in leaves the 8-day
-suppression as the shipped behaviour and means the bound exists only where
-someone knew to configure it — which is the population least likely to need it.
-
-My view: **default-on with a deadline large enough that firing is itself a
-signal**, because a silent 8-day suppression is worse than an audited duplicate
-in a process already known to be broken. I hold this at moderate confidence and
-would take the opposite call if the duplicate risk is judged higher than I have
-weighted it.
+My view: **default-on**, sized so that firing is itself a signal. With release
+withdrawn, the only cost of firing is an audit line — there is no duplicate risk
+left to weigh, which is what made v1's version of this question hard. That makes
+default-on a much easier call than it was, and I hold it at **high** confidence
+now rather than moderate.
