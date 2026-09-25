@@ -1,8 +1,8 @@
 ---
 issue: bazfer/yugo#28
-status: DRAFT v3 for review — no code
+status: DRAFT v4 for review — no code
 date: 2026-09-25
-supersedes: v1 (REWORK) and v2 (MORE CHANGES NEEDED). See "What v1 got wrong" and "What v2 got wrong".
+supersedes: v1 (REWORK), v2 and v3 (MORE CHANGES NEEDED). See "What v1 got wrong" and "What v2 got wrong".
 ---
 
 # #28 — Bounded recovery for a never-completing session callback
@@ -61,6 +61,22 @@ errors of *scope* and the next reader should see how the design was aimed wrong.
 4. **v2 left the age timer's lifecycle unspecified**, which is the "fix the
    class" review round waiting to happen. §4a.
 
+## What v3 got wrong
+
+1. **§7 claimed a fencing benefit the chosen path does not have.** §7 describes
+   *lapse*; §4 chose *release*. Release `DELETE`s the row, so nothing is
+   preserved and nothing is fenced — and nothing needs to be. §7.
+2. **§4 listed `receiveLedger` among the leaked resources release fixes.**
+   Release does not clear it and must not: a late reply after release still
+   publishes, reading the inbound envelope from exactly that entry. Listing it
+   invited a regression. §4.
+3. **The event could not carry the name the design insisted on.**
+   `abandonRepliedClaim` hardcodes its `reason` and puts the caller's string in
+   `note`, so the code would have been misleading and the name grep-invisible.
+   §4 now threads a reason parameter. §4.
+4. **"~30 leaked timers per day" was the worst day**, not the rate. 27 on
+   2026-09-24, ~10 on a three-day mean.
+
 ## 1. The delivery contract already permits either answer
 
 #28's decision 3 asks whether a hung callback should lose its claim, calling
@@ -94,6 +110,11 @@ behind an LLM call.
   with nothing swallowing in between, so the `CancelledError` reaches the cleanup
   scope's `finally`, which **releases the claim** because `settled` is still
   False, then stops the renewer.
+  Two caveats on it: `RESPONSE_TIMEOUT` is read with `_env_int` and has **no
+  ceiling**, so this bound is operator-defeatable by configuration; and
+  `history.build_messages` / `record_turn` are **synchronous**, so a stall there
+  blocks the whole loop rather than one claim — a different failure class, out of
+  scope here but worth not confusing with this one.
 - **Not bounded except by shutdown:** the adapter's own awaits inside the scope —
   `_warn_origin`'s publish, which the code comment says "can stall on a full
   pending buffer mid-outage", and the reply publish.
@@ -175,11 +196,29 @@ Every unsettled claim leaves behind, until capacity eviction at
 
 - a `setInterval` from `renewWhileRunning` issuing one SQLite `UPDATE` every
   `lease × 0.4` — 24s at the default 60s lease,
-- a `receiveLedger` entry,
-- a `pendingReplyClaims` entry.
+- a `pendingReplyClaims` entry,
+- a `receiveLedger` entry — **which release does NOT clear, deliberately.**
 
-At the rate measured in §3 that is roughly **30 leaked timers per day on one
-bot**, growing linearly toward a 1000-timer floor at ~40 UPDATEs per second.
+At the rate measured in §3 that is **10-30 leaked timers per day on one bot** —
+27 on the worst day measured, ~10 on a three-day mean — growing linearly toward a
+1000-timer floor at ~40 UPDATEs per second.
+
+### Release does not lose a late answer — and that is why `receiveLedger` stays
+
+**Do not "fix" the `receiveLedger` entry.** `abandonRepliedClaim` leaves it
+alone, and that is load-bearing at a 74% non-settle rate.
+
+A session that replies *after* release still succeeds. `publishReply` finds no
+pending claim under the `reqId`, so the token check is skipped — the code says so
+at the guard: *"Replies with NO pending claim (unsolicited and late-reply paths)
+are unaffected: they mutate no claim."* It then reads the inbound envelope from
+`receiveLedger`, builds the reply, and publishes it. No settle, no store write,
+answer on the wire.
+
+Clear `receiveLedger` on release and that path fails with
+`claude_discord_adapter_req_id_unknown` instead. So the entry is **retained until
+capacity eviction, on purpose.** Listing it among the leaked resources without
+this paragraph would have invited exactly that regression.
 
 **The codebase already documented this exact failure**, in
 `abandonRepliedClaim`'s docstring: *"Left alone the renewal timer keeps extending
@@ -203,8 +242,8 @@ current evidence.**
 
 ### The mechanism: reuse, do not invent
 
-Release goes through **`abandonRepliedClaim(reqId, 'claude_discord_adapter_claim_unanswered')`**,
-the existing three-round-reviewed path. It already does the right things:
+Release goes through **`abandonRepliedClaim`**, the existing three-round-reviewed
+path. It already does the right things:
 
 - defers when `injectionActive` is still true, setting `abandonReason` so
   `finishInjection` performs the release the moment the callback exits;
@@ -214,6 +253,46 @@ the existing three-round-reviewed path. It already does the right things:
 An age deadline is one more entry in that existing class of triggers, not a new
 release path. That is the strongest argument for this shape: it adds a *reason*,
 not a *mechanism*.
+
+### The reason code needs one small change to that function
+
+`abandonRepliedClaim` currently hardcodes
+`reason: 'claude_discord_adapter_reply_undelivered'` and puts the caller's string
+in `note`. That code is **wrong for this case** — nothing was undelivered,
+nothing was attempted — and SPEC §8 defines `reason` as the drop code, so an
+event the design insists must be "named for what it catches" would be
+grep-visible only in `note`, under a misleading code.
+
+**Thread the reason through as a parameter, defaulting to the current value.**
+One line in a reviewed function, no behaviour change for existing callers, and
+this trigger then emits `claude_discord_adapter_claim_unanswered` as its actual
+`reason`.
+
+This is the one place the design does touch the mechanism rather than only adding
+a reason, and it is worth being explicit that v3 promised the naming while
+specifying something that could not deliver it.
+
+### The no-producer finding is an observation. Make it an invariant.
+
+**"No same-id retry producer exists" is measured, not enforced.** Anyone adding a
+retry loop to `request()` in either port silently converts every released claim
+into a re-injection — and nothing would fail.
+
+**So add a tripwire:** a test on each port's `request` path asserting **one
+publish per envelope id**, whose failure message names this design. That turns a
+prose promise into something a future PR trips over, which is the only kind of
+promise worth writing down.
+
+### Make the audit line consumed rather than decorative
+
+At a 74% fire rate the event is **not an alarm and must not be described as
+one** — but it is the only per-request record that a request went unanswered, and
+it is the evidence base for the separate issue filed from §3.
+
+**Add a `claims_released_unanswered` counter to `statusSnapshot`**, which today
+carries `injections_delivered` / `injections_failed` and nothing about claims.
+`bus_status` then surfaces the rate without anyone grepping a log, and the metric
+that issue will be measured against is readable at a glance.
 
 ### If a retry producer ever appears
 
@@ -289,9 +368,26 @@ preserved, so token fencing engages** — a late `publishReply` carrying the sta
 token is rejected with `reply_token_mismatch` — and the row stays inspectable for
 up to one lease. That is a delay with a fencing benefit, not a category.
 
-This section is now directly load-bearing: §4 releases, so the second consumer's
-behaviour above is the behaviour the design invites. It is a delay with a fencing
-benefit, and it should be defended as that rather than as a category.
+**Corrected in v4: this section describes the LAPSE path, which §4 does not
+take.** v3 claimed it was "directly load-bearing" because §4 releases. It is not.
+
+Lapse and release differ concretely. On **lapse** the row survives with an
+expired lease, a second consumer takes it by `UPDATE lease_owner`, the `req_id`
+is preserved, and token fencing therefore engages. On **release** the row is
+`DELETE`d, so a later same-id arrival hits `INSERT OR IGNORE` on an absent row
+and succeeds with the caller's **freshly minted** `reqId`. Nothing is preserved
+and nothing is fenced — **and nothing needs to be**, because with no pending
+claim under the old key there is no claim for a stale attempt to corrupt.
+
+So the fencing benefit v1 and v3 both reached for **does not exist on the path
+this design chose**, and claiming it would mislead. The section is kept as an
+accurate account of the lapse path, because a future revisit that reconsiders
+lapse-instead-of-release needs it.
+
+**Consequence for §9 test 3:** the takeover half is unreachable through release.
+It must force a lapse to exercise the identity check — which is exactly what the
+existing test at `src/fleet-bus.test.ts:892-925` does, with a raw
+`UPDATE lease_until_ms = 0`.
 
 ## 8. Verified and unchanged: the late-returning callback
 
@@ -319,8 +415,11 @@ Nothing in this design changes any of that.
    await, and without this the suite passes with that error reintroduced.
 3. The timer **no-ops on fire when the claim was already settled**, and again
    when it was **replaced by a takeover under the same `reqId`** — asserting the
-   identity check, not the key lookup. The second half is the one that protects a
-   replacement owner.
+   identity check, not the key lookup. The second half protects a replacement
+   owner, and it **must force a lapse to set up**, because release deletes the
+   row and no takeover under the same `reqId` can follow it (§7). The existing
+   test at `src/fleet-bus.test.ts:892-925` shows the setup: a raw
+   `UPDATE lease_until_ms = 0`.
 4. Deferral: age expires **while `injectionActive` is still true** → no immediate
    release, `abandonReason` recorded, and `finishInjection` performs the release
    when the callback exits. This is the #25 guarantee and must not regress.
