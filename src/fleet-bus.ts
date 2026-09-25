@@ -33,6 +33,34 @@ const DEDUP_PRUNE_LIMIT = 100
 export const DEDUP_PRUNE_BUDGET = 4 * DEDUP_PRUNE_EVERY
 // Renewal cadence for a live owner, as a fraction of the lease.
 export const DEDUP_LEASE_RENEW_RATIO = 0.4
+/**
+ * Age at which a pending reply claim is released although nothing settled it.
+ *
+ * A claim is registered before the session callback is awaited and is removed
+ * by `publishReply`, by `abandonRepliedClaim`, by capacity eviction or by
+ * `finishInjection`. A session that simply never answers reaches none of them,
+ * so the claim renews its lease for the store's full TTL and suppresses the
+ * envelope the whole time. The only time bound before this constant existed
+ * was process lifetime.
+ *
+ * EXPECTED FIRE RATE — this is NOT an alarm. Measured on one bot
+ * (2026-09-25, 62 request-lane claims): 74% of claims post-#25 never settled,
+ * and ~84% of those are peer replies mis-admitted as fresh turns rather than
+ * sessions failing to answer — yugo#39, which removes most of this population
+ * at the source. Settle latencies for the claims that do settle span
+ * 13.9-64.6s. Seeing `claude_discord_adapter_claim_deadline_released` in a log
+ * is routine; do not open an incident over one.
+ *
+ * The 15-minute default is not derived from the settle-latency samples — a
+ * Claude Code turn mid-task routinely runs longer than any of them. It rests
+ * on premature release costing close to nothing today: `receiveLedger` is
+ * deliberately retained, so a reply arriving after release still publishes,
+ * and no sender mints a same-id retry that the released claim would have
+ * suppressed. The price is that a released-then-answered claim is still
+ * counted as released; there is nothing that remembers the reqId was released,
+ * so it cannot be corrected after the fact.
+ */
+export const DEFAULT_DEDUP_CLAIM_DEADLINE_MS = 15 * 60 * 1000
 export const DEFAULT_ATTR_MAX_LEN = 1024
 export const DEFAULT_PAYLOAD_BODY_MAX_BYTES = 8192
 
@@ -73,6 +101,8 @@ export interface FleetBusConfig {
   seenRequestLedgerCap?: number
   dedupStorePath?: string
   dedupTtlMs?: number
+  /** See `DEFAULT_DEDUP_CLAIM_DEADLINE_MS`. Must satisfy `leaseMs <= deadline < dedupTtlMs`. */
+  dedupClaimDeadlineMs?: number
   dedupStore?: DurableEnvelopeDedupStore
   rateLimiters?: FleetBusRateLimiters
   supervisorSleepMs?: number
@@ -752,6 +782,17 @@ interface PendingReplyClaim {
   injectionActive: boolean
   /** Set when abandonment was decided while the injection was still running. */
   abandonReason?: string
+  /**
+   * SPEC §8 drop code for a deferred abandonment, paired with `abandonReason`.
+   *
+   * `abandonReason` is the caller's descriptive note; this is the code the
+   * audit line is grepped by. Without it `finishInjection` hardcoded
+   * `reply_undelivered` for every deferred abandonment, so a trigger that
+   * threads its own code through `abandonRepliedClaim` would still have been
+   * logged under the wrong one on the deferred branch. Undefined means the
+   * default, which is what every pre-existing trigger sets.
+   */
+  abandonDropReason?: string
   /** Identifies the attempt that owns this claim; see `FleetBusSessionEvent.replyToken`. */
   token: string
 }
@@ -844,6 +885,7 @@ export class FleetBus {
   private readonly seenRequestEnvelopes: BoundedLru<string, { reqId: string; ts: number }>
   private readonly durableDedup: DurableEnvelopeDedupStore
   private readonly dedupTtlMs: number
+  private readonly dedupClaimDeadlineMs: number
   private readonly rateLimiters: FleetBusRateLimiters
   private readonly connectFn: (options: ConnectionOptions) => Promise<NatsConnection>
   private supervisorStopping = false
@@ -903,6 +945,25 @@ export class FleetBus {
       config.dedupStorePath ?? `${homedir()}/.claude/fleet-bus-dedup-${config.botName}.sqlite`,
       this.dedupTtlMs,
     )
+    this.dedupClaimDeadlineMs = config.dedupClaimDeadlineMs ?? DEFAULT_DEDUP_CLAIM_DEADLINE_MS
+    // Refuse a deadline that cannot do its job rather than shipping it.
+    //
+    // BELOW ONE LEASE it cannot tell a slow turn from a stuck one, and a tiny
+    // value fires inside the inject await where it only re-arms in a tight
+    // loop. AT OR ABOVE THE TTL it is redundant rather than inert: prune has
+    // already removed the row it would release, and renewal self-terminates at
+    // TTL anyway once `renew()` starts returning false.
+    //
+    // Checked against the CONFIGURED ttl, not the store in use: an injected
+    // store's `ttlMs` is private and has no getter, so it may differ. Only
+    // `leaseMs` is exposed, so that half is checked against the real store.
+    const leaseMs = this.durableDedup.leaseMs
+    if (this.dedupClaimDeadlineMs < leaseMs || this.dedupClaimDeadlineMs >= this.dedupTtlMs) {
+      throw new RangeError(
+        'dedup claim deadline must satisfy leaseMs <= deadline < dedupTtlMs '
+        + `(lease ${leaseMs}ms, deadline ${this.dedupClaimDeadlineMs}ms, configured ttl ${this.dedupTtlMs}ms)`,
+      )
+    }
   }
 
   /**
@@ -1320,9 +1381,11 @@ export class FleetBus {
    */
   private finishInjection(claim: PendingReplyClaim, reqId: string): void {
     claim.injectionActive = false
-    const reason = claim.abandonReason
-    if (reason === undefined) return
+    const note = claim.abandonReason
+    if (note === undefined) return
+    const reason = claim.abandonDropReason ?? 'claude_discord_adapter_reply_undelivered'
     claim.abandonReason = undefined
+    claim.abandonDropReason = undefined
     // Identity, not key: the LRU may have evicted this entry, or a later
     // delivery may have registered a DIFFERENT claim under the same reqId. A
     // stale callback must never finalize a replacement owner, and must still
@@ -1332,8 +1395,8 @@ export class FleetBus {
     claim.stopRenewing()
     this.releaseClaim(claim.subject, claim.envelopeId, reqId, claim.owner)
     this.recordAudit({
-      dir: 'drop', subject: claim.subject, reason: 'claude_discord_adapter_reply_undelivered',
-      envelope_id: claim.envelopeId, req_id: reqId, note: reason,
+      dir: 'drop', subject: claim.subject, reason,
+      envelope_id: claim.envelopeId, req_id: reqId, note,
     })
   }
 
@@ -1348,8 +1411,19 @@ export class FleetBus {
    * restart, or the full TTL rather than the lease. Releasing hands the
    * envelope straight back — under at-least-once a repeated effect is
    * permitted and a lost answer is not.
+   *
+   * `note` describes the trigger; `reason` is the SPEC §8 drop code the audit
+   * line is grepped by. The code DEFAULTS to the value this function used to
+   * hardcode, so every pre-existing trigger is unchanged — but it is not right
+   * for every trigger: the claim-age deadline attempted no delivery, so
+   * logging it as `reply_undelivered` would have been both misleading and
+   * grep-invisible under its own name.
    */
-  private abandonRepliedClaim(reqId: string, reason: string): void {
+  private abandonRepliedClaim(
+    reqId: string,
+    note: string,
+    reason = 'claude_discord_adapter_reply_undelivered',
+  ): void {
     const pending = this.pendingReplyClaims.get(reqId)
     if (pending === undefined) return
     if (pending.injectionActive) {
@@ -1357,16 +1431,74 @@ export class FleetBus {
       // but the turn is still executing and ownership is what stops a second
       // consumer starting the same work. `finishInjection` performs the
       // release the moment the callback exits.
-      pending.abandonReason ??= reason
+      //
+      // First writer wins, and note and code move TOGETHER — a later trigger
+      // must not leave the first trigger's note under its own drop code.
+      if (pending.abandonReason === undefined) {
+        pending.abandonReason = note
+        pending.abandonDropReason = reason
+      }
       return
     }
     this.pendingReplyClaims.delete(reqId)
     pending.stopRenewing()
     this.releaseClaim(pending.subject, pending.envelopeId, reqId, pending.owner)
     this.recordAudit({
-      dir: 'drop', subject: pending.subject, reason: 'claude_discord_adapter_reply_undelivered',
-      envelope_id: pending.envelopeId, req_id: reqId, note: reason,
+      dir: 'drop', subject: pending.subject, reason,
+      envelope_id: pending.envelopeId, req_id: reqId, note,
     })
+  }
+
+  /**
+   * Release a claim that has stayed pending past `dedupClaimDeadlineMs`.
+   *
+   * WHAT THIS BOUNDS, and what it deliberately does not. A claim whose session
+   * never publishes an answer reaches no removal path at all: it renews its
+   * lease until the process dies, holding the envelope suppressed for the
+   * store's TTL and leaking a renewal interval plus a map entry per claim. The
+   * deadline ends that. A callback that itself never returns is NOT bounded
+   * here and must not be — releasing a claim whose turn is still executing is
+   * exactly the live-owner overlap `injectionActive` exists to prevent. That
+   * case stays bounded by process lifetime, as before.
+   *
+   * The event says WHEN, not WHY: the claim did not settle in time. It does
+   * not diagnose the cause, and on measured evidence the most common cause is
+   * not a session failing to answer — see `DEFAULT_DEDUP_CLAIM_DEADLINE_MS`.
+   *
+   * The timer is `unref`'d and no removal path clears it, deliberately: all
+   * four of settle, abandon, eviction and `finishInjection` were reviewed
+   * independently and none should acquire a new obligation. Instead a fire
+   * against anything but the live claim no-ops. (`get` is an LRU touch, so a
+   * fire against a live claim moves it to most-recently-used. Harmless at a
+   * one-shot timer's frequency, recorded so nobody finds it by surprise.)
+   */
+  private armClaimDeadline(reqId: string, claim: PendingReplyClaim): void {
+    const timer = setTimeout(() => {
+      // Identity, not key — the same discipline `finishInjection` uses. After
+      // a takeover the key may belong to a REPLACEMENT owner, and a stale
+      // timer must never act on someone else's claim.
+      if (this.pendingReplyClaims.get(reqId) !== claim) return
+      if (claim.abandonReason !== undefined) return
+      if (claim.injectionActive) {
+        // RE-ARM, do not fire and do not die. Firing would release a running
+        // turn. Recording an abandon reason would be worse: the session could
+        // still publish — putting the answer on the wire — and
+        // `settleRepliedClaim` would then refuse because the reason is set,
+        // leaving an ANSWERED envelope released as unanswered under a false
+        // drop line. And dying silently would restore the original bug for any
+        // callback longer than the deadline: the timer gone, the callback
+        // returning without a reply, and the claim renewing forever.
+        this.armClaimDeadline(reqId, claim)
+        return
+      }
+      this.abandonRepliedClaim(
+        reqId,
+        `pending past ${this.dedupClaimDeadlineMs}ms deadline`,
+        'claude_discord_adapter_claim_deadline_released',
+      )
+    }, this.dedupClaimDeadlineMs)
+    // Never hold the event loop open for a claim deadline.
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer) (timer as { unref: () => void }).unref()
   }
 
   /**
@@ -1621,6 +1753,10 @@ export class FleetBus {
         token: replyToken,
       }
       this.pendingReplyClaims.set(reqId, pendingClaim)
+      // Bound the claim's AGE, from here — not the await below. The await is a
+      // single notification write in the deployed embedder and returns in
+      // milliseconds; the turn, and the hang worth bounding, happen after it.
+      this.armClaimDeadline(reqId, pendingClaim)
       try {
         await this.injectIntoSession({ envelope: result.envelope, reqId, replyToken })
       } catch (error) {

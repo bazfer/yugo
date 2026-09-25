@@ -379,6 +379,41 @@ Precisely what holds:
 - **Not exactly-once.** Exactly-once execution is **not offered and is not
   achievable** at this boundary.
 
+#### Known divergence: how a pending claim stops being pending
+
+The two ports bound an unsettled claim by **different mechanisms**, and neither
+bound is part of the contract above. Recorded here as prose because the
+conformance vectors carry envelope `accept`/`reject` verdicts and **cannot
+represent a cancellation lifecycle** — there is no vector shape for "the claim
+ended, and how".
+
+- **Python** is bounded by **asyncio cancellation reaching one cleanup scope**.
+  `_on_request` opens a single scope for the whole claimed lifetime and does not
+  swallow `CancelledError`, so on shutdown — drain, then close, then per-task
+  cancellation — the `finally` releases a claim that never settled. A second,
+  independent bound lives in the **embedder**: `RESPONSE_TIMEOUT` caps the whole
+  turn while the process is alive. It is read from the environment with no
+  ceiling, so that bound is operator-defeatable by configuration.
+- **TypeScript** has no equivalent. `injectIntoSession` is an awaited promise
+  with no cancellation channel, and `disconnect()` neither cancels it nor stops
+  renewal — deliberately, since `run()` calls `disconnect()` on every reconnect
+  cycle and stopping renewal there would make ordinary connection churn a
+  lease-loss event for healthy work. Its bound is instead a **per-claim age
+  deadline** (`dedupClaimDeadlineMs`, default 15 minutes, required to satisfy
+  `leaseMs <= deadline < dedupTtlMs`): a claim still pending at the deadline is
+  released through the ordinary abandon path and audited as
+  `claude_discord_adapter_claim_deadline_released`. The deadline no-ops and
+  re-arms while the session callback is still executing, so a running turn is
+  never released; that case remains bounded only by process lifetime, in both
+  ports.
+
+Consequences worth stating: a **released claim is not a failed one**. A reply
+arriving after release still publishes — the inbound envelope is retained for
+exactly that — so the release is not observable to the peer, and the count of
+releases over-reports the claims that genuinely went unanswered. And in neither
+port does a release imply the turn stopped; nothing at this boundary can cancel
+work already handed to a session.
+
 #### Why exactly-once is unachievable here
 
 Exactly-once at an execution boundary requires the side effect and the record of

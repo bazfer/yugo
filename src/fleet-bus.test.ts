@@ -9,6 +9,7 @@ import {
   BatonDerivationError,
   BatonHopsExhausted,
   DEFAULT_MAX_ENVELOPE_BYTES,
+  DEFAULT_DEDUP_CLAIM_DEADLINE_MS,
   DEFAULT_DEDUP_TTL_MS,
   DEFAULT_PAYLOAD_BODY_MAX_BYTES,
   DurableEnvelopeDedupStore,
@@ -2354,15 +2355,27 @@ describe('envelope-id dedup', () => {
   })
 
   test('memory fast path expires with durable TTL and cannot overrule it', async () => {
+    // Config reshaped by the #28 claim deadline, which refuses
+    // `leaseMs > deadline` or `deadline >= dedupTtlMs` at construction — and
+    // the previous `dedupTtlMs: 1` against a default 60s lease admits no valid
+    // deadline at all. So the lease comes down with the TTL rather than the
+    // TTL going up, and the turn SETTLES: an unsettled claim would be released
+    // by the deadline before the sleep ended, and re-admission would then
+    // prove nothing about the TTL. Settling also arms `seenRequestEnvelopes`,
+    // which is the memory fast path this test is named for and which the
+    // unsettled version never populated at all.
     const events: FleetBusSessionEvent[] = []
     const bus = new TestFleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      dedupTtlMs: 1,
+      dedupStore: new DurableEnvelopeDedupStore(':memory:', 300, 50),
+      dedupTtlMs: 300, dedupClaimDeadlineMs: 100,
       injectIntoSession: async event => { events.push(event) },
     }, allowlist)
     const wire = envelope({ id: 'ttl-cache-agreement', to: 'vec' })
     await bus.handleRequest(wire)
-    await new Promise(resolve => setTimeout(resolve, 5))
+    bus.settleReply(events[0]!.reqId)
+    expect(bus.seenRequestLedgerHas('ttl-cache-agreement')).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 400))
     await bus.handleRequest(wire)
     expect(events).toHaveLength(2)
   })
@@ -2433,6 +2446,375 @@ describe('envelope-id dedup', () => {
     // Once the answer is on the wire the claim settles and the fast path arms.
     bus.settleReply(firstReqId)
     expect(bus.seenRequestLedgerHas('dup-req-1')).toBe(true)
+  })
+})
+/* -------------------------------------------------------------------------- */
+/* Pending-claim age deadline (#28)                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A claim registered here is removed by `publishReply`, `abandonRepliedClaim`,
+ * capacity eviction or `finishInjection`. A session that never answers reaches
+ * none of them, so before #28 the claim renewed its lease for the store's full
+ * 8-day TTL and the only time bound was process lifetime.
+ *
+ * Tests 4, 9 and 10 below are labelled WEAK in
+ * `docs/DESIGN-28-hung-callback-bounded-recovery.md` §9 and are labelled weak
+ * here, individually, with what each one cannot distinguish. A suite that hides
+ * which of its tests cannot fail is worse than a smaller one.
+ */
+describe('pending claim age deadline', () => {
+  const claimConfig = (overrides: Partial<FleetBusConfig>): FleetBusConfig => ({
+    botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', ...overrides,
+  })
+  const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
+  test('a claim still pending at the deadline is released — entry, renewal and durable row', async () => {
+    // DESIGN §9 test 1, with test 2 folded in: the deadline is keyed to the
+    // CLAIM'S AGE from registration, not to the `injectIntoSession` await.
+    // This callback returns in microseconds — as the deployed embedder's does,
+    // it being a single MCP notification write — and the release still happens
+    // at the deadline, which is the whole distinction between this design and
+    // the one that raced the await.
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-deadline-'))
+    const path = join(dir, 'dedup.sqlite')
+    const auditLogPath = join(dir, 'audit.jsonl')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, auditLogPath, dedupClaimDeadlineMs: 250,
+      injectIntoSession: async event => { reqId = event.reqId },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({ id: 'deadline-release', to: 'vec', from: 'kat' }))
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+    expect(store.count()).toBe(1)
+
+    await sleep(600)
+
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+    // The durable row is gone, so renewal is no longer extending anything and
+    // a peer is no longer suppressed. Without the release this row would still
+    // be pending with a freshly renewed lease.
+    expect(store.count()).toBe(0)
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('deadline-release', 'retry').duplicate).toBe(false)
+    // Named for the point in time, under its OWN drop code. `reply_undelivered`
+    // would be wrong twice over: nothing was undelivered, nothing was attempted.
+    const drops = readAudit(auditLogPath).filter(e => e.reason === 'claude_discord_adapter_claim_deadline_released')
+    expect(drops).toHaveLength(1)
+    expect(drops[0]!.req_id).toBe(reqId)
+    expect(drops[0]!.envelope_id).toBe('deadline-release')
+  })
+
+  test('a turn that answers before the deadline releases nothing — WEAK, pairs with the test above', async () => {
+    // DESIGN §9 test 10, labelled VACUOUS ON ITS OWN in the design and kept
+    // only as test 1's pair: a settled claim is already off the map, so the
+    // identity check no-ops for any implementation, including one with no
+    // deadline at all. It cannot fail in a way test 1 would not also catch.
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-deadline-settled-'))
+    const auditLogPath = join(dir, 'audit.jsonl')
+    const store = new DurableEnvelopeDedupStore(join(dir, 'dedup.sqlite'), DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    let token: string | null = null
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, auditLogPath, dedupClaimDeadlineMs: 250,
+      injectIntoSession: async event => { reqId = event.reqId; token = event.replyToken },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    await bus.handleRequest(envelope({ id: 'deadline-settled', to: 'vec', from: 'kat' }))
+    expect(bus.publishReply(reqId, { text: 'answered in time' }, 'result', token).ok).toBe(true)
+    expect(bus.seenRequestLedgerHas('deadline-settled')).toBe(true)
+
+    await sleep(600)
+
+    expect(readAudit(auditLogPath).some(e => e.reason === 'claude_discord_adapter_claim_deadline_released')).toBe(false)
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+  })
+
+  test('the timer no-ops when a takeover replaced its claim under the same req_id', async () => {
+    // DESIGN §9 test 3. `reqId` is stable across a takeover — the store keeps
+    // it and issues a NEW owner — so the key names the ENVELOPE, not the
+    // attempt. A timer that looked its claim up by key would release the
+    // REPLACEMENT owner's healthy claim. Setup must force a LAPSE rather than
+    // a release, because release DELETEs the row and leaves nothing to take
+    // over; #26 admits the forward clock step this simulates.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-deadline-takeover-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let calls = 0
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, dedupClaimDeadlineMs: 500,
+      injectIntoSession: async () => { calls += 1 },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const wire = envelope({ id: 'deadline-takeover', to: 'vec', from: 'kat' })
+    await bus.handleRequest(wire)
+    // t≈0: claim A registered, its deadline due at t≈500.
+    await sleep(150)
+    const raw = new Database(path)
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('deadline-takeover')
+    raw.close()
+    await bus.handleRequest(wire)
+    // t≈150: claim B takes the lapsed row and replaces A under the same key.
+    // Its own deadline is due at t≈650.
+    expect(calls).toBe(2)
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    await sleep(450)
+
+    // t≈600: A's timer has fired and must have left B alone.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+    expect(store.count()).toBe(1)
+  })
+
+  test('the timer records no abandon reason while the injection is still running — WEAK', async () => {
+    // DESIGN §9 test 4, labelled WEAK there and here. It discriminates only
+    // against the DEFERRING variant — a timer that recorded `abandonReason`
+    // mid-injection, letting the session publish an answer that
+    // `settleRepliedClaim` then refuses, so an ANSWERED envelope is released
+    // as unanswered under a false drop line (§4b). The observable outcome is
+    // IDENTICAL under a fire-once no-op, so this test does not prove re-arm.
+    // Re-arm is proven by the next test alone.
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-deadline-active-'))
+    const auditLogPath = join(dir, 'audit.jsonl')
+    const store = new DurableEnvelopeDedupStore(join(dir, 'dedup.sqlite'), DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    let token: string | null = null
+    let releaseCallback: (() => void) | undefined
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, auditLogPath, dedupClaimDeadlineMs: 200,
+      injectIntoSession: async event => {
+        reqId = event.reqId
+        token = event.replyToken
+        await new Promise<void>(resolve => { releaseCallback = resolve })
+      },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const turn = bus.handleRequest(envelope({ id: 'deadline-active', to: 'vec', from: 'kat' }))
+    await sleep(500)
+    // Two deadline periods have passed with the callback still executing.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    // The session answers, late, from inside its still-running callback.
+    expect(bus.publishReply(reqId, { text: 'late but delivered' }, 'result', token).ok).toBe(true)
+    releaseCallback?.()
+    await turn
+
+    // Settled, not released: the fast path arms only when `completeClaim`
+    // succeeds, which a deferred abandonment would have prevented.
+    expect(bus.seenRequestLedgerHas('deadline-active')).toBe(true)
+    expect(readAudit(auditLogPath).some(e => e.dir === 'drop')).toBe(false)
+  })
+
+  test('a callback outliving the deadline and returning without a reply is released by the re-armed timer', async () => {
+    // DESIGN §9 test 5 — the hole the fire-once rule opened. Claim registered
+    // at t=0, callback runs past the deadline, timer fires, finds the
+    // injection active, and under fire-once NO-OPS AND IS GONE. The callback
+    // then returns without publishing, `finishInjection` finds no abandon
+    // reason, and the claim renews forever: #28's original state with the
+    // mechanism installed and silent.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-deadline-rearm-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let releaseCallback: (() => void) | undefined
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, dedupClaimDeadlineMs: 200,
+      injectIntoSession: async () => { await new Promise<void>(resolve => { releaseCallback = resolve }) },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const turn = bus.handleRequest(envelope({ id: 'deadline-rearm', to: 'vec', from: 'kat' }))
+    await sleep(500)
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+    releaseCallback?.()
+    await turn
+    // The callback is over and published nothing. Only a re-armed timer is
+    // left to notice.
+    expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    await sleep(400)
+
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+    expect(store.count()).toBe(0)
+  })
+
+  test('a reply arriving after a deadline release still publishes', async () => {
+    // DESIGN §9 test 6 — the tripwire for §4's "do not clear `receiveLedger`".
+    // Release deliberately leaves the inbound envelope in the ledger, and that
+    // is load-bearing at the measured non-settle rate: `publishReply` finds no
+    // pending claim, skips the token check, reads the inbound envelope from
+    // exactly that entry and puts the answer on the wire. Clearing the entry
+    // on release would turn this into `req_id_unknown` instead.
+    const store = new DurableEnvelopeDedupStore(':memory:', DEFAULT_DEDUP_TTL_MS, 200)
+    let reqId = ''
+    let token: string | null = null
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, dedupClaimDeadlineMs: 200,
+      injectIntoSession: async event => { reqId = event.reqId; token = event.replyToken },
+    }), allowlist)
+    const nc = new FakeNatsConnection()
+    bus.attachFakeNc(nc)
+
+    await bus.handleRequest(envelope({ id: 'deadline-late-reply', to: 'vec', from: 'kat' }))
+    await sleep(400)
+    expect(bus.pendingReplyClaimCount()).toBe(0)
+
+    const result = bus.publishReply(reqId, { text: 'answered after release' }, 'result', token)
+    expect(result.ok).toBe(true)
+    expect(nc.publishes.some(p => (p.envelope as Envelope).in_reply_to === 'deadline-late-reply')).toBe(true)
+  })
+
+  test('a deadline outside leaseMs <= deadline < dedupTtlMs is refused at construction', async () => {
+    // DESIGN §9 test 7, both bounds. Below one lease the deadline cannot tell
+    // a slow turn from a stuck one; at or above the TTL it is redundant, since
+    // prune has already removed the row it would release. A configuration that
+    // can never do its job is refused rather than shipped.
+    const withDeadline = (dedupClaimDeadlineMs: number, leaseMs = DEFAULT_DEDUP_LEASE_MS): FleetBus => new TestFleetBus(
+      claimConfig({ dedupStore: new DurableEnvelopeDedupStore(':memory:', DEFAULT_DEDUP_TTL_MS, leaseMs), dedupClaimDeadlineMs }),
+      allowlist,
+    )
+    expect(() => withDeadline(DEFAULT_DEDUP_LEASE_MS - 1)).toThrow(RangeError)
+    expect(() => withDeadline(DEFAULT_DEDUP_TTL_MS)).toThrow(RangeError)
+    // Both bounds are INCLUSIVE at the lease end and exclusive at the TTL end.
+    expect(() => withDeadline(DEFAULT_DEDUP_LEASE_MS)).not.toThrow()
+    expect(() => withDeadline(DEFAULT_DEDUP_TTL_MS - 1)).not.toThrow()
+    // The check reads the STORE's lease, not the module default — an injected
+    // store may issue a different one, and the default deadline is legal
+    // against a 60s lease but not against a 20-minute one.
+    expect(() => withDeadline(DEFAULT_DEDUP_CLAIM_DEADLINE_MS, 20 * 60_000)).toThrow(RangeError)
+  })
+
+  test('request() publishes exactly once per envelope id, waited or not', async () => {
+    // DESIGN §9 test 8 — an observation turned into an invariant. #28 releases
+    // a deadlined claim partly because NO SENDER mints a same-id retry, so a
+    // released claim cannot be re-admitted by one. Anyone adding a retry loop
+    // to `request()` converts every release into a re-injection, and nothing
+    // else in this suite would notice.
+    //
+    // SCOPE, stated because it is narrower than the invariant: this covers the
+    // TypeScript sender only. The Python port's `request` path and
+    // codex-container — the fleet's dominant sender of `.request` frames —
+    // each need their own copy of this test in their own repository.
+    const nc = new FakeNatsConnection()
+    const bus = new TestFleetBus(claimConfig({}), allowlist)
+    bus.attachFakeNc(nc)
+
+    const fired = await bus.request({ to: 'kat', kind: 'text_message', payload: {} })
+    const waited = await bus.request({ to: 'kat', kind: 'text_message', payload: {}, wait: true, timeoutMs: 50 })
+    expect(waited.timed_out).toBe(true)
+
+    for (const id of [fired.envelope!.id, waited.envelope!.id]) {
+      const sends = nc.publishes.filter(p => (p.envelope as Envelope).id === id)
+      if (sends.length !== 1) {
+        throw new Error(
+          `DESIGN-28 §4 invariant broken: ${sends.length} publishes for envelope id ${id}. `
+          + 'Releasing a deadlined claim is free only while no sender retries the same id; '
+          + 'see docs/DESIGN-28-hung-callback-bounded-recovery.md and yugo#10.',
+        )
+      }
+      expect(sends).toHaveLength(1)
+    }
+  })
+
+  test('the deadline is independent of the renewal cadence — WEAK', async () => {
+    // DESIGN §9 test 9, labelled there as a COUPLING GUARD, NOT COVERAGE. With
+    // one mechanism it restates test 1 at two lease values; what it pins is
+    // that nobody later derives the deadline from the lease, which would make
+    // a short-lease deployment release healthy claims early.
+    const buses = [200, 1_000].map(leaseMs => {
+      const store = new DurableEnvelopeDedupStore(':memory:', DEFAULT_DEDUP_TTL_MS, leaseMs)
+      const bus = new TestFleetBus(claimConfig({
+        dedupStore: store, dedupClaimDeadlineMs: 1_500, injectIntoSession: async () => {},
+      }), allowlist)
+      bus.attachFakeNc(new FakeNatsConnection())
+      return { bus, store }
+    })
+    await Promise.all(buses.map((b, i) => b.bus.handleRequest(envelope({ id: `deadline-cadence-${i}`, to: 'vec', from: 'kat' }))))
+
+    // Past five renewal periods of the short lease, and well short of the
+    // deadline: a deadline derived from the lease would already have fired.
+    await sleep(700)
+    for (const { bus } of buses) expect(bus.pendingReplyClaimCount()).toBe(1)
+
+    await sleep(1_200)
+    for (const { bus, store } of buses) {
+      expect(bus.pendingReplyClaimCount()).toBe(0)
+      expect(store.count()).toBe(0)
+    }
+  })
+
+  test('disconnect() during an active claim leaves renewal running — WEAK, regression guard only', async () => {
+    // DESIGN §9 test 11, labelled VACUOUS BY CONSTRUCTION there: #28 touches
+    // nothing in `disconnect()`. It guards the withdrawn v1 proposal that
+    // stopped renewal there — `run()` calls `disconnect()` on EVERY reconnect
+    // cycle, not only at shutdown, so that would have made ordinary connection
+    // churn a lease-loss event for healthy in-flight work. Renewal is a local
+    // SQLite write and has no business depending on the bus connection.
+    const path = join(mkdtempSync(join(tmpdir(), 'fleet-deadline-disconnect-')), 'dedup.sqlite')
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    let releaseCallback: (() => void) | undefined
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, dedupClaimDeadlineMs: 5_000,
+      injectIntoSession: async () => { await new Promise<void>(resolve => { releaseCallback = resolve }) },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const turn = bus.handleRequest(envelope({ id: 'deadline-disconnect', to: 'vec', from: 'kat' }))
+    await sleep(50)
+    await bus.disconnect()
+
+    // Several lease periods after the disconnect, a rival must still be locked
+    // out: the turn is running and renewal is what says so.
+    await sleep(700)
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    expect(rival.claim('deadline-disconnect', 'rival-during').duplicate).toBe(true)
+    releaseCallback?.()
+    await turn
+  })
+
+  test('a deferred abandonment still audits under the default drop code', async () => {
+    // NOT in the design's list. `abandonRepliedClaim` now takes its drop code
+    // as a parameter and a deferred abandonment carries that code through to
+    // `finishInjection`, which used to hardcode one — and no test anywhere
+    // asserted what that second site emits, so the threading could have
+    // silently changed every OTHER trigger's audit line. Every pre-existing
+    // trigger takes the default, and this pins it.
+    //
+    // WHAT IT CANNOT DO: prove the threading itself. A deferred abandonment
+    // carrying a NON-default code needs a trigger that both threads one and
+    // defers, and the only trigger that threads one — the claim deadline —
+    // never defers, by design (§3's no-op). So the `finishInjection` half of
+    // the reason change is verified as "unchanged for every reachable
+    // trigger", not as "carries a custom code".
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-deferred-code-'))
+    const auditLogPath = join(dir, 'audit.jsonl')
+    const store = new DurableEnvelopeDedupStore(join(dir, 'dedup.sqlite'), DEFAULT_DEDUP_TTL_MS, 200)
+    let releaseFirst: (() => void) | undefined
+    let first = true
+    const bus = new TestFleetBus(claimConfig({
+      dedupStore: store, auditLogPath, receiveLedgerCap: 1,
+      injectIntoSession: async () => {
+        if (!first) return
+        first = false
+        await new Promise<void>(resolve => { releaseFirst = resolve })
+      },
+    }), allowlist)
+    bus.attachFakeNc(new FakeNatsConnection())
+
+    const turn = bus.handleRequest(envelope({ id: 'deferred-code-a', to: 'vec', from: 'kat' }))
+    await sleep(20)
+    // Overflows the capacity-1 ledgers, abandoning A while its callback runs.
+    await bus.handleRequest(envelope({ id: 'deferred-code-b', to: 'vec', from: 'kat' }))
+    releaseFirst?.()
+    await turn
+
+    const drops = readAudit(auditLogPath).filter(e => e.envelope_id === 'deferred-code-a' && e.dir === 'drop')
+    expect(drops).toHaveLength(1)
+    expect(drops[0]!.reason).toBe('claude_discord_adapter_reply_undelivered')
+    expect(drops[0]!.note).toBe('claude_discord_adapter_receive_ledger_evicted')
   })
 })
 
