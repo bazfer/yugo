@@ -1,6 +1,6 @@
 ---
 issue: bazfer/yugo#28
-status: DRAFT v4 for review — no code
+status: DRAFT v7 for review — no code
 date: 2026-09-25
 supersedes: v1 (REWORK), v2 and v3 (MORE CHANGES NEEDED). See "What v1 got wrong" and "What v2 got wrong".
 ---
@@ -19,9 +19,10 @@ path. Not because a retry is waiting — none is — but because every unsettled
 claim leaks a renewal timer and two ledger entries, and at the measured rate that
 is ~30 leaked timers per day on one bot.
 
-**The deadline detects an unanswered request, not a hung callback**, and at a 74%
-non-settle rate that is the common case rather than the exception. It must be
-named accordingly.
+**The deadline detects a claim that did not settle in time — it does NOT
+diagnose why.** Most of the population turns out to be peer replies mis-admitted
+as new turns (§3), not sessions failing to answer, so the event is named for the
+point in time: `claude_discord_adapter_claim_deadline_released`.
 
 ## What v1 got wrong
 
@@ -50,8 +51,8 @@ errors of *scope* and the next reader should see how the design was aimed wrong.
 
 1. **v2 assumed a claim's expected lifetime is a turn.** Measurement says 74% of
    claims never settle at all, in a bimodal distribution with no middle. So the
-   deadline detects an unanswered request, not a hung callback, and "firing is
-   itself a signal" was false. §3.
+   deadline detects a claim that did not settle, and "firing is itself a signal"
+   was false. v6 then found the population is mostly mis-admitted replies. §3.
 2. **v2 chose audit-only on an incomplete cost/benefit.** It weighed release
    against admitting a retry, found no producer, and never weighed the resource
    leak that release fixes for free. §4 reverses it.
@@ -142,11 +143,28 @@ The claim is registered at `src/fleet-bus.ts:1567`, before the callback is
 awaited, and is removed by `publishReply` on settle, by `abandonRepliedClaim`, or by capacity
 eviction. **Measure from registration.**
 
-One deadline on that age bounds **both** failure modes with one timer:
+**Corrected in v5 — this bounds ONE failure mode, not two.** v3 and v4 both said
+"both failure modes with one timer". That is false, and the reason it is false is
+also the reason it must stay that way:
 
-- the MCP write that never returns, and
-- the far likelier case where the write returns fine and the session never
-  replies.
+- **Mode 2 — the write returns, the session never replies. BOUNDED by this
+  design.** The claim is registered, `injectionActive` is already false, and the
+  deadline releases it.
+- **Mode 1 — `injectIntoSession` itself never returns. NOT bounded, by design.**
+  `abandonRepliedClaim` only records `abandonReason` while `injectionActive` is
+  true; the actual release runs in `finishInjection`, which runs from the
+  `finally` around the callback — so it runs only when the callback returns or
+  throws. A callback that does neither never reaches it.
+
+**That is the correct disposition, not a gap to close.** Releasing a claim whose
+callback is still executing is exactly the premature release #25 fixed over three
+rounds. Mode 1 remains bounded by process lifetime, as today.
+
+So: **the timer no-ops while `injectionActive` is true.** It does not defer, does
+not record an abandon reason, and **re-arms for another deadline period rather
+than firing or dying** (§4a). One check, and it makes
+the scope honest instead of merely documented — see §4b for the state that
+deferring would otherwise create.
 
 v1 needed a second mechanism for the second case and did not have one.
 
@@ -157,23 +175,76 @@ audit log says otherwise. Matching `.request` `in` lines to any `out` line by
 `req_id` on this bot:
 
 ```
-all history      : 62 claims, 11 settled, 51 never settled  — 82%
-post-#25 only    : 39 claims, 10 settled, 29 never settled  — 74%
+all history      : 62 lines, 11 settled, 51 never settled  — 82%
+post-#25 only    : 39 claims, 10 settled, 29 never settled — 74%
 ```
 
-Measured independently twice, same result. **The distribution is bimodal with
-nothing in between:** settled turns cluster at 21-65s, unsettled ones never
-settle — not late, never. There is no "long turn" population for a deadline to
-avoid, and any threshold from two minutes to eight days separates the two
-identically.
+(v6 claimed an "honest count" of 60/11/49 on the grounds that two lines carry the
+`ledger_matched` note. Wrong — both of those are on `fleet.deet.result`, not the
+request lane. The request-lane count is **62/11/51** as first stated.) Settle
+latencies span **13.9-64.6s**. The distribution is
+bimodal with nothing in between: settled turns cluster in that band, unsettled
+ones never settle — not late, never.
 
-**So the deadline does not detect a hung callback. It detects an unanswered
-request**, and that is the common case rather than the exception. That finding is
-filed as its own issue; it is larger than #28 and does not belong buried here.
+### What that population actually is — corrected in v6
 
-The consequence for this design is that the event must be **named for what it
-catches** — `claude_discord_adapter_claim_unanswered` — and its expected fire
-rate documented, or it will be read as an alarm and tuned out within a day.
+v3 through v5 read this as "sessions do not reply", and sized the deadline
+against it. **That diagnosis was wrong.**
+
+`onRequest` handles `in_reply_to` **only when an outbound waiter exists**. An
+unwaited reply, or one arriving after its waiter timed out, falls through to the
+fresh-turn path and is handed a pending claim **owed a reply it will never get**.
+The `.result` lane does the opposite with the identical case — unmatched replies
+there go to `injectUnsolicited` and settle at inject time. The two lanes disagree
+about what an unmatched reply is.
+
+**Evidence, by reading the baton fields rather than by correlating timestamps.**
+v6 argued this from temporal adjacency — 40 of 51 unsettled claims arriving within
+120s of an outbound request. That method is too weak to rely on: **the audit `in`
+lines carry no `in_reply_to`**, so it cannot distinguish a reply from an unrelated
+request that happened to arrive just after one. The gaps also span 0-100s, not the
+"28 to 45 seconds" v6 claimed.
+
+Classifying all 51 by their actual baton fields:
+
+- **37 carry `origin=deet`** at hops 1 or 3 — replies to this bot's own requests.
+- **6 predate baton fields** and carry reply-shaped payloads (`{"status":"complete"}`,
+  `"received"`).
+- **8 are genuine originating requests** this session never answered — six from
+  luna, two from kat, all at hops 0.
+
+So **~43 of 51, about 84%, are mis-admitted replies**, and the genuinely
+unanswered population is **8**, not 51.
+
+Settling does not imply a real request either: 7 of the 11 settled claims also
+carry `origin=deet`, meaning this bot sometimes answers a peer's answer.
+
+And the whole log holds **7 `request_timeout` drops**, so nearly every
+`bus_request` is `wait:false` and registers no waiter.
+
+So most of this population is **peer answers to questions this bot asked**,
+mis-classified on arrival. The traffic pattern generating it is this bot's own
+normal way of talking to the fleet.
+
+**Consequences for this design, and they are not small:**
+
+- The event is **not** "the session ignored a request". Naming it
+  `claim_unanswered` would enshrine a wrong diagnosis in the audit log.
+- The real fix is routing unmatched replies on the `.request` lane through
+  `injectUnsolicited`, matching `onResult`. **That is issue #39**, filed
+  2026-09-25 — not #27, which is the separate question of `injectUnsolicited`'s
+  settle point. Fixing #39 removes most of this population at the source.
+- **This deadline is a backstop for whatever remains, not the fix.** v3-v5 sized
+  and justified it against a population that mostly should not exist.
+
+The genuinely-unanswered population is **8 claims**, not 51 — a twentieth of the
+traffic, not three quarters of it. That is a very different thing to size a
+mechanism against.
+
+So the event is named for **the point in time**, not a diagnosis it cannot
+support: **`claude_discord_adapter_claim_deadline_released`**. A name that
+asserts *why* the claim was never settled would be a guess, and on current
+evidence the most common answer is not the one v3-v5 assumed.
 
 **Existing bound, for completeness:** `pendingReplyClaims` capacity eviction
 (`DEFAULT_RECEIVE_LEDGER_CAP = 1000`) is a *count*, not a time. On a quiet bot it
@@ -200,8 +271,40 @@ Every unsettled claim leaves behind, until capacity eviction at
 - a `receiveLedger` entry — **which release does NOT clear, deliberately.**
 
 At the rate measured in §3 that is **10-30 leaked timers per day on one bot** —
-27 on the worst day measured, ~10 on a three-day mean — growing linearly toward a
-1000-timer floor at ~40 UPDATEs per second.
+27 on the worst day measured, ~10 on a three-day mean.
+
+**Corrected in v5: the ceiling is lower than v4 claimed, and the leak is
+self-limiting.** `renew()` returns false once the row is gone, and
+`renewWhileRunning` clears its interval on false — so a leaked timer lives at
+most **TTL plus prune cadence**, not until capacity eviction. And the plugin
+restarts, which clears them.
+
+**Corrected in v6 — v5 asserted this as verified and it was false.** v5 said the
+running server started after *all* of the worst day's unsettled claims. It did
+not. The server started 2026-09-24T20:03:41Z and unsettled claims followed at
+20:06:49Z, 23:47:15Z, and twice more on 09-25. The live store confirms **29
+pending rows, 10 completed, and four leases still renewing in the running
+process** as this is written. Restarts reduce the population; they did not clear
+it.
+
+Reaching v4's "1000-timer floor at ~40 UPDATEs/second" would need ~125 unsettled
+claims per day sustained inside a single 8-day process lifetime. At the measured
+~10/day the steady state is roughly **80 timers, about 3 UPDATEs per second.**
+
+**A projected side effect, NOT an observed one** — corrected in v7 after I
+asserted it as measured. When prune eventually removes a leaked row, `renew()`
+returns false and the adapter records a `dedup_lease_lost` drop line for a row
+that was never a duplicate. **That has never happened here:** `dedup_lease_lost`
+appears **zero** times in the audit log, whose only drop reasons are
+`request_timeout` (7) and `unsupported_envelope_version` (2). It requires a
+process to survive the row's full 8-day TTL, and none has. v6 stated a count of
+27 for this, taken from a review report without checking. It was wrong.
+
+Still worth closing — 3 writes per second of pure waste against a store on the
+critical path is real, and the bound depends on restarts that are not
+guaranteed.
+But the honest number is 3/s, not 40/s, and a design should not be sold on a
+figure an order of magnitude too large.
 
 ### Release does not lose a late answer — and that is why `receiveLedger` stays
 
@@ -264,9 +367,16 @@ event the design insists must be "named for what it catches" would be
 grep-visible only in `note`, under a misleading code.
 
 **Thread the reason through as a parameter, defaulting to the current value.**
-One line in a reviewed function, no behaviour change for existing callers, and
-this trigger then emits `claude_discord_adapter_claim_unanswered` as its actual
-`reason`.
+No behaviour change for existing callers.
+
+**Two emit sites, not one** — corrected in v5. `finishInjection` **also**
+hardcodes `reason: 'claude_discord_adapter_reply_undelivered'` and puts the
+stored string in `note`, so changing only `abandonRepliedClaim` leaves the
+deferred branch still emitting the wrong code. Both sites change, or
+`finishInjection` emits the stored code as its `reason`.
+
+(With §3's no-op the deferred branch is unreachable *from this trigger*, but the
+site is shared with every other abandon reason, so the fix is owed regardless.)
 
 This is the one place the design does touch the mechanism rather than only adding
 a reason, and it is worth being explicit that v3 promised the naming while
@@ -286,28 +396,133 @@ promise worth writing down.
 ### Make the audit line consumed rather than decorative
 
 At a 74% fire rate the event is **not an alarm and must not be described as
-one** — but it is the only per-request record that a request went unanswered, and
+one** — but it is the only per-request record that a claim was released unsettled, and
 it is the evidence base for the separate issue filed from §3.
 
-**Add a `claims_released_unanswered` counter to `statusSnapshot`**, which today
+**Add a `claims_released_at_deadline` counter to `statusSnapshot`**, which today
 carries `injections_delivered` / `injections_failed` and nothing about claims.
-`bus_status` then surfaces the rate without anyone grepping a log, and the metric
-that issue will be measured against is readable at a glance.
+`bus_status` then surfaces the rate without anyone grepping a log.
 
-### If a retry producer ever appears
+**This is a CROSS-REPO change, not one edit.** `statusSnapshot` lives in the
+plugin (`artifice-discord`, `src/fleet-bus-wiring.ts`), not in yugo, and it
+counts injections by *wrapping* `injectIntoSession`. A released-claim counter has
+nothing to wrap — it needs a new surface on `FleetBus` (a getter or a callback)
+**plus** a plugin change consuming it. v4 presented it as a single edit in one
+file; it is two repos and a released plugin version. Scope it accordingly or drop
+it from this design and file it separately.
 
-Durable execution retries, a replayer, or a supervisor republishing with the
-original id would make release start costing something. Revisit then, and **name
-that producer with a file and line** rather than assuming it.
+### A retry producer is SCHEDULED, not hypothetical
+
+v3-v6 framed this as "if one ever appears". It is already on the roadmap.
+
+**SPEC §6.3 defines the `FLEET_REQUEST` and `FLEET_RESULT` JetStream streams** —
+`fleet.*.request` and `fleet.*.result`, 7-day retention, 100,000 messages, applied
+2026-09-02. They capture every publish today. **The first durable consumer bound
+to `FLEET_REQUEST` under FB-3 (#10) is a redelivery producer**, and on that day
+the "cost is zero" argument in this section expires and release starts paying
+#25's duplicate cost for real.
+
+So this is a dated assumption, not an open-ended one. Revisit at #10, not "if".
+
+**Also: the survey covered the wrong senders.** "Neither port sends a same-id
+retry" was verified against yugo's TypeScript and Python `request()` paths — but
+the peers that actually send `.request` frames to this bot are **codex-container**
+(Vec, Ohm, Myc, Helm), a third codebase this design never examined. Read at
+repository HEAD it also publishes once and mints a fresh uuid per call, and its
+reconnect loop backs off without republishing — so the finding survives. But the
+fleet's dominant sender was outside the scope of the check, and test 8's "per
+port" wording must say **per sender**, codex-container included.
+
+## 4b. The state that deferring would create — and why the no-op avoids it
+
+**Found on an independent fresh review, after four rounds had approved the
+deferring version.** Worth recording in full, because the sequence is reachable
+and every step is ordinary.
+
+If the timer deferred instead of no-opping, with an embedder whose callback spans
+the turn — which is how `fleet-bus.test.ts` models `injectIntoSession`:
+
+1. Deadline fires while `injectionActive` is true → `abandonRepliedClaim` records
+   `abandonReason = claim_deadline_released` and returns.
+2. The session replies. `publishReply` puts **the answer on the wire** and writes
+   its `out` audit line.
+3. `settleRepliedClaim` then **refuses**, because `abandonReason` is set.
+4. The callback exits. `finishInjection` **deletes the row** and audits
+   `reply_undelivered`.
+
+Net result: **an answered envelope, released as unanswered**, with a false drop
+line and the `claims_released_at_deadline` counter incremented for a claim that
+was in fact answered. The metric that §3's separate issue will be measured
+against would be corrupted by the mechanism meant to produce it.
+
+Two ways out were available. Clearing a deadline-origin `abandonReason` inside
+`settleRepliedClaim` would work, but it special-cases one reason inside a
+reviewed function. **The no-op is better:** every #25 path stays byte-identical,
+and the honest scope in §3 falls out of the mechanism rather than relying on
+prose.
+
+Unreachable with the deployed millisecond embedder. That is exactly why it is
+worth writing down — it is invisible today and normal for any embedder whose
+callback spans the turn.
+
+## 4c. The deadline value
+
+**v4 excluded this from the open question and then never answered it anywhere.**
+"Any value from two minutes to eight days" is an observation, not a
+specification.
+
+- **Constant:** `DEDUP_CLAIM_DEADLINE_MS`, alongside the existing dedup constants.
+- **Default: 15 minutes.** The "14× the longest observed settle" argument v5 used
+  is **withdrawn** — it rests on 11 samples capped at 65s, and a Claude Code turn
+  mid-task routinely runs longer than 15 minutes, so that reasoning would have
+  justified almost any number.
+
+  The honest defence is that **premature release costs close to nothing on
+  current evidence**: a late reply still publishes, because `receiveLedger` is
+  retained (§4), and no same-id retry producer exists. So the cost of choosing
+  too short is a released claim that still answers correctly.
+
+  The price is that a released-then-answered claim is counted as released. That is
+  §4b's corruption at a longer timescale.
+
+  **v6 promised the counter would be "correctable" and specified no mechanism for
+  it.** After release `publishReply` sees no claim at all and nothing remembers
+  the reqId was ever released, so there is nothing to tag. Correcting it would
+  need a released-reqId ledger, which is a new structure and not in scope here.
+  **The promise is withdrawn:** the counter over-reports by however many claims
+  are answered after release, and that is stated rather than hand-waved. With the
+  deployed embedder and a 15-minute deadline this is routine, not an edge case.
+- **Config knob:** overridable per deployment, like the other dedup settings.
+- **Bounds: `leaseMs <= deadline < dedupTtlMs`**, validated at construction,
+  refusing a configuration that violates either. **Validated against the adapter's
+  configured TTL**, since an injected store's private `ttlMs` has no getter and may
+  differ — only `leaseMs` is exposed. Either add a `ttlMs` getter or say plainly
+  that the check is against config, not against the store in use.
+
+  **Upper bound, with the justification corrected in v6.** v5 said a deadline at
+  or above TTL is "silently inert". Not quite — the timer still deletes the
+  `pendingReplyClaims` entry and calls `stopRenewing()`; what it cannot do is
+  release a row that prune already removed, and renewal would have self-terminated
+  at TTL anyway once `renew()` started returning false. So the real reason for the
+  bound is that **past TTL the mechanism is redundant rather than inert**, and a
+  configuration that can never do its job should be refused rather than shipped.
+
+  **Lower bound, which v5 omitted entirely.** A zero or tiny deadline fires inside
+  the inject await, where under v6's re-arm rule it would re-arm in a tight loop,
+  and under v5's fire-once rule it would do nothing at all. Below one lease it
+  cannot distinguish a slow turn from a stuck one. Refuse it.
 
 ## 4a. Timer lifecycle
 
 Specified rather than left to the implementer, because leaving it unsaid is the
 "fix the class" review round waiting to happen.
 
-The per-claim age timer is `unref`'d and **fires once**. It does **not** need
-clearing from any of the four existing removal paths — settle, abandon, eviction,
-`finishInjection`. Instead, **on fire it no-ops unless the claim it was created
+The per-claim age timer is `unref`'d and **fires once against a settled or
+replaced claim** — while the injection is still running it re-arms instead (see
+below). It does **not** need
+clearing from any of the four existing removal paths — settle, abandon, eviction
+and `finishInjection`. (§3 lists three; it omits `finishInjection`. Four is
+correct.) Instead, **on fire it no-ops unless the claim it was created
 for is still the live one**:
 
 ```
@@ -317,6 +532,24 @@ pendingReplyClaims.get(reqId) === claim && claim.abandonReason === undefined
 Identity, not key — the same discipline `finishInjection` already uses, and for
 the same reason: after a takeover the key may belong to a replacement owner, and
 a stale timer must never act on someone else's claim.
+
+**And while `claim.injectionActive` is true it RE-ARMS for another deadline
+period** rather than dying (§3, §4b). Corrected in v6.
+
+v5 said "no-ops and is gone", which opened a hole the size of the original bug:
+claim registered at t=0, turn runs 20 minutes, timer fires at 15 and finds the
+injection active, no-ops, **and is gone**. The callback returns at 20 without
+publishing a reply, `finishInjection` finds no `abandonReason` and returns — and
+the claim renews forever. That is #28's original state **with the mechanism
+installed and silent**, and it is Mode 2 by this document's own definition.
+
+Re-arming keeps §4b's guarantee intact: still no `abandonReason` recorded while
+the injection runs, so the answered-but-released corruption cannot occur, and the
+claim is re-examined once the callback has exited.
+
+**Note:** `pendingReplyClaims.get()` is an LRU touch, so a fire against a live
+claim moves it to most-recently-used. Harmless at this scale and at a one-shot
+timer's frequency, but recorded so nobody discovers it as a surprise.
 
 This keeps all four removal paths untouched, which matters because each of them
 was reviewed independently and none should acquire a new obligation.
@@ -406,34 +639,57 @@ Nothing in this design changes any of that.
 
 ## 9. Tests
 
-1. A claim whose age exceeds the deadline is **released** via
-   `abandonRepliedClaim` — entry deleted, `stopRenewing()` called, row released
-   by owner. Mutate by removing the release and watch it fail.
-2. The deadline is measured from **registration**, not from the callback
-   returning: a fast `injectIntoSession` followed by a long silence still fires.
-   **This is the load-bearing test** — v1 attached the deadline to the wrong
-   await, and without this the suite passes with that error reintroduced.
-3. The timer **no-ops on fire when the claim was already settled**, and again
-   when it was **replaced by a takeover under the same `reqId`** — asserting the
-   identity check, not the key lookup. The second half protects a replacement
-   owner, and it **must force a lapse to set up**, because release deletes the
-   row and no takeover under the same `reqId` can follow it (§7). The existing
-   test at `src/fleet-bus.test.ts:892-925` shows the setup: a raw
-   `UPDATE lease_until_ms = 0`.
-4. Deferral: age expires **while `injectionActive` is still true** → no immediate
-   release, `abandonReason` recorded, and `finishInjection` performs the release
-   when the callback exits. This is the #25 guarantee and must not regress.
-5. A turn that replies before the deadline releases nothing and records nothing.
-   Only meaningful paired with test 1 — stated so it is not read as standalone
-   coverage.
-6. The deadline is independent of renewal cadence: a short lease with many
-   renewal ticks and a turn shorter than the deadline still does nothing.
-7. `disconnect()` during an active claim leaves renewal running and the row
-   present — the regression guard for v1's withdrawn D4.
-8. **Python divergence vector.** The cancel-then-release behaviour is **already
-   covered** by existing tests in `yugo/test/test_fleet_bus_dedup.py`; this work
-   does not write them, it **registers the divergence** as `known_divergence` per
-   #27's precedent, since the TypeScript port has no equivalent.
+Rebuilt again in v6. Two more were found vacuous, one named an indistinguishable
+alternative, and three were missing.
+
+1. A claim whose age exceeds the deadline, **with `injectionActive` false**, is
+   released via `abandonRepliedClaim` — entry deleted, `stopRenewing()` called,
+   row released by owner.
+2. **FOLDED INTO TEST 1.** v6 kept this as "the deadline is keyed to claim age,
+   not to the `injectIntoSession` await". Under the age-timer rule it makes the
+   same observation test 1 does — release at D regardless of a callback shorter
+   than D. Two tests, one assertion. Merged rather than kept for appearance.
+3. **The timer no-ops when its claim was replaced by a takeover under the same
+   `reqId`** — the identity check, not the key lookup. Setup must force a *lapse*
+   (`src/fleet-bus.test.ts:892`'s raw `UPDATE lease_until_ms = 0`), since release
+   deletes the row.
+4. **The §4b guard, and it does NOT prove re-arm.** The timer records no
+   `abandonReason` while `injectionActive` is true, and the claim settles normally
+   if the session then replies. **Labelled weak in v7:** the observable outcome is
+   identical under v5's fire-once no-op, so this discriminates only against the
+   *deferring* variant. Re-arm is proven by test 5 alone — or strengthen this one
+   by observing a second fire.
+5. **NEW — the hole v5 opened.** Callback longer than the deadline, returning
+   **without** a reply: the re-armed timer must release it. Under v5's fire-once
+   rule this claim renewed forever with the mechanism installed and silent.
+6. **NEW — late reply after release still publishes.** The tripwire for §4's "do
+   not clear `receiveLedger`", which until now had no test at all despite the
+   design naming it as a property.
+7. **NEW — a deadline outside `leaseMs <= d < dedupTtlMs` is refused at
+   construction**, both bounds.
+8. **`request()` publishes exactly once per envelope id — per SENDER, not per
+   port.** §4 promised this tripwire and v5's §9 never listed it. Scope must
+   include **codex-container**, which is the fleet's dominant sender of `.request`
+   frames and was outside the original survey entirely.
+9. The deadline is independent of renewal cadence. **Passes with the mechanism
+   absent** — a coupling guard, not coverage.
+10. A turn that replies before the deadline releases nothing. **Vacuous on its
+    own** — after a settle the key is gone, so any implementation passes. Kept
+    only as a pair with test 1, and labelled.
+11. `disconnect()` during an active claim leaves renewal running. **Vacuous by
+    construction**, since this design touches nothing in `disconnect()`. Kept as a
+    regression guard for v1's withdrawn D4 and labelled as such.
+12. **Python divergence.** Already covered by `yugo/test/test_fleet_bus_dedup.py`
+    (parametrized `CancelledError`; cancel mid-publish). The `known_divergence`
+    conformance vectors carry envelope `accept|reject` verdicts and **cannot
+    represent a cancellation lifecycle** — record the divergence in SPEC §6.4
+    prose instead.
+
+**Tests 4, 9, 10 and 11 are labelled weak on purpose, and test 2 was deleted
+rather than kept.** A suite that hides which of its tests cannot fail is worse
+than a smaller one — and across v5, v6 and v7 an outside reviewer found a vacuous
+test in this list every single time, so the labels are the honest response to a
+measured tendency, not modesty.
 
 ## Open question for review
 
@@ -450,9 +706,10 @@ What I now propose, and what I want argued with:
 - **Default-on, still** — because the leak in §4 is real and grows linearly, and
   releasing is free on current evidence. The release should happen whether or not
   anyone reads the audit line.
-- **Named for what it catches**: `claude_discord_adapter_claim_unanswered`, not
-  `claim_age_exceeded` and certainly not anything with "hung" in it. It detects
-  an unanswered request, which on this fleet is the *common* case.
+- **Named for the point in time**, not a cause:
+  `claude_discord_adapter_claim_deadline_released`. Settled in §3 — a name
+  asserting *why* the claim never settled would be a guess, and the most common
+  answer is not the one v3-v5 assumed.
 - **Fire rate documented next to the constant**, with the measurement and its
   date, so the first person to see it in a log does not open an incident.
 
