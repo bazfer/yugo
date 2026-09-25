@@ -46,6 +46,13 @@ def _bus_env(tmp_path: Path, **overrides) -> dict[str, str]:
         "FLEET_BUS_TOKEN_FILE": str(token),
         "FLEET_BUS_MANIFEST_PATH": str(manifest),
         "FLEET_BUS_AUDIT_LOG": str(tmp_path / "audit.jsonl"),
+        # Load-bearing since this helper's callers now pin the dedup default.
+        # `_import_bot` merges {**os.environ, **env_overrides}, so a developer
+        # with YUGO_DEDUP_STORE_PATH exported gets a local-only failure on the
+        # very test whose job is to pin that value — and it looks like a code
+        # bug. Every other key this test depends on is set explicitly; so is
+        # this one now.
+        "YUGO_DEDUP_STORE_PATH": "",
     }
     env.update(overrides)
     return env

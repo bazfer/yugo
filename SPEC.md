@@ -312,7 +312,11 @@ it; it is recorded here because the identical claim was living in two places and
 only one was fixed.
 
 **So: the yugo Python adapter is a file-backed participant in a store shared by
-OTHER PYTHON PROCESSES POINTED AT THE SAME FILE.** Cross-process suppression
+OTHER PYTHON PROCESSES POINTED AT THE SAME FILE.** Note that the default path is
+**per bot name** (`<bot_name>-dedup.sqlite`), so in the shipped topology the
+participant set is a single process and the cross-process suppression described
+here is real but currently unexercised — measured 2026-09-25: three accessors,
+three files, no sharing. Cross-process suppression
 works for it by the same mechanism and to the same degree as the TypeScript port
 — but **never in the same store as it.**
 
@@ -334,8 +338,8 @@ drops every inbound envelope for as long as it runs** — no dedup, no delivery,
 one audit line per message.
 
 This correction was itself over-broad on first writing. It said suppression
-applies to Python "exactly as it does to the TypeScript port", placed three lines
-below the definition of a functioning store as "the same logical database and key
+applies to Python "exactly as it does to the TypeScript port", in this same
+corrected block, under a definition requiring "the same logical database and key
 space for every participant" — which reads as though the two ports could be
 participants in one store. That is the same defect as the claim being corrected,
 pointing the other way, and it was caught in review before merge.
