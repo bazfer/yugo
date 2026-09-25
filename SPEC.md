@@ -295,9 +295,58 @@ nothing is suppressed.
 
 **"Functioning store"** means: the same logical database and key space for every
 participant, each participant following the claim protocol, and SQLite's
-transaction, uniqueness and locking guarantees intact. The Python adapter's
+transaction, uniqueness and locking guarantees intact.
+
+**Corrected 2026-09-25.** This paragraph previously said "The Python adapter's
 default of `:memory:` satisfies none of this across processes — there is no
-shared store, so no cross-process suppression exists at all.
+shared store, so no cross-process suppression exists at all." **That default is
+wrong.** `load_config_from_env` resolves `/var/lib/yugo/<bot_name>-dedup.sqlite`
+and `yugo/bot.py` uses that loader; the `:memory:` in the
+`DurableEnvelopeDedupStore` construction is the **constructor fallback** for a
+config carrying no path, which the production startup path never produces. (Named
+by function rather than line number deliberately — line numbers in a long-lived
+document drift invisibly.)
+
+The same error appeared in the #26 design document, where Codex and Ohm caught
+it; it is recorded here because the identical claim was living in two places and
+only one was fixed.
+
+**So: the yugo Python adapter is a file-backed participant in a store shared by
+OTHER PYTHON PROCESSES POINTED AT THE SAME FILE.** Note that the default path is
+**per bot name** (`<bot_name>-dedup.sqlite`), so in the shipped topology the
+participant set is a single process and the cross-process suppression described
+here is real but currently unexercised — measured 2026-09-25: three accessors,
+three files, no sharing. Cross-process suppression
+works for it by the same mechanism and to the same degree as the TypeScript port
+— but **never in the same store as it.**
+
+**The two ports' schemas are incompatible and must never be pointed at one
+path.** TypeScript declares `first_seen_ms` / `lease_until_ms` as `INTEGER`;
+Python declares `first_seen_s` / `lease_until_s` as `REAL`. Same table name, same
+index name, different columns. `docs/SPEC-26-clock-step-lease-fencing.md` states
+this as a prohibition rather than an impossibility, and that is the right framing:
+nothing stops a misconfiguration, so the failure is worth naming.
+
+**What that misconfiguration does**, reproduced 2026-09-25: point both ports at
+one path via `YUGO_DEDUP_STORE_PATH`, with the TypeScript port creating the file
+first. The Python constructor **succeeds silently**, because
+`CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` both match on name
+and no-op against the foreign schema. Every subsequent `claim()` then raises
+`no such column: first_seen_s`, which the adapter catches and records as a
+`yugo_dedup_store_failed` drop. **The bot boots clean, heartbeats normally, and
+drops every inbound envelope for as long as it runs** — no dedup, no delivery,
+one audit line per message.
+
+This correction was itself over-broad on first writing. It said suppression
+applies to Python "exactly as it does to the TypeScript port", in this same
+corrected block, under a definition requiring "the same logical database and key
+space for every participant" — which reads as though the two ports could be
+participants in one store. That is the same defect as the claim being corrected,
+pointing the other way, and it was caught in review before merge.
+
+`:memory:` remains a legitimate configuration, and when it is configured the
+paragraph's original reasoning holds for that consumer: no file, no sharing, no
+cross-process suppression. It is a deliberate choice, not the default.
 
 Precisely what holds:
 
