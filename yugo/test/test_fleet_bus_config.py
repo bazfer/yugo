@@ -206,7 +206,7 @@ def test_defaults_match_the_documented_env_surface(tmp_path):
         _bus_env(tmp_path, FLEET_BUS_URL="", FLEET_BUS_AUDIT_LOG=""),
         "import bot; c = bot.BUS_CONFIG; "
         "print(c.url, c.audit_log_path, c.user, c.heartbeat_interval_s, "
-        "c.max_envelope_bytes, c.plugin_version)",
+        "c.max_envelope_bytes, c.dedup_store_path, c.plugin_version)",
     )
     assert r.returncode == 0, f"stderr={r.stderr!r}"
     assert r.stdout.split() == [
@@ -215,6 +215,13 @@ def test_defaults_match_the_documented_env_surface(tmp_path):
         "yugo",  # FLEET_BUS_USER blank -> BOT_NAME
         "30.0",  # SPEC/TS heartbeat cadence
         "1044480",  # DEFAULT_MAX_ENVELOPE_BYTES, matches fleet-bus.ts
+        # SPEC §6.4 asserts the Python adapter is a FILE-BACKED participant in a
+        # shared store. Nothing enforced that. Drop the `or "/var/lib/yugo/..."`
+        # in load_config_from_env and this path becomes "" -> falsy -> the
+        # `:memory:` constructor fallback, silently making §6.4 wrong again
+        # while the whole suite stayed green. §6.4 previously carried exactly
+        # that wrong claim, so pin the default rather than narrate it.
+        "/var/lib/yugo/yugo-dedup.sqlite",
         # Read from the module rather than pinned as a literal: this test is
         # about DEFAULTS, and a hardcoded version turns every slice bump into
         # an unrelated red. `test_packaging` is what pins the version itself.
