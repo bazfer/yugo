@@ -295,9 +295,26 @@ nothing is suppressed.
 
 **"Functioning store"** means: the same logical database and key space for every
 participant, each participant following the claim protocol, and SQLite's
-transaction, uniqueness and locking guarantees intact. The Python adapter's
+transaction, uniqueness and locking guarantees intact.
+
+**Corrected 2026-09-25.** This paragraph previously said "The Python adapter's
 default of `:memory:` satisfies none of this across processes — there is no
-shared store, so no cross-process suppression exists at all.
+shared store, so no cross-process suppression exists at all." **That default is
+wrong.** `load_config_from_env` resolves
+`/var/lib/yugo/<bot_name>-dedup.sqlite` (`yugo/fleet_bus.py:1377-1378`) and
+`yugo/bot.py:152` uses that loader. The `:memory:` at `fleet_bus.py:1433` is the
+**constructor fallback** for a config carrying no path, which the production
+startup path never produces.
+
+The same error appeared in the #26 design document, where Codex and Ohm caught
+it; it is recorded here because the identical claim was living in two places and
+only one was fixed. A Python consumer **is** a file-backed participant in a
+shared store, and cross-process suppression applies to it exactly as it does to
+the TypeScript port.
+
+`:memory:` remains a legitimate configuration, and when it is configured the
+paragraph's original reasoning holds for that consumer: no file, no sharing, no
+cross-process suppression. It is a deliberate choice, not the default.
 
 Precisely what holds:
 
