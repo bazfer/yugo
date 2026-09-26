@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: v3.3 — Release 1 MERGED (undeployed); Release 2 gated; §8 pending review (2026-09-24)
+status: v4.0 — §1 condition 4 AMENDED after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -111,8 +111,65 @@ The four conditions:
    object they belong to. Stating it as namespace identity claimed more than the
    check delivers and more than the design needs.
 4. Clock API named explicitly, not "monotonic milliseconds":
-   **TS `process.hrtime.bigint()`**, **Python `time.monotonic_ns()`**. Both are
-   `CLOCK_MONOTONIC`; both survive a wall-clock step; neither is process-relative.
+   **TS: `clock_gettime(CLOCK_MONOTONIC)` read through `bun:ffi`** (see §1a).
+   **Python: `time.monotonic_ns()`.**
+
+   **AMENDED 2026-09-26. The previous version named `process.hrtime.bigint()` for
+   TypeScript and asserted "neither is process-relative". THAT IS FALSE ON BUN,
+   which is the runtime we deploy.**
+
+   Measured on one host, one boot, zero time-namespace offsets:
+
+   | Source | Reading |
+   |---|---|
+   | Bun parent process | 31,489,026 ns |
+   | Bun child process | 36,181,598 ns |
+   | Python `time.monotonic_ns()` | 3,364,095,287,444,575 ns |
+   | Node `process.hrtime.bigint()` | 3,364,095,323,159,358 ns |
+
+   Python and Node agree to within 36 microseconds — both read host monotonic,
+   roughly 39 days of uptime. **Bun returns tens of milliseconds: time since
+   process start.** Two Bun processes therefore have unrelated epochs and their
+   monotonic values are not comparable at all.
+
+   **This was worse than the defect the document exists to fix.** The clock-step
+   defect needs an NTP correction to fire. This fires on every pair of Bun
+   processes, deterministically: `conformance/lease-clock-bun-repro.ts`
+   demonstrates an older Bun process taking a younger process's 200 ms lease
+   **10 ms after acquisition, while the original owner is still alive**, with no
+   wall-clock step involved. Shipping Release 2 against the old condition 4 would
+   have made takeover *more* likely, not less.
+
+   Found by Vec during implementation, who stopped for a ruling rather than
+   substituting a clock. **§6 test 15 exists precisely to catch this** — it binds
+   the assertion to the actual APIs rather than to `/proc/uptime` — and it is what
+   caught it. Reviewed and ruled on by Ohm, who noted his earlier approval missed
+   the false premise.
+
+## 1a. The TypeScript clock adapter — requirements
+
+Ruled by Ohm, 2026-09-26, as conditions on the amendment above.
+
+- **An isolated `bun:ffi` adapter** reading `clock_gettime(CLOCK_MONOTONIC)`. It
+  is the syscall Node and Python already call; this makes Bun read the same clock
+  rather than approximating it.
+- **A named, explicit supported ABI and runtime.** The binding is
+  platform-specific and must say so rather than assuming.
+- **Fail closed on initialization or read error. NO ALTERNATE-CLOCK FALLBACK.** A
+  consumer that cannot read the host monotonic clock refuses to consume, per §1's
+  startup rule. Falling back to a process-relative clock would reintroduce exactly
+  this defect at the moment the primary path broke.
+- **`/proc/uptime` is REJECTED as a fallback**, and the reason is sharper than the
+  resolution argument that was first offered for it: **`/proc/uptime` includes
+  suspend time and `CLOCK_MONOTONIC` does not.** It is a different clock domain,
+  not a coarser reading of the same one. Mixing the two would produce
+  disagreements that look exactly like the bug being fixed.
+- **Keep the actual-API, cross-process lease and mutation tests in CI.** The
+  premise failed once because it was asserted rather than measured; the tests that
+  caught it must not be weakened into mocks.
+- **Record `bun:ffi`'s experimental status as a release risk.** It is not a reason
+  to avoid the approach, but it belongs in the rollout notes rather than being
+  discovered later.
 
 ### Measured on the live deployment, 2026-09-24
 
@@ -394,9 +451,27 @@ never that they test anything.
 14. **Boot-ID read failure on a NEW-format row refuses takeover** — the precise
     case: unreadable boot ID, then a forward wall-clock step, against an unexpired
     monotonic claim. Must refuse, not fall through to wall-clock.
-15. Cross-port clock agreement asserts against **actual `process.hrtime.bigint()`
-    and `time.monotonic_ns()` values** — `/proc/uptime` was supporting evidence for
-    the design, not verification of the chosen APIs' shared epoch.
+15. Cross-port clock agreement asserts against the **actual clock APIs** — the
+    `bun:ffi` `clock_gettime(CLOCK_MONOTONIC)` adapter (§1a) and
+    `time.monotonic_ns()` — never against `/proc/uptime` and never against mocked
+    values. `/proc/uptime` was supporting evidence for the design, not verification
+    of the chosen APIs' shared epoch.
+
+    **This test is the reason the Bun premise was caught rather than shipped.** The
+    old condition 4 asserted a property of `process.hrtime.bigint()` that was
+    false; binding the assertion to the real API is what surfaced it. Amended in
+    v4.0 to name the FFI adapter, and **it must not be weakened into a mock** — the
+    whole value is that it measures rather than restates.
+
+15a. **Two live Bun processes bracket a Python reading.** The FFI adapter's
+    output from an older and a younger Bun process must fall either side of a
+    `time.monotonic_ns()` reading taken between them. This is the direct inverse of
+    the failure: under `process.hrtime.bigint()` both Bun values were tens of
+    milliseconds while Python's was ~39 days, so no bracketing was possible.
+
+15b. **Fail-closed on FFI error.** With the adapter's initialisation forced to
+    fail, the consumer refuses to consume (§1a) and does **not** fall back to any
+    other clock. Mutate by adding a fallback and watch this go red.
 
 ## 7. The load-bearing assumption — RESOLVED
 
