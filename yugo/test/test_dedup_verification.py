@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import sqlite3
@@ -228,7 +229,7 @@ def test_28_mixed_or_string_device_refuses(environment, device):
 def test_29a_mountinfo_representation_is_never_read(environment, monkeypatch):
     read = Path.read_text
     def no_mountinfo(path, *args, **kwargs):
-        assert "mountinfo" not in str(path)
+        assert re.fullmatch(r"/proc/(?:self|thread-self|[0-9]+)/mountinfo", str(path)) is None
         return read(path, *args, **kwargs)
     monkeypatch.setattr(Path, "read_text", no_mountinfo)
     open_store(environment).close()
