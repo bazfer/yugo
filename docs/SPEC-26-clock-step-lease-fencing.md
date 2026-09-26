@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: v4.0 — §1 condition 4 AMENDED after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
+status: v4.0c — §1 condition 4 AMENDED after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -138,7 +138,14 @@ The four conditions:
    processes, deterministically: `conformance/lease-clock-bun-repro.ts`
    demonstrates an older Bun process taking a younger process's 200 ms lease
    **10 ms after acquisition, while the original owner is still alive**, with no
-   wall-clock step involved. Shipping Release 2 against the old condition 4 would
+   wall-clock step involved.
+
+   **That file is not in this repository yet.** It lives on Vec's implementation
+   branch at commit `2c5adfe861ac58f9b625db8b412e1c86fb1b7f50`
+   (`vec/26-release-2-clock-fencing`), alongside `conformance/lease-clock.py` and
+   `src/clock-fencing.test.ts`. Cited by immutable SHA rather than branch name,
+   because a branch pointer moves and this citation is evidence. It lands in the
+   repository with the Release 2 PR. Shipping Release 2 against the old condition 4 would
    have made takeover *more* likely, not less.
 
    Found by Vec during implementation, who stopped for a ruling rather than
@@ -172,6 +179,36 @@ Ruled by Ohm, 2026-09-26, as conditions on the amendment above.
   to avoid the approach, but it belongs in the rollout notes rather than being
   discovered later.
 
+### 1a.1 Native result validation — what counts as a usable reading
+
+A syscall through FFI can return successfully and still hand back something
+unusable. Each of these is a **refusal** under §1a's fail-closed rule, never a
+fallback:
+
+- **A non-zero return code** from `clock_gettime`.
+- **A negative or zero `tv_sec`**, or a `tv_nsec` outside `[0, 999_999_999]`.
+  These indicate a marshalling error, not a clock reading.
+- **A reading that moves backwards within one process.** `CLOCK_MONOTONIC` cannot;
+  if it appears to, the struct is being read wrongly.
+- **A magnitude implausible against the host's uptime.** `/proc/uptime` is a sanity
+  BOUND here and explicitly **not** the clock (§1a) — it is the check that would
+  have caught the Bun failure immediately, since tens of milliseconds against 39
+  days of uptime is not a plausible host monotonic reading.
+
+### 1a.2 ABI qualification — what "supported runtime" means concretely
+
+The binding is platform-specific and must state its assumptions rather than
+inherit them:
+
+- **`struct timespec` layout**: two 64-bit fields, `tv_sec` then `tv_nsec`. A
+  32-bit `time_t` platform is unsupported, not silently reinterpreted.
+- **The symbol's provenance**: glibc and musl both expose `clock_gettime`, but the
+  containers run musl (Alpine-based). Name which was qualified.
+- **`CLOCK_MONOTONIC`'s numeric value is 1 on Linux** and must be asserted, not
+  assumed from a header the FFI layer never reads.
+- **Refuse on any unqualified platform at startup**, rather than attempting the
+  call and interpreting whatever comes back.
+
 ### Measured on the live deployment, 2026-09-24
 
 ```
@@ -183,10 +220,21 @@ host uptime (/proc/uptime), sampled sequentially
 host 3112047.18   vec 3112047.29   ohm 3112047.36
 ```
 
-Containers read the host's `boot_id` and are not in a separate time namespace; the
-~0.2 s spread is three sequential `docker exec` calls, not an offset. Re-runnable:
+Containers read the host's `boot_id`, and the ~0.2 s spread is three sequential
+`docker exec` calls rather than an offset. Re-runnable:
 `cat /proc/sys/kernel/random/boot_id` and `awk '{print $1}' /proc/uptime`, on the
 host and inside each container.
+
+**What this evidence does NOT establish**, corrected in v4.0c after Ohm flagged
+the claim surviving a rewrite: **matching `boot_id` values and close `/proc/uptime`
+readings do not prove the absence of a time namespace.** Earlier versions asserted
+"no time namespace in use" and then "not in a separate time namespace" from exactly
+this data, and neither follows from it.
+
+**The actual check is `/proc/self/timens_offsets`** (§8.1): a zero `monotonic`
+offset is what establishes the clock domain, and it is measured per consumer at
+startup rather than inferred from a topology snapshot. This block is evidence of
+shared *boot identity* and nothing more.
 
 **`/proc/uptime` is used here as EVIDENCE OF SHARED TOPOLOGY ONLY — it is not the
 lease clock and must never be.** It includes suspend time and `CLOCK_MONOTONIC`
@@ -485,9 +533,21 @@ never that they test anything.
        must hold across both. This is `conformance/lease-clock-bun-repro.ts`'s
        scenario inverted into a passing assertion.
 
+    Two further cases Ohm required, both two-process and both against the real
+    lease path:
+
+    c. **Reverse owner.** The younger process must not take the OLDER process's
+       live lease either. The observed failure ran older-steals-younger; asserting
+       only that direction would leave a sign error uncaught.
+    d. **Post-expiry takeover still works.** Once a lease genuinely expires, the
+       rival MUST be able to take it. A fix that refuses everything passes (b) and
+       (c) trivially, and this is the case that distinguishes "correctly fenced"
+       from "broken closed".
+
     **Mutate the PRODUCTION lease clock**, not the test's: point it back at
-    `process.hrtime.bigint()` and half (b) must fail. An adapter-only test passes
-    under that mutation, which is what made the first version insufficient.
+    `process.hrtime.bigint()` and halves (b) and (c) must fail while (d) still
+    passes. An adapter-only test passes under that mutation, which is what made the
+    first version insufficient.
 
 15b. **Fail-closed on FFI error, at INITIALISATION *and* on every read.**
     Amended after Ohm observed that an init-only test lets a fallback added after
