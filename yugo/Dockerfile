@@ -22,6 +22,8 @@ COPY yugo/version.py .
 COPY yugo/entrypoint.sh .
 COPY yugo/history.py .
 COPY yugo/fleet_bus.py .
+COPY yugo/dedup_verification.py .
+COPY yugo/dedup_admin.py .
 COPY yugo/tools.py .
 COPY yugo/filesystem_tools.py .
 COPY yugo/http_tools.py .

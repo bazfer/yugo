@@ -12,7 +12,7 @@ import {
   DEFAULT_DEDUP_CLAIM_DEADLINE_MS,
   DEFAULT_DEDUP_TTL_MS,
   DEFAULT_PAYLOAD_BODY_MAX_BYTES,
-  DurableEnvelopeDedupStore,
+  DurableEnvelopeDedupStore as VerifiedDedupStore,
   FixedWindowBucket,
   FleetBus,
   RESERVED_BOT_NAMES,
@@ -34,6 +34,15 @@ import {
   type TokenBucket,
   DEFAULT_DEDUP_LEASE_MS,
 } from './fleet-bus'
+
+import { provisionTestStore } from './dedup-test-fixtures'
+// Explicit test fixture provisioning, not a consumer auto-create path.
+class DurableEnvelopeDedupStore extends VerifiedDedupStore {
+  constructor(path: string, ttl = DEFAULT_DEDUP_TTL_MS, lease = DEFAULT_DEDUP_LEASE_MS) {
+    if (path !== ':memory:') process.env.YUGO_DEDUP_VERIFICATION_RECORD = provisionTestStore(path)
+    super(path, ttl, lease)
+  }
+}
 
 const jc = JSONCodec()
 const allowlist = normalizeAllowlist(['luna', 'deet', 'kat', 'vec', 'ohm', 'myc', 'helm'])
@@ -110,6 +119,7 @@ describe('durable envelope dedup', () => {
     expect(rival.claim('long-turn', 'rival', 104_500).duplicate).toBe(true)
 
     // Owner dies. Recovery still works — that is the at-least-once half.
+    new Database(path).exec('UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1')
     expect(rival.claim('long-turn', 'rival', 200_000).duplicate).toBe(false)
     // And the original owner is now fenced: its completion must not land.
     expect(owner.complete('long-turn', claim.owner!)).toBe(false)
@@ -142,6 +152,7 @@ describe('durable envelope dedup', () => {
     const crashed = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
     expect(crashed.claim('pending', 'original', 100)).toMatchObject({ duplicate: false, reqId: 'original' })
     const restarted = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
+    new Database(path).exec('UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1')
     expect(restarted.claim('pending', 'replacement', 111)).toMatchObject({ duplicate: false, reqId: 'original' })
   })
 })
@@ -457,6 +468,9 @@ function fakeMessage(subject: string, envelope: unknown): Msg {
 
 class TestFleetBus extends FleetBus {
   constructor(config: FleetBusConfig, allowed: ReadonlySet<string>) {
+    if (config.dedupStorePath && config.dedupStorePath !== ':memory:') {
+      process.env.YUGO_DEDUP_VERIFICATION_RECORD = provisionTestStore(config.dedupStorePath)
+    }
     super({ ...config, dedupStorePath: config.dedupStorePath ?? ':memory:' }, allowed)
   }
   attachFakeNc(nc: FakeNatsConnection): void {
@@ -922,7 +936,7 @@ describe('request session injection', () => {
     // waiting, which renewal would otherwise defeat. The store preserves the
     // ORIGINAL reqId and issues a NEW owner, which is the whole point.
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-owner')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('stale-owner')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -967,7 +981,7 @@ describe('request session injection', () => {
 
     // Force the takeover #26 admits: same reqId, new owner, new attempt token.
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-reply')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('stale-reply')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -1012,7 +1026,7 @@ describe('request session injection', () => {
     const oldTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('token-matrix')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('token-matrix')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -1100,7 +1114,7 @@ describe('request session injection', () => {
     expect(first.duplicate).toBe(false)
     const ownerA = first.owner!
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('rel-own')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('rel-own')
     raw.close()
 
     // B takes over the SAME envelope; reqId is preserved, owner is new.
@@ -1154,7 +1168,7 @@ describe('request session injection', () => {
     const oldTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('hop-token')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('hop-token')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -1235,6 +1249,7 @@ describe('request session injection', () => {
     // PR's durable store would otherwise have introduced: before it, the
     // ledger was in-memory and a restart simply cleared it.
     const store = new DurableEnvelopeDedupStore(dedupStorePath)
+    new Database(dedupStorePath).exec('UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1')
     const row = store.claim('restart-duplicate', 'after-lease', Date.now() + DEFAULT_DEDUP_LEASE_MS + 1)
     expect(row.duplicate).toBe(false)
   })
@@ -2555,7 +2570,7 @@ describe('pending claim age deadline', () => {
     // t≈0: claim A registered, its deadline due at t≈500.
     await sleep(150)
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('deadline-takeover')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('deadline-takeover')
     raw.close()
     await bus.handleRequest(wire)
     // t≈150: claim B takes the lapsed row and replaces A under the same key.
@@ -3009,7 +3024,7 @@ describe('FixedWindowBucket', () => {
 describe('publish-only mode', () => {
   test('connect() skips subscriptions and heartbeat', async () => {
     const nc = new FakeNatsConnection()
-    const bus = new FleetBus({
+    const bus = new FleetBus({ dedupStorePath: ':memory:',
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       mode: 'publish-only',
       connectFn: async () => nc as unknown as NatsConnection,
@@ -3023,7 +3038,7 @@ describe('publish-only mode', () => {
 
   test('publishReply returns multi_instance_publish_only', async () => {
     const nc = new FakeNatsConnection()
-    const bus = new FleetBus({
+    const bus = new FleetBus({ dedupStorePath: ':memory:',
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       mode: 'publish-only',
       connectFn: async () => nc as unknown as NatsConnection,
@@ -3037,7 +3052,7 @@ describe('publish-only mode', () => {
 
   test('request({wait:true}) returns multi_instance_publish_only', async () => {
     const nc = new FakeNatsConnection()
-    const bus = new FleetBus({
+    const bus = new FleetBus({ dedupStorePath: ':memory:',
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       mode: 'publish-only',
       connectFn: async () => nc as unknown as NatsConnection,
@@ -3051,7 +3066,7 @@ describe('publish-only mode', () => {
 
   test('request({wait:false}) still publishes in publish-only mode', async () => {
     const nc = new FakeNatsConnection()
-    const bus = new FleetBus({
+    const bus = new FleetBus({ dedupStorePath: ':memory:',
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       mode: 'publish-only',
       connectFn: async () => nc as unknown as NatsConnection,
@@ -3068,7 +3083,7 @@ describe('publish-only mode', () => {
 describe('supervisor loop', () => {
   test('reconnects after the underlying NATS connection closes', async () => {
     const connections: FakeNatsConnection[] = []
-    const bus = new FleetBus({
+    const bus = new FleetBus({ dedupStorePath: ':memory:',
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       supervisorSleepMs: 10,
       connectFn: async () => {
@@ -3090,7 +3105,7 @@ describe('supervisor loop', () => {
   })
 
   test('runSupervisor helper returns bus + done promise', async () => {
-    const { bus, done } = runSupervisor({
+    const { bus, done } = runSupervisor({ dedupStorePath: ':memory:',
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       supervisorSleepMs: 10,
       connectFn: async () => new FakeNatsConnection() as unknown as NatsConnection,
@@ -3106,7 +3121,7 @@ describe('supervisor loop', () => {
     // the caller thought was torn down.
     let releaseConnect: (() => void) | null = null
     const connections: FakeNatsConnection[] = []
-    const bus = new FleetBus({
+    const bus = new FleetBus({ dedupStorePath: ':memory:',
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       supervisorSleepMs: 10,
       connectFn: async () => {

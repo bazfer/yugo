@@ -9,6 +9,28 @@ import fleet_bus
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def provision_test_stores(monkeypatch):
+    """Explicit fixture provisioning; never bypass the production startup gate."""
+    import os
+    from pathlib import Path
+    from dedup_admin import provision
+    base = fleet_bus.DurableEnvelopeDedupStore
+    class TestStore(base):
+        def __init__(self, path, *args, **kwargs):
+            if path != ":memory:":
+                record = str(path) + ".verification.json"
+                evidence = dict(device_path="test", mount_point="unresolved", fstype="unresolved",
+                                mount_id_source="unresolved", backing="local-virtual",
+                                determined_by="test fixture", inspected_at="2026-09-24T19:00:00Z")
+                inventory = [dict(process="test", user="test", path=str(path), method="fixture")]
+                provision(str(path), record, "python", "test", evidence, inventory,
+                          record_only=Path(path).exists())
+                monkeypatch.setenv("YUGO_DEDUP_VERIFICATION_RECORD", record)
+            super().__init__(str(path), *args, **kwargs)
+    monkeypatch.setattr(fleet_bus, "DurableEnvelopeDedupStore", TestStore)
+
+
 def test_dedup_survives_restart_reports_original_req_id_and_expires(tmp_path):
     path = tmp_path / "dedup.sqlite"
     first = fleet_bus.DurableEnvelopeDedupStore(str(path), ttl_s=fleet_bus.DEFAULT_DEDUP_TTL_S)
@@ -37,6 +59,7 @@ def test_pending_lease_recovers_and_prune_uses_index_with_bounded_batch(tmp_path
     crashed = fleet_bus.DurableEnvelopeDedupStore(str(path), ttl_s=fleet_bus.DEFAULT_DEDUP_TTL_S, lease_s=2)
     assert crashed.claim("pending", "original", now_s=100)[:2] == (False, "original")
     restarted = fleet_bus.DurableEnvelopeDedupStore(str(path), ttl_s=fleet_bus.DEFAULT_DEDUP_TTL_S, lease_s=2)
+    restarted._db.execute("UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1")
     assert restarted.claim("pending", "replacement", now_s=103)[:2] == (False, "original")
     plan = restarted._db.execute(
         "EXPLAIN QUERY PLAN SELECT rowid FROM envelope_dedup_v2 "
@@ -111,6 +134,7 @@ def test_release_does_not_delete_a_replacement_owners_row(tmp_path):
     assert duplicate is False
 
     # A's lease expires; B takes over the same envelope, reqId preserved.
+    store._db.execute("UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1")
     duplicate_b, req_id_b, owner_b = store.claim("rel-own", "req-rel", now_s=110)
     assert duplicate_b is False
     assert owner_b != owner_a
@@ -138,6 +162,7 @@ def test_renew_by_a_lost_owner_does_not_extend_the_winners_lease(tmp_path):
     path = tmp_path / "dedup.sqlite"
     store = fleet_bus.DurableEnvelopeDedupStore(str(path), lease_s=2)
     _, _, owner_a = store.claim("renew-own", "req-renew", now_s=100)
+    store._db.execute("UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1")
     _, _, owner_b = store.claim("renew-own", "req-renew", now_s=110)
     assert owner_b != owner_a
 
@@ -176,6 +201,7 @@ def test_renew_holds_a_live_owner_past_the_original_expiry(tmp_path):
     assert rival.claim("long-turn", "rival", now_s=104.5)[0] is True, "a live owner was overlapped"
 
     # Owner dies. Recovery still works — that is the at-least-once half.
+    rival._db.execute("UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1")
     stolen = rival.claim("long-turn", "rival", now_s=200)
     assert stolen[0] is False, "a dead owner's envelope was never recovered"
     # And the original owner is now fenced: its completion must not land.
