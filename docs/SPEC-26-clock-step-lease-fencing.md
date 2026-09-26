@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: v4.0c — §1 condition 4 AMENDED after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
+status: v4.0d — §1 condition 4 AMENDED after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -179,68 +179,64 @@ Ruled by Ohm, 2026-09-26, as conditions on the amendment above.
   to avoid the approach, but it belongs in the rollout notes rather than being
   discovered later.
 
-### 1a.1 Native result validation — what counts as a usable reading
+### 1a.1 Native result validation — Ohm's normative text, verbatim
 
-A syscall through FFI can return successfully and still hand back something
-unusable. Each of these is a **refusal** under §1a's fail-closed rule, never a
-fallback:
+> Retain the native library handle and use a correctly sized, aligned buffer kept
+> live across the call. Check the C return code before reading output. Require
+> `tv_sec >= 0` and `0 <= tv_nsec < 1e9`. Construct nanoseconds with bigint,
+> divide before Number conversion, and reject unsafe integer milliseconds or
+> deadline overflow. Initialization/read failures, including invalid output, refuse
+> startup or the affected claim/takeover/renewal without authorizing execution or
+> mutating lease metadata, including `:memory:`. No cached, zero, wall-clock,
+> uptime, or calibrated-hrtime substitution is permitted. Qualify the actual
+> deployed OS/architecture/libc/Bun combination before release.
 
-- **A non-zero return code** from `clock_gettime`.
-- **A negative or zero `tv_sec`**, or a `tv_nsec` outside `[0, 999_999_999]`.
-  These indicate a marshalling error, not a clock reading.
-- **A reading that moves backwards within one process.** `CLOCK_MONOTONIC` cannot;
-  if it appears to, the struct is being read wrongly.
-- **A magnitude implausible against the host's uptime.** `/proc/uptime` is a sanity
-  BOUND here and explicitly **not** the clock (§1a) — it is the check that would
-  have caught the Bun failure immediately, since tens of milliseconds against 39
-  days of uptime is not a plausible host monotonic reading.
+**Why bigint is not pedantry.** `2^53` nanoseconds is **104.2 days** of uptime.
+The host running the TypeScript accessor is at **38.9 days** — 37% of the way
+there. A Number-based conversion does not fail loudly at the boundary; it silently
+loses precision in the low digits of a lease deadline, which is precisely where the
+comparison happens.
 
-### 1a.2 ABI qualification — what "supported runtime" means concretely
+**Two requirements v4.0c invented and got wrong. Deleted, not softened:**
 
-The binding is platform-specific and must state its assumptions rather than
-inherit them:
+- **The uptime-magnitude check is REMOVED.** I added it as a "sanity bound", and it
+  was the same domain confusion §1a rejects `/proc/uptime` for, wearing a different
+  hat. A `CLOCK_MONOTONIC` reading can legitimately sit far below `/proc/uptime`
+  after suspend — 39 days of suspended time does not require 39 days of monotonic
+  elapsed time — so any threshold either rejects supported clocks or invents a new
+  deployment precondition. **The epoch test is the cross-process bracketing in §6
+  test 15a. There is no uptime ratio and no tolerance.**
+- **`tv_sec == 0` is VALID.** v4.0c refused `tv_sec <= 0` as a marshalling error. A
+  reading in the first second after boot has `tv_sec == 0` with a good `tv_nsec`.
+  Refuse `tv_sec < 0` only.
+
+### 1a.2 ABI qualification — the deployed combination, measured
+
+**Corrected in v4.0d. v4.0c asserted "the containers run musl (Alpine-based)". That
+is wrong twice over:**
+
+- **The TypeScript accessor is not containerized at all.** It runs on the host —
+  same mount namespace as init, `mnt:[4026531841]`, verified during the Release 1
+  rollout.
+- **The host is glibc**, not musl: Ubuntu GLIBC 2.39. The musl guess came from
+  generalizing about "the containers"; `yugo/Dockerfile` is `python:3.13-slim`,
+  which is Debian, so it would have been wrong for the Python port too.
+
+**Qualify the combination actually measured**, and name it rather than the class:
+
+| | |
+|---|---|
+| Runtime | Bun **1.3.12** (Vec's reproduction was on 1.3.0 — both process-relative) |
+| OS / libc | Ubuntu, GLIBC 2.39 |
+| Architecture | x86_64 |
+| Location | Host, not a container |
 
 - **`struct timespec` layout**: two 64-bit fields, `tv_sec` then `tv_nsec`. A
   32-bit `time_t` platform is unsupported, not silently reinterpreted.
-- **The symbol's provenance**: glibc and musl both expose `clock_gettime`, but the
-  containers run musl (Alpine-based). Name which was qualified.
-- **`CLOCK_MONOTONIC`'s numeric value is 1 on Linux** and must be asserted, not
-  assumed from a header the FFI layer never reads.
-- **Refuse on any unqualified platform at startup**, rather than attempting the
-  call and interpreting whatever comes back.
-
-### Measured on the live deployment, 2026-09-24
-
-```
-host boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
-vec  boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
-ohm  boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
-
-host uptime (/proc/uptime), sampled sequentially
-host 3112047.18   vec 3112047.29   ohm 3112047.36
-```
-
-Containers read the host's `boot_id`, and the ~0.2 s spread is three sequential
-`docker exec` calls rather than an offset. Re-runnable:
-`cat /proc/sys/kernel/random/boot_id` and `awk '{print $1}' /proc/uptime`, on the
-host and inside each container.
-
-**What this evidence does NOT establish**, corrected in v4.0c after Ohm flagged
-the claim surviving a rewrite: **matching `boot_id` values and close `/proc/uptime`
-readings do not prove the absence of a time namespace.** Earlier versions asserted
-"no time namespace in use" and then "not in a separate time namespace" from exactly
-this data, and neither follows from it.
-
-**The actual check is `/proc/self/timens_offsets`** (§8.1): a zero `monotonic`
-offset is what establishes the clock domain, and it is measured per consumer at
-startup rather than inferred from a topology snapshot. This block is evidence of
-shared *boot identity* and nothing more.
-
-**`/proc/uptime` is used here as EVIDENCE OF SHARED TOPOLOGY ONLY — it is not the
-lease clock and must never be.** It includes suspend time and `CLOCK_MONOTONIC`
-does not, so it is a different clock domain (§1a). Labelling it
-"CLOCK_MONOTONIC" here, as an earlier version did, contradicted the amendment in
-the same document.
+- **`CLOCK_MONOTONIC` is 1 on Linux** and must be asserted, not assumed from a
+  header the FFI layer never reads.
+- **Refuse at startup on any unqualified platform** rather than attempting the call
+  and interpreting whatever comes back.
 
 ## 2. Mechanism
 
@@ -544,10 +540,22 @@ never that they test anything.
        (c) trivially, and this is the case that distinguishes "correctly fenced"
        from "broken closed".
 
-    **Mutate the PRODUCTION lease clock**, not the test's: point it back at
-    `process.hrtime.bigint()` and halves (b) and (c) must fail while (d) still
-    passes. An adapter-only test passes under that mutation, which is what made the
-    first version insufficient.
+    **Mutation expectation, Ohm's replacement text verbatim** — v4.0c specified
+    per-case outcomes and they are not derivable:
+
+    > Restoring Bun hrtime in the production lease path must fail the regression
+    > suite, including the older-rival/younger-owner early-takeover case.
+    > Reverse-owner and real-expiry cases must pass with the correct adapter;
+    > individual mutation outcomes depend on process ages and ordering and are not
+    > required to all fail or all pass.
+
+    Why my version was impossible: under a process-relative clock an older owner
+    writes a deadline *ahead* of a younger rival's reading — owner reads 1,200 ms
+    and sets a 1,400 ms deadline, rival reads 20 ms and refuses. So (c) can pass
+    under the bad clock. And after 200 ms of real time that rival may read only
+    220 ms and wrongly refuse the expired 1,400 ms deadline, so (d) need not stay
+    green either. **The suite failing is the assertion; which cases fail is a
+    function of process ages.**
 
 15b. **Fail-closed on FFI error, at INITIALISATION *and* on every read.**
     Amended after Ohm observed that an init-only test lets a fallback added after
@@ -557,10 +565,15 @@ never that they test anything.
     Required cases, each asserting refusal **with no metadata mutation**:
 
     - initialisation forced to fail → consumer refuses to consume;
-    - a **failed or invalid read during `claim`** → refuse, row untouched;
-    - a **failed or invalid read during takeover** → refuse, the existing owner's
-      metadata unchanged;
-    - a **failed or invalid read during renewal** → refuse, lease not extended.
+    - **a non-zero C return code** → refuse before reading the output buffer;
+    - **invalid fields** — `tv_sec < 0`, or `tv_nsec` outside `[0, 1e9)` → refuse
+      (note `tv_sec == 0` is VALID and must pass, §1a.1);
+    - **unsafe integer conversion or deadline overflow** → refuse rather than
+      silently losing precision;
+
+    each at **claim**, **takeover** and **renewal**, asserting refusal with the row
+    untouched, the existing owner's metadata unchanged, and the lease not extended
+    respectively. **Including `:memory:`** — §1a.1 admits no exemption there.
 
     Mutate by adding a fallback clock at each site and watch the corresponding
     case go red. A fallback is the tempting thing to add later, which is exactly
