@@ -12,6 +12,7 @@
   },
   "files": [
     "src/fleet-bus.ts",
+    "src/dedup-verification.ts",
     "schema/envelope.v1.schema.json",
     "SPEC.md",
     "conformance/envelope.v1.vectors.json"

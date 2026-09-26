@@ -66,6 +66,8 @@ import os
 import re
 import sqlite3
 import threading
+import time
+import math
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
@@ -74,6 +76,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, NamedTuple
 
 import yaml
+
+from dedup_verification import open_verified_store, read_boot_id, valid_boot_id, VerificationError
 
 # --- wire constants (must match fleet-bus.ts) ---
 
@@ -1127,27 +1131,28 @@ class DurableEnvelopeDedupStore:
                  lease_s: int = DEFAULT_DEDUP_LEASE_S) -> None:
         if path != ":memory:" and ttl_s < MIN_DEDUP_TTL_S:
             raise ValueError("durable dedup TTL must be at least the 7-day stream max_age")
-        if path != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        # WAL, matching the TypeScript port. Rollback-journal mode costs ~5ms
-        # per claim+complete against ~2.6ms on WAL — per inbound envelope, on
-        # the event-loop thread that also serves NATS callbacks — and lets a
-        # writer block readers file-wide, which is the regime the concurrency
-        # claim below is counting on.
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=5000")
-        self._db.execute(
-            "CREATE TABLE IF NOT EXISTS envelope_dedup_v2 ("
-            "envelope_id TEXT PRIMARY KEY, first_seen_s REAL NOT NULL, req_id TEXT NOT NULL, "
-            "state TEXT NOT NULL CHECK(state IN ('pending','completed')), "
-            "lease_owner TEXT NOT NULL, lease_until_s REAL NOT NULL)"
-        )
-        self._db.execute("CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_s)")
+        if not math.isfinite(lease_s) or lease_s <= 0:
+            raise ValueError("dedup lease must be positive and finite")
+        self._db = open_verified_store(path)
         self._ttl_s = ttl_s
         self._lease_s = lease_s
         self._lock = threading.Lock()
         self._claims = 0
+
+    @staticmethod
+    def _validate_metadata(boot: object, deadline: object) -> None:
+        if boot == "":
+            return  # The supported legacy discriminator, not malformed.
+        if not valid_boot_id(boot) or type(deadline) is not int or not 0 < deadline <= 2**53 - 1:
+            raise VerificationError("malformed new-format lease metadata")
+
+    def _lease_clock(self) -> tuple[str, int, int]:
+        boot = read_boot_id()  # Failure never authorizes a fresh claim or takeover.
+        mono = time.monotonic_ns() // 1_000_000
+        deadline = mono + math.ceil(self._lease_s * 1000)
+        if not 0 <= mono < deadline <= 2**53 - 1:
+            raise VerificationError("invalid monotonic lease clock")
+        return boot, mono, deadline
 
     def claim(self, envelope_id: str, req_id: str, now_s: float | None = None) -> tuple[bool, str, str | None]:
         now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
@@ -1155,37 +1160,51 @@ class DurableEnvelopeDedupStore:
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
+                boot, mono, deadline = self._lease_clock()
                 self._claims += 1
                 if self._claims % DEDUP_PRUNE_EVERY == 0:
                     self.prune(now)
                 self._db.execute(
-                    "DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND first_seen_s < ?",
+                    "DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND state='completed' AND first_seen_s < ?",
                     (envelope_id, now - self._ttl_s),
                 )
                 cursor = self._db.execute(
-                    "INSERT OR IGNORE INTO envelope_dedup_v2 (envelope_id,first_seen_s,req_id,state,lease_owner,lease_until_s) VALUES (?,?,?,'pending',?,?)",
-                    (envelope_id, now, req_id, owner, now + self._lease_s),
+                    "INSERT OR IGNORE INTO envelope_dedup_v2 (envelope_id,first_seen_s,req_id,state,lease_owner,lease_until_s,lease_boot_id,lease_until_mono_ms) VALUES (?,?,?,'pending',?,?,?,?)",
+                    (envelope_id, now, req_id, owner, now + self._lease_s, boot, deadline),
                 )
                 if cursor.rowcount == 1:
                     result = (False, req_id, owner)
+                elif cursor.rowcount != 0:
+                    raise VerificationError("fresh claim affected an unexpected number of rows")
                 else:
                     row = self._db.execute(
-                        "SELECT req_id,state,lease_until_s FROM envelope_dedup_v2 WHERE envelope_id=?",
+                        "SELECT req_id,state,lease_until_s,lease_owner,lease_boot_id,lease_until_mono_ms FROM envelope_dedup_v2 WHERE envelope_id=?",
                         (envelope_id,),
                     ).fetchone()
-                    if row[1] == "pending" and row[2] <= now:
+                    if row is None:
+                        raise VerificationError("fresh claim inserted zero rows without an existing claim")
+                    eligible = False
+                    if row[1] == "pending":
+                        self._validate_metadata(row[4], row[5])
+                        eligible = row[2] <= now if row[4] == "" else (row[4] != boot or row[5] <= mono)
+                    if eligible:
+                        # All ownership metadata changes in ONE conditional write.
+                        # BEGIN IMMEDIATE serializes readers/writers; the snapshot
+                        # predicates also prevent authorizing a zero-row update.
                         changed = self._db.execute(
-                            "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_s=? "
-                            "WHERE envelope_id=? AND state='pending' AND lease_until_s<=?",
-                            (owner, now + self._lease_s, envelope_id, now),
+                            "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_s=?,lease_boot_id=?,lease_until_mono_ms=? "
+                            "WHERE envelope_id=? AND state='pending' AND lease_owner=? "
+                            "AND lease_until_s=? AND lease_boot_id=? AND lease_until_mono_ms=?",
+                            (owner, now + self._lease_s, boot, deadline, envelope_id, row[3], row[2], row[4], row[5]),
                         ).rowcount
-                        result = (False, row[0], owner) if changed else (True, row[0], None)
+                        result = (False, row[0], owner) if changed == 1 else (True, row[0], None)
                     else:
                         result = (True, row[0], None)
-                self._db.execute("COMMIT")
+                self._db.execute("COMMIT")  # Execution is authorized only AFTER commit.
                 return result
             except BaseException:
-                self._db.execute("ROLLBACK")
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
                 raise
 
     @property
@@ -1209,11 +1228,29 @@ class DurableEnvelopeDedupStore:
         """
         now = datetime.now(timezone.utc).timestamp() if now_s is None else now_s
         with self._lock:
-            return self._db.execute(
-                "UPDATE envelope_dedup_v2 SET lease_until_s=? "
-                "WHERE envelope_id=? AND lease_owner=? AND state='pending'",
-                (now + self._lease_s, envelope_id, owner),
-            ).rowcount == 1
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                boot, _, deadline = self._lease_clock()
+                row = self._db.execute(
+                    "SELECT lease_boot_id,lease_until_mono_ms FROM envelope_dedup_v2 "
+                    "WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+                    (envelope_id, owner),
+                ).fetchone()
+                changed = 0
+                if row is not None:
+                    self._validate_metadata(*row)
+                    if row[0] in ("", boot):
+                        changed = self._db.execute(
+                            "UPDATE envelope_dedup_v2 SET lease_until_s=?,lease_boot_id=?,lease_until_mono_ms=? "
+                            "WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+                            (now + self._lease_s, boot, deadline, envelope_id, owner),
+                        ).rowcount
+                self._db.execute("COMMIT")
+                return changed == 1
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
 
     def complete(self, envelope_id: str, owner: str) -> bool:
         """Mark done. False means we no longer owned it, so we did NOT finish it.
@@ -1252,7 +1289,7 @@ class DurableEnvelopeDedupStore:
             batch = min(DEDUP_PRUNE_LIMIT, budget - deleted)
             n = self._db.execute(
                 "DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 "
-                "WHERE first_seen_s < ? ORDER BY first_seen_s LIMIT ?)",
+                "WHERE state='completed' AND first_seen_s < ? ORDER BY first_seen_s LIMIT ?)",
                 (cutoff, batch),
             ).rowcount
             deleted += n
