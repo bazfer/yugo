@@ -127,7 +127,8 @@ The four conditions:
    | Python `time.monotonic_ns()` | 3,364,095,287,444,575 ns |
    | Node `process.hrtime.bigint()` | 3,364,095,323,159,358 ns |
 
-   Python and Node agree to within 36 microseconds — both read host monotonic,
+   Python and Node agree to within **35.7 milliseconds** — both read host
+   monotonic,
    roughly 39 days of uptime. **Bun returns tens of milliseconds: time since
    process start.** Two Bun processes therefore have unrelated epochs and their
    monotonic values are not comparable at all.
@@ -178,14 +179,20 @@ host boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
 vec  boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
 ohm  boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
 
-CLOCK_MONOTONIC (/proc/uptime), sampled sequentially
+host uptime (/proc/uptime), sampled sequentially
 host 3112047.18   vec 3112047.29   ohm 3112047.36
 ```
 
-Containers read the host's `boot_id` and share its monotonic clock; the ~0.2 s
-spread is three sequential `docker exec` calls, not an offset. **No time namespace
-in use.** Re-runnable: `cat /proc/sys/kernel/random/boot_id` and
-`awk '{print $1}' /proc/uptime`, on the host and inside each container.
+Containers read the host's `boot_id` and are not in a separate time namespace; the
+~0.2 s spread is three sequential `docker exec` calls, not an offset. Re-runnable:
+`cat /proc/sys/kernel/random/boot_id` and `awk '{print $1}' /proc/uptime`, on the
+host and inside each container.
+
+**`/proc/uptime` is used here as EVIDENCE OF SHARED TOPOLOGY ONLY — it is not the
+lease clock and must never be.** It includes suspend time and `CLOCK_MONOTONIC`
+does not, so it is a different clock domain (§1a). Labelling it
+"CLOCK_MONOTONIC" here, as an earlier version did, contradicted the amendment in
+the same document.
 
 ## 2. Mechanism
 
@@ -463,15 +470,41 @@ never that they test anything.
     v4.0 to name the FFI adapter, and **it must not be weakened into a mock** — the
     whole value is that it measures rather than restates.
 
-15a. **Two live Bun processes bracket a Python reading.** The FFI adapter's
-    output from an older and a younger Bun process must fall either side of a
-    `time.monotonic_ns()` reading taken between them. This is the direct inverse of
-    the failure: under `process.hrtime.bigint()` both Bun values were tens of
-    milliseconds while Python's was ~39 days, so no bracketing was possible.
+15a. **The two-process LEASE regression, not just an adapter probe.** Amended
+    after Ohm observed the first version verified the clock and not its callers.
 
-15b. **Fail-closed on FFI error.** With the adapter's initialisation forced to
-    fail, the consumer refuses to consume (§1a) and does **not** fall back to any
-    other clock. Mutate by adding a fallback and watch this go red.
+    Two halves, both required:
+
+    a. **Adapter agreement** — the FFI adapter's output from an older and a
+       younger Bun process must bracket a `time.monotonic_ns()` reading taken
+       between them. The direct inverse of the failure: under
+       `process.hrtime.bigint()` both Bun values were tens of milliseconds while
+       Python's was ~39 days, so no bracketing was possible.
+    b. **The actual lease regression, including renewal** — an older Bun process
+       must NOT take a younger process's live lease, and renewal by the true owner
+       must hold across both. This is `conformance/lease-clock-bun-repro.ts`'s
+       scenario inverted into a passing assertion.
+
+    **Mutate the PRODUCTION lease clock**, not the test's: point it back at
+    `process.hrtime.bigint()` and half (b) must fail. An adapter-only test passes
+    under that mutation, which is what made the first version insufficient.
+
+15b. **Fail-closed on FFI error, at INITIALISATION *and* on every read.**
+    Amended after Ohm observed that an init-only test lets a fallback added after
+    successful startup pass — which is the same "forbidden in prose, unenforced in
+    code" failure that survived four rounds on §8.
+
+    Required cases, each asserting refusal **with no metadata mutation**:
+
+    - initialisation forced to fail → consumer refuses to consume;
+    - a **failed or invalid read during `claim`** → refuse, row untouched;
+    - a **failed or invalid read during takeover** → refuse, the existing owner's
+      metadata unchanged;
+    - a **failed or invalid read during renewal** → refuse, lease not extended.
+
+    Mutate by adding a fallback clock at each site and watch the corresponding
+    case go red. A fallback is the tempting thing to add later, which is exactly
+    why each site needs its own failing test rather than one at startup.
 
 ## 7. The load-bearing assumption — RESOLVED
 
