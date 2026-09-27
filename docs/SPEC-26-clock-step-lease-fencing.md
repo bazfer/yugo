@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: v4.0d — §1 condition 4 AMENDED after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
+status: v4.0e — §1 condition 4 AMENDED, APPROVED for implementation after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -191,11 +191,18 @@ Ruled by Ohm, 2026-09-26, as conditions on the amendment above.
 > uptime, or calibrated-hrtime substitution is permitted. Qualify the actual
 > deployed OS/architecture/libc/Bun combination before release.
 
-**Why bigint is not pedantry.** `2^53` nanoseconds is **104.2 days** of uptime.
-The host running the TypeScript accessor is at **38.9 days** — 37% of the way
-there. A Number-based conversion does not fail loudly at the boundary; it silently
-loses precision in the low digits of a lease deadline, which is precisely where the
-comparison happens.
+**Why bigint is required, stated precisely.** `2^53` **nanoseconds** is 104.2 days
+of uptime, and the host running the TypeScript accessor is at 38.9 days. Past that
+boundary a Number-based *nanosecond* intermediate silently loses low-order
+precision rather than failing loudly.
+
+**It is NOT a countdown on the lease** — corrected in v4.0e at Ohm's note, because
+v4.0d's "37% of the way there" implied one. The stored lease is in
+**milliseconds**, and `2^53` milliseconds is roughly 285,000 years. So the
+requirement protects the nanosecond intermediate produced by
+`tv_sec * 1e9 + tv_nsec`; it is not a deadline after which leases break. Construct
+with bigint and **divide before converting to Number**, and the millisecond value
+is never near the boundary.
 
 **Two requirements v4.0c invented and got wrong. Deleted, not softened:**
 
