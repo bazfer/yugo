@@ -5,6 +5,7 @@
 import { readFileSync, realpathSync, statSync, readdirSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { Database } from 'bun:sqlite'
+import { readMonotonicMs } from './monotonic-clock.ts'
 
 export const BOOT_PATH = '/proc/sys/kernel/random/boot_id'
 export const TIMENS_PATH = '/proc/self/timens_offsets'
@@ -166,6 +167,7 @@ export function openVerifiedStore(path: string, recordPath = process.env.YUGO_DE
   let db: Database | undefined
   try {
     checkClockDomain()
+    readMonotonicMs() // Initialization/read failure refuses even :memory:, before writes.
     if (path === ':memory:') {
       readBootId()
       db = new Database(':memory:')

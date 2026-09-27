@@ -11,6 +11,7 @@ import { appendFileSync, chmodSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { homedir } from 'node:os'
 import { Database } from 'bun:sqlite'
+import { readMonotonicMs, checkedDeadline } from './monotonic-clock.ts'
 import { openVerifiedStore, readBootId, validBootId, VerificationError } from './dedup-verification.ts'
 import { parse as parseYaml } from 'yaml'
 
@@ -169,8 +170,8 @@ export class DurableEnvelopeDedupStore {
 
   private leaseClock(): { boot: string; mono: number; deadline: number } {
     const boot = readBootId() // A failed read never authorizes acquisition.
-    const mono = Number(process.hrtime.bigint() / 1_000_000n)
-    const deadline = mono + Math.ceil(this.leaseMsValue)
+    const mono = readMonotonicMs()
+    const deadline = checkedDeadline(mono, this.leaseMsValue)
     if (!Number.isSafeInteger(mono) || mono < 0 || !Number.isSafeInteger(deadline) || deadline <= mono) {
       throw new VerificationError('invalid monotonic lease clock')
     }

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { DurableEnvelopeDedupStore, DEFAULT_DEDUP_TTL_MS } from './fleet-bus'
+import * as monotonic from './monotonic-clock'
 import * as verification from './dedup-verification'
 import { provisionTestStore } from './dedup-test-fixtures'
 
@@ -14,7 +15,7 @@ const cleanups: (() => void)[] = []
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup() })
 function clock() {
   mono = 100_000
-  const mock = spyOn(process.hrtime, 'bigint').mockImplementation(() => BigInt(mono) * 1_000_000n)
+  const mock = spyOn(monotonic, 'readMonotonicMs').mockImplementation(() => mono)
   cleanups.push(() => mock.mockRestore())
 }
 function store() { clock(); return new DurableEnvelopeDedupStore(':memory:') }
@@ -329,9 +330,9 @@ test('13 and 15 cross-port expiry agrees using actual named clock APIs', () => {
   const s = new DurableEnvelopeDedupStore(':memory:')
   s.claim('e', 'original', 100000)
   const r = row(s)
-  const before = process.hrtime.bigint()
+  const before = monotonic.readMonotonicNs()
   const live = pythonClock({ mode: 'actual', boot: r.lease_boot_id, deadline: r.lease_until_mono_ms })
-  const after = process.hrtime.bigint()
+  const after = monotonic.readMonotonicNs()
   expect(BigInt(live.before)).toBeGreaterThanOrEqual(before)
   expect(BigInt(live.after)).toBeLessThanOrEqual(after)
   expect(live.boot).toBe(r.lease_boot_id)
