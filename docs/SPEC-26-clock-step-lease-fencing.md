@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: v4.0f — §1 condition 4 AMENDED, APPROVED for implementation after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
+status: v4.0g — §1 condition 4 AMENDED, APPROVED for implementation after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -140,29 +140,52 @@ The four conditions:
    **10 ms after acquisition, while the original owner is still alive**, with no
    wall-clock step involved.
 
-   **That file is not on `main` yet.** It is preserved at the tag
-   **`evidence/26-bun-clock-repro`**, alongside `conformance/lease-clock.py`,
-   `src/clock-fencing.test.ts` and `docs/IMPLEMENTATION-26-status.md` as they stood
-   when the premise was disproved. It lands on `main` with the Release 2 PR.
+   **A preserved historical WIP reproduction**, not a release-approved
+   implementation and not a script available on `main`. Run it from the full
+   checkpoint below, with that checkpoint's dependencies. The implementation
+   remains gated; the measured defect does not.
 
-   **Why a tag and not a commit SHA.** The previous version cited
-   `2c5adfe861ac58f9b625db8b412e1c86fb1b7f50` on
-   `vec/26-release-2-clock-fencing`, reasoning that a SHA is immutable where a
-   branch pointer moves. **That reasoning was wrong in practice and broke within
-   hours:** Vec rebased onto the merged amendment, which rewrote the commit and
-   orphaned it from every branch. An unreferenced object is reachable until
-   garbage collection, not permanently — so the citation was to something that
-   would quietly stop resolving.
+   **Commit `2c5adfe861ac58f9b625db8b412e1c86fb1b7f50`** is the authoritative
+   content identity. The tag **`evidence/26-bun-clock-repro`** is its retention
+   mechanism. It preserves `conformance/lease-clock-bun-repro.ts`,
+   `conformance/lease-clock.py`, `src/clock-fencing.test.ts` and
+   `docs/IMPLEMENTATION-26-status.md` as they stood when the premise was
+   disproved.
 
-   A SHA is immutable; **being reachable is a different property**, and evidence
-   needs both. The tag supplies the second one. Shipping Release 2 against the old condition 4 would
-   have made takeover *more* likely, not less.
+   Verify:
 
-   Found by Vec during implementation, who stopped for a ruling rather than
-   substituting a clock. **§6 test 15 exists precisely to catch this** — it binds
-   the assertion to the actual APIs rather than to `/proc/uptime` — and it is what
-   caught it. Reviewed and ruled on by Ohm, who noted his earlier approval missed
-   the false premise.
+   ```sh
+   git rev-parse 'refs/tags/evidence/26-bun-clock-repro^{commit}'
+   # must equal 2c5adfe861ac58f9b625db8b412e1c86fb1b7f50
+   ```
+
+   **RETENTION IS AN OPERATIONAL REQUIREMENT, NOT AN ENFORCED ARCHIVE.** This tag
+   **must remain at that commit and must not be deleted**. No tag ruleset
+   currently protects it — the rulesets API reports only a default-branch rule —
+   so nothing stops it being moved or removed, and a moved tag must not silently
+   redefine the cited evidence. A ruleset targeting `evidence/*` with updates and
+   deletions restricted is recommended; that is a repository-admin action. **Do
+   not call this enforced permanence until that control exists**, and note that
+   even protection is not an independent backup.
+
+   **Why a retention tag AND a pinned SHA.** v4.0c cited the SHA alone, on the
+   reasoning that a SHA is immutable where a branch pointer moves. The rebase then
+   removed that commit from the implementation branch's ancestry. **Its SHA still
+   identifies the same content, but a SHA citation alone creates no retention
+   root.** Objects not retained by refs or other retention mechanisms may
+   eventually be pruned. The tag supplies the ref; the SHA supplies the identity;
+   the citation needs both.
+
+   v4.0f's first attempt at this correction overstated it in the other direction,
+   promising the citation would stop resolving "at the next garbage collection".
+   **That is not guaranteed either** — reflogs, other refs, retention policy and
+   hosting behaviour can all preserve an object, and failing one `merge-base` test
+   does not establish the absence of every retention root. Codex was right on both
+   counts.
+
+   **Landing these files on `main` with the Release 2 PR does not replace this
+   tag.** A squash or rebase merge will not retain this original commit. Keep the
+   tag regardless of what lands later.
 
 ## 1a. The TypeScript clock adapter — requirements
 
