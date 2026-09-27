@@ -109,8 +109,8 @@ Two consequences, and the second is the more serious one:
    subscription would bypass coordinator holds."
 
 So FB-3 does two things: it stops losing messages while a bot is restarting, and
-it is the precondition for the hold ever being enforceable. Nothing is being
-bypassed today, because nothing holds yet.
+it is the precondition for the hold ever being enforceable. No policy hold is
+being bypassed today, because nothing holds yet.
 
 ---
 
