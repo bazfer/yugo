@@ -97,15 +97,20 @@ Two consequences, and the second is the more serious one:
 1. **Delivery to a bot is fire-and-forget.** A bot that is down loses its
    message, because the copy that survived is on a subject it does not subscribe
    to.
-2. **The coordinator's policy gate is bypassed.** Per `yugo/SPEC.md` §4.3 the
-   coordinator is not merely a durable relay — it applies a policy check and can
-   hold an envelope for human approve / reject / redirect before releasing it to
-   `.inbox`. An adapter subscribing `fleet.<self>.request` directly receives the
-   envelope regardless of that decision. §4.7 records this as the **SEV1-1** gap:
-   "a still-active `.request` subscription would bypass coordinator holds."
+2. **The interposition the policy gate will need is not in place.** Per
+   `yugo/SPEC.md` §4.3 the coordinator's designed role is not merely a durable
+   relay — it applies a policy check and can hold an envelope for human approve /
+   reject / redirect before releasing it to `.inbox`. **That is a target, not
+   today's behaviour:** §7 describes the deployed v0.6a relay as forward-only
+   (audit + forward); v0.7a adds policy evaluation and **v0.7b is where holding
+   starts**. An adapter subscribing `fleet.<self>.request` directly would
+   therefore receive an envelope regardless of a **future** hold decision, which
+   is why §4.7 records it as the **SEV1-1** gap: "a still-active `.request`
+   subscription would bypass coordinator holds."
 
-So FB-3 is not only "stop losing messages while a bot is restarting". It is what
-makes the hold real.
+So FB-3 does two things: it stops losing messages while a bot is restarting, and
+it is the precondition for the hold ever being enforceable. Nothing is being
+bypassed today, because nothing holds yet.
 
 ---
 
@@ -141,8 +146,9 @@ changed by FB-3.
 
 - **subscribe:** `fleet.*.status` **of all bots**, `fleet.broadcast.>`, and its
   pull consumer on `FLEET_REQUEST`
-- **publish:** `fleet.*.inbox` — **the only user with this grant** —
-  `fleet.coordinator.status`, `fleet.broadcast.>`
+- **publish:** `fleet.*.inbox` — **the only user with this grant** — and
+  `fleet.coordinator.status`. **No broadcast publish:** §4.7 grants the
+  coordinator `fleet.broadcast.>` subscribe only.
 
 The tap / console user keeps subscribe on request, inbox, status and broadcast,
 with **zero publish**.
@@ -166,21 +172,41 @@ gets to choose:**
   historical `prod_op` / `spend` envelopes on the FB-3 flip.
 - **Re-creation**, the durable existed and was deleted → `DeliverPolicy=All`.
   **Do not re-skip**; persistent envelope-id de-dup absorbs the replay.
-- The store file itself carries the signal: **absent → INITIAL** (create schema
-  and marker in one transaction); **present with marker → RE-CREATION**.
+- The signal is an **`_initialized_at` marker row**, exempt from the retention
+  cull — its presence, **not** the row count, distinguishes the two cases, because
+  a quiet bot can legitimately have zero rows after a cull. The marker must be
+  written in the **same SQLite transaction** that creates the schema. Three
+  startup cases:
+  - store file absent → **INITIAL**: create schema + marker in one transaction,
+    `DeliverPolicy=New`
+  - file present, marker present → **RE-CREATION**: `DeliverPolicy=All`
+  - file present, **marker absent → FAIL-LOUD ABORT**: log and refuse to start.
+    Marker-absent means ops truncation, a cleanup-script bug or a hand-crafted
+    store — every case where a silent `New` would drop approved holds.
 - Adapter de-dup retention **MUST be ≥ the `.inbox` stream `max_age`** of 7d;
   the default is 8d, one day of slack. Guarded in the TypeScript constructor at
   `src/fleet-bus.ts:156`.
-- The store path is configured explicitly, `$YUGO_DEDUP_STORE_PATH` (§14). An
-  operator recovery path exists — `yugo dedup-recover --store <path>
-  --deliver-policy ...` — with `all` risking mass replay and `new` risking silent
-  drop, so it is an operator decision, not a default.
+- The store path is configured explicitly, `$YUGO_DEDUP_STORE_PATH`.
+
+**Specified but NOT implemented.** The following are §14/§15 targets, not features
+that exist today, and this document does not claim otherwise:
+
+- The operator recovery command `yugo dedup-recover --store <path>
+  --deliver-policy <all|new|since:<ts>> --acknowledge-replay-risk`. It requires an
+  explicit policy with no default and re-stamps the marker. `all` risks mass
+  re-execution of `prod_op`/`spend` envelopes older than the surviving rows;
+  `new` risks silently dropping approved holds in flight during the outage;
+  **`since:<ts>`** replays from an ISO-8601 timestamp using JetStream
+  `DeliverByStartTime` and is the **recommended** choice when the store held rows
+  before truncation. §14's heuristic: prefer `since:<ts>` or `new` after
+  truncation, `all` only when the store is young and the fleet is
+  idempotent-safe.
+- The coordinator's own persistent de-dup store for its own `.request` durable
+  (`$YUGO_COORDINATOR_DEDUP_PATH`, §15 S2-B).
 
 **De-dup arbitration belongs to the receiving adapter**, not to the coordinator's
-relay. The relay is unconditional; the adapter is what decides whether an
-envelope id has already been claimed. The coordinator maintains its own separate
-persistent store for its own `.request` durable
-(`$YUGO_COORDINATOR_DEDUP_PATH`, §15 S2-B).
+relay. The relay is unconditional; the adapter is what decides whether an envelope
+id has already been claimed — and it does so **however the envelope arrived**.
 
 ---
 
@@ -198,9 +224,13 @@ persistent store for its own `.request` durable
 coordinator, after the policy check.
 
 Today every bot holds `publish` on `fleet.*.inbox` (§2.2). That means any bot can
-write directly into any peer's durable inbox, bypassing the coordinator, its
-policy hold, its de-dup arbitration and its ack semantics entirely. It is the
-publish-side twin of the SEV1-1 subscribe gap.
+write directly into any peer's durable inbox, bypassing the coordinator entirely
+— its audit record, its forward accounting, and the policy hold that v0.7b will
+add. It is the publish-side twin of the SEV1-1 subscribe gap.
+
+**It does not bypass de-dup.** De-dup lives in the receiving adapter and keys on
+envelope id regardless of how the envelope reached the inbox (§3.5). The grant's
+hazard is unaudited, ungated injection, not duplicate execution.
 
 **Required action:** revoke `fleet.*.inbox` publish from every bot user, leaving
 it to the coordinator. This is a broker-config change and therefore
