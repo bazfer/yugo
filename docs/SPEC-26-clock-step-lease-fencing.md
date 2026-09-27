@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: v4.0e — §1 condition 4 AMENDED, APPROVED for implementation after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
+status: v4.0f — §1 condition 4 AMENDED, APPROVED for implementation after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -140,12 +140,22 @@ The four conditions:
    **10 ms after acquisition, while the original owner is still alive**, with no
    wall-clock step involved.
 
-   **That file is not in this repository yet.** It lives on Vec's implementation
-   branch at commit `2c5adfe861ac58f9b625db8b412e1c86fb1b7f50`
-   (`vec/26-release-2-clock-fencing`), alongside `conformance/lease-clock.py` and
-   `src/clock-fencing.test.ts`. Cited by immutable SHA rather than branch name,
-   because a branch pointer moves and this citation is evidence. It lands in the
-   repository with the Release 2 PR. Shipping Release 2 against the old condition 4 would
+   **That file is not on `main` yet.** It is preserved at the tag
+   **`evidence/26-bun-clock-repro`**, alongside `conformance/lease-clock.py`,
+   `src/clock-fencing.test.ts` and `docs/IMPLEMENTATION-26-status.md` as they stood
+   when the premise was disproved. It lands on `main` with the Release 2 PR.
+
+   **Why a tag and not a commit SHA.** The previous version cited
+   `2c5adfe861ac58f9b625db8b412e1c86fb1b7f50` on
+   `vec/26-release-2-clock-fencing`, reasoning that a SHA is immutable where a
+   branch pointer moves. **That reasoning was wrong in practice and broke within
+   hours:** Vec rebased onto the merged amendment, which rewrote the commit and
+   orphaned it from every branch. An unreferenced object is reachable until
+   garbage collection, not permanently — so the citation was to something that
+   would quietly stop resolving.
+
+   A SHA is immutable; **being reachable is a different property**, and evidence
+   needs both. The tag supplies the second one. Shipping Release 2 against the old condition 4 would
    have made takeover *more* likely, not less.
 
    Found by Vec during implementation, who stopped for a ruling rather than
