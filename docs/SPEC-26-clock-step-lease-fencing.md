@@ -1,6 +1,6 @@
 ---
 title: "yugo #26 — clock-step-safe lease fencing"
-status: v3.3 — Release 1 MERGED (undeployed); Release 2 gated; §8 pending review (2026-09-24)
+status: v4.0e — §1 condition 4 AMENDED, APPROVED for implementation after the Bun premise failed; Release 1 deployed; Release 2 gated on the FFI clock adapter (2026-09-26)
 updated: 2026-09-24
 issue: https://github.com/bazfer/yugo/issues/26
 ---
@@ -111,24 +111,139 @@ The four conditions:
    object they belong to. Stating it as namespace identity claimed more than the
    check delivers and more than the design needs.
 4. Clock API named explicitly, not "monotonic milliseconds":
-   **TS `process.hrtime.bigint()`**, **Python `time.monotonic_ns()`**. Both are
-   `CLOCK_MONOTONIC`; both survive a wall-clock step; neither is process-relative.
+   **TS: `clock_gettime(CLOCK_MONOTONIC)` read through `bun:ffi`** (see §1a).
+   **Python: `time.monotonic_ns()`.**
 
-### Measured on the live deployment, 2026-09-24
+   **AMENDED 2026-09-26. The previous version named `process.hrtime.bigint()` for
+   TypeScript and asserted "neither is process-relative". THAT IS FALSE ON BUN,
+   which is the runtime we deploy.**
 
-```
-host boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
-vec  boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
-ohm  boot_id  eb1d102e-5f57-4148-a3d6-bbfdcbd937d9
+   Measured on one host, one boot, zero time-namespace offsets:
 
-CLOCK_MONOTONIC (/proc/uptime), sampled sequentially
-host 3112047.18   vec 3112047.29   ohm 3112047.36
-```
+   | Source | Reading |
+   |---|---|
+   | Bun parent process | 31,489,026 ns |
+   | Bun child process | 36,181,598 ns |
+   | Python `time.monotonic_ns()` | 3,364,095,287,444,575 ns |
+   | Node `process.hrtime.bigint()` | 3,364,095,323,159,358 ns |
 
-Containers read the host's `boot_id` and share its monotonic clock; the ~0.2 s
-spread is three sequential `docker exec` calls, not an offset. **No time namespace
-in use.** Re-runnable: `cat /proc/sys/kernel/random/boot_id` and
-`awk '{print $1}' /proc/uptime`, on the host and inside each container.
+   Python and Node agree to within **35.7 milliseconds** — both read host
+   monotonic,
+   roughly 39 days of uptime. **Bun returns tens of milliseconds: time since
+   process start.** Two Bun processes therefore have unrelated epochs and their
+   monotonic values are not comparable at all.
+
+   **This was worse than the defect the document exists to fix.** The clock-step
+   defect needs an NTP correction to fire. This fires on every pair of Bun
+   processes, deterministically: `conformance/lease-clock-bun-repro.ts`
+   demonstrates an older Bun process taking a younger process's 200 ms lease
+   **10 ms after acquisition, while the original owner is still alive**, with no
+   wall-clock step involved.
+
+   **That file is not in this repository yet.** It lives on Vec's implementation
+   branch at commit `2c5adfe861ac58f9b625db8b412e1c86fb1b7f50`
+   (`vec/26-release-2-clock-fencing`), alongside `conformance/lease-clock.py` and
+   `src/clock-fencing.test.ts`. Cited by immutable SHA rather than branch name,
+   because a branch pointer moves and this citation is evidence. It lands in the
+   repository with the Release 2 PR. Shipping Release 2 against the old condition 4 would
+   have made takeover *more* likely, not less.
+
+   Found by Vec during implementation, who stopped for a ruling rather than
+   substituting a clock. **§6 test 15 exists precisely to catch this** — it binds
+   the assertion to the actual APIs rather than to `/proc/uptime` — and it is what
+   caught it. Reviewed and ruled on by Ohm, who noted his earlier approval missed
+   the false premise.
+
+## 1a. The TypeScript clock adapter — requirements
+
+Ruled by Ohm, 2026-09-26, as conditions on the amendment above.
+
+- **An isolated `bun:ffi` adapter** reading `clock_gettime(CLOCK_MONOTONIC)`. It
+  is the syscall Node and Python already call; this makes Bun read the same clock
+  rather than approximating it.
+- **A named, explicit supported ABI and runtime.** The binding is
+  platform-specific and must say so rather than assuming.
+- **Fail closed on initialization or read error. NO ALTERNATE-CLOCK FALLBACK.** A
+  consumer that cannot read the host monotonic clock refuses to consume, per §1's
+  startup rule. Falling back to a process-relative clock would reintroduce exactly
+  this defect at the moment the primary path broke.
+- **`/proc/uptime` is REJECTED as a fallback**, and the reason is sharper than the
+  resolution argument that was first offered for it: **`/proc/uptime` includes
+  suspend time and `CLOCK_MONOTONIC` does not.** It is a different clock domain,
+  not a coarser reading of the same one. Mixing the two would produce
+  disagreements that look exactly like the bug being fixed.
+- **Keep the actual-API, cross-process lease and mutation tests in CI.** The
+  premise failed once because it was asserted rather than measured; the tests that
+  caught it must not be weakened into mocks.
+- **Record `bun:ffi`'s experimental status as a release risk.** It is not a reason
+  to avoid the approach, but it belongs in the rollout notes rather than being
+  discovered later.
+
+### 1a.1 Native result validation — Ohm's normative text, verbatim
+
+> Retain the native library handle and use a correctly sized, aligned buffer kept
+> live across the call. Check the C return code before reading output. Require
+> `tv_sec >= 0` and `0 <= tv_nsec < 1e9`. Construct nanoseconds with bigint,
+> divide before Number conversion, and reject unsafe integer milliseconds or
+> deadline overflow. Initialization/read failures, including invalid output, refuse
+> startup or the affected claim/takeover/renewal without authorizing execution or
+> mutating lease metadata, including `:memory:`. No cached, zero, wall-clock,
+> uptime, or calibrated-hrtime substitution is permitted. Qualify the actual
+> deployed OS/architecture/libc/Bun combination before release.
+
+**Why bigint is required, stated precisely.** `2^53` **nanoseconds** is 104.2 days
+of uptime, and the host running the TypeScript accessor is at 38.9 days. Past that
+boundary a Number-based *nanosecond* intermediate silently loses low-order
+precision rather than failing loudly.
+
+**It is NOT a countdown on the lease** — corrected in v4.0e at Ohm's note, because
+v4.0d's "37% of the way there" implied one. The stored lease is in
+**milliseconds**, and `2^53` milliseconds is roughly 285,000 years. So the
+requirement protects the nanosecond intermediate produced by
+`tv_sec * 1e9 + tv_nsec`; it is not a deadline after which leases break. Construct
+with bigint and **divide before converting to Number**, and the millisecond value
+is never near the boundary.
+
+**Two requirements v4.0c invented and got wrong. Deleted, not softened:**
+
+- **The uptime-magnitude check is REMOVED.** I added it as a "sanity bound", and it
+  was the same domain confusion §1a rejects `/proc/uptime` for, wearing a different
+  hat. A `CLOCK_MONOTONIC` reading can legitimately sit far below `/proc/uptime`
+  after suspend — 39 days of suspended time does not require 39 days of monotonic
+  elapsed time — so any threshold either rejects supported clocks or invents a new
+  deployment precondition. **The epoch test is the cross-process bracketing in §6
+  test 15a. There is no uptime ratio and no tolerance.**
+- **`tv_sec == 0` is VALID.** v4.0c refused `tv_sec <= 0` as a marshalling error. A
+  reading in the first second after boot has `tv_sec == 0` with a good `tv_nsec`.
+  Refuse `tv_sec < 0` only.
+
+### 1a.2 ABI qualification — the deployed combination, measured
+
+**Corrected in v4.0d. v4.0c asserted "the containers run musl (Alpine-based)". That
+is wrong twice over:**
+
+- **The TypeScript accessor is not containerized at all.** It runs on the host —
+  same mount namespace as init, `mnt:[4026531841]`, verified during the Release 1
+  rollout.
+- **The host is glibc**, not musl: Ubuntu GLIBC 2.39. The musl guess came from
+  generalizing about "the containers"; `yugo/Dockerfile` is `python:3.13-slim`,
+  which is Debian, so it would have been wrong for the Python port too.
+
+**Qualify the combination actually measured**, and name it rather than the class:
+
+| | |
+|---|---|
+| Runtime | Bun **1.3.12** (Vec's reproduction was on 1.3.0 — both process-relative) |
+| OS / libc | Ubuntu, GLIBC 2.39 |
+| Architecture | x86_64 |
+| Location | Host, not a container |
+
+- **`struct timespec` layout**: two 64-bit fields, `tv_sec` then `tv_nsec`. A
+  32-bit `time_t` platform is unsupported, not silently reinterpreted.
+- **`CLOCK_MONOTONIC` is 1 on Linux** and must be asserted, not assumed from a
+  header the FFI layer never reads.
+- **Refuse at startup on any unqualified platform** rather than attempting the call
+  and interpreting whatever comes back.
 
 ## 2. Mechanism
 
@@ -394,9 +509,82 @@ never that they test anything.
 14. **Boot-ID read failure on a NEW-format row refuses takeover** — the precise
     case: unreadable boot ID, then a forward wall-clock step, against an unexpired
     monotonic claim. Must refuse, not fall through to wall-clock.
-15. Cross-port clock agreement asserts against **actual `process.hrtime.bigint()`
-    and `time.monotonic_ns()` values** — `/proc/uptime` was supporting evidence for
-    the design, not verification of the chosen APIs' shared epoch.
+15. Cross-port clock agreement asserts against the **actual clock APIs** — the
+    `bun:ffi` `clock_gettime(CLOCK_MONOTONIC)` adapter (§1a) and
+    `time.monotonic_ns()` — never against `/proc/uptime` and never against mocked
+    values. `/proc/uptime` was supporting evidence for the design, not verification
+    of the chosen APIs' shared epoch.
+
+    **This test is the reason the Bun premise was caught rather than shipped.** The
+    old condition 4 asserted a property of `process.hrtime.bigint()` that was
+    false; binding the assertion to the real API is what surfaced it. Amended in
+    v4.0 to name the FFI adapter, and **it must not be weakened into a mock** — the
+    whole value is that it measures rather than restates.
+
+15a. **The two-process LEASE regression, not just an adapter probe.** Amended
+    after Ohm observed the first version verified the clock and not its callers.
+
+    Two halves, both required:
+
+    a. **Adapter agreement** — the FFI adapter's output from an older and a
+       younger Bun process must bracket a `time.monotonic_ns()` reading taken
+       between them. The direct inverse of the failure: under
+       `process.hrtime.bigint()` both Bun values were tens of milliseconds while
+       Python's was ~39 days, so no bracketing was possible.
+    b. **The actual lease regression, including renewal** — an older Bun process
+       must NOT take a younger process's live lease, and renewal by the true owner
+       must hold across both. This is `conformance/lease-clock-bun-repro.ts`'s
+       scenario inverted into a passing assertion.
+
+    Two further cases Ohm required, both two-process and both against the real
+    lease path:
+
+    c. **Reverse owner.** The younger process must not take the OLDER process's
+       live lease either. The observed failure ran older-steals-younger; asserting
+       only that direction would leave a sign error uncaught.
+    d. **Post-expiry takeover still works.** Once a lease genuinely expires, the
+       rival MUST be able to take it. A fix that refuses everything passes (b) and
+       (c) trivially, and this is the case that distinguishes "correctly fenced"
+       from "broken closed".
+
+    **Mutation expectation, Ohm's replacement text verbatim** — v4.0c specified
+    per-case outcomes and they are not derivable:
+
+    > Restoring Bun hrtime in the production lease path must fail the regression
+    > suite, including the older-rival/younger-owner early-takeover case.
+    > Reverse-owner and real-expiry cases must pass with the correct adapter;
+    > individual mutation outcomes depend on process ages and ordering and are not
+    > required to all fail or all pass.
+
+    Why my version was impossible: under a process-relative clock an older owner
+    writes a deadline *ahead* of a younger rival's reading — owner reads 1,200 ms
+    and sets a 1,400 ms deadline, rival reads 20 ms and refuses. So (c) can pass
+    under the bad clock. And after 200 ms of real time that rival may read only
+    220 ms and wrongly refuse the expired 1,400 ms deadline, so (d) need not stay
+    green either. **The suite failing is the assertion; which cases fail is a
+    function of process ages.**
+
+15b. **Fail-closed on FFI error, at INITIALISATION *and* on every read.**
+    Amended after Ohm observed that an init-only test lets a fallback added after
+    successful startup pass — which is the same "forbidden in prose, unenforced in
+    code" failure that survived four rounds on §8.
+
+    Required cases, each asserting refusal **with no metadata mutation**:
+
+    - initialisation forced to fail → consumer refuses to consume;
+    - **a non-zero C return code** → refuse before reading the output buffer;
+    - **invalid fields** — `tv_sec < 0`, or `tv_nsec` outside `[0, 1e9)` → refuse
+      (note `tv_sec == 0` is VALID and must pass, §1a.1);
+    - **unsafe integer conversion or deadline overflow** → refuse rather than
+      silently losing precision;
+
+    each at **claim**, **takeover** and **renewal**, asserting refusal with the row
+    untouched, the existing owner's metadata unchanged, and the lease not extended
+    respectively. **Including `:memory:`** — §1a.1 admits no exemption there.
+
+    Mutate by adding a fallback clock at each site and watch the corresponding
+    case go red. A fallback is the tempting thing to add later, which is exactly
+    why each site needs its own failing test rather than one at startup.
 
 ## 7. The load-bearing assumption — RESOLVED
 
