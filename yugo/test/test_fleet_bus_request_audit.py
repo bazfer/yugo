@@ -240,6 +240,7 @@ async def test_every_on_request_terminal_path_has_its_exact_current_audit_set(
         allowed_from=frozenset({"yugo", "vec"}),
         plugin_version="request-audit-test",
         audit_log_path=None,
+        dedup_store_path=":memory:",
     )
     bus = fleet_bus.FleetBus(config, audit, on_envelope=hook)
     if case.publishes:

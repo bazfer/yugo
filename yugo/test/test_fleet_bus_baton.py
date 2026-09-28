@@ -428,6 +428,7 @@ def _hookless_bus(lines: list):
         allowed_from=ALLOWED,
         plugin_version="0.3d-test",
         audit_log_path=None,
+        dedup_store_path=":memory:",
     )
     return fleet_bus.FleetBus(
         config, fleet_bus.AuditLog(None, logger=lines.append)
@@ -568,6 +569,8 @@ def baton_bus(nats_server, tmp_path):  # noqa: F811 — pytest fixture injection
             audit_log_path=str(audit_path),
             heartbeat_interval_s=HEARTBEAT_S,
             reconnect_time_wait_s=RECONNECT_WAIT_S,
+            # Required (#29), one file per harness under pytest's tmp_path.
+            dedup_store_path=str(tmp_path / f"baton-dedup-{len(started)}.sqlite"),
         )
         bus = fleet_bus.FleetBus(
             config, fleet_bus.AuditLog(str(audit_path)), on_envelope=_hook
