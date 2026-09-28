@@ -72,3 +72,85 @@ Result: exit 0, 1 pass, 51 filtered out, 0 fail, 9 assertions, final PASS line.
 This rerun includes the script's explicit `YUGO_QUALIFIED_CLOCK_TEST=1` setting.
 Deet separately checked that omitting the variable visibly skips the test
 (0 pass, 1 skip, 0 fail). Vec did not independently execute this host run.
+
+## Operator-executed run at the Release 2 head — 2026-09-28
+
+Deet executed this run on the qualified deployment host. It is
+operator-executed evidence; Vec, Ohm and CI did not independently execute it.
+
+Revision: `29c2b5371981d355365ac89a1b465b8aac78ed8d`, from a clean working
+tree. That commit is the parent of the commit adding this section, and the
+two differ only in this file, which no code path reads.
+
+Command, from the checkout root:
+
+```sh
+BUN=/home/deet/.bun/bin/bun PYTHON=python3 \
+  bash conformance/run-qualified-clock.sh
+```
+
+Verbatim output, exit **0**:
+
+```text
+revision: 29c2b5371981d355365ac89a1b465b8aac78ed8d
+runtime: 1.3.12
+Linux x86_64
+glibc 2.39
+self mount namespace: mnt:[4026531841]
+init mount namespace: unreadable unprivileged; diagnostic skipped (host placement requires operator attestation)
+glibc 2.39: CLOCK_MONOTONIC=1, timespec=16 bytes/8 aligned
+bun install v1.3.12 (700fc117)
+
+Checked 9 installs across 10 packages (no changes) [6.00ms]
+bun test v1.3.12 (700fc117)
+
+ 1 pass
+ 53 filtered out
+ 0 fail
+ 9 expect() calls
+Ran 1 test across 1 file. [292.00ms]
+bun test v1.3.12 (700fc117)
+
+ 5 pass
+ 0 fail
+ 23 expect() calls
+Ran 5 tests across 1 file. [4.03s]
+bun test v1.3.12 (700fc117)
+
+ 56 pass
+ 0 fail
+ 352 expect() calls
+Ran 56 tests across 1 file. [7.79s]
+PASS: native ABI and actual-clock cross-port bracketing/live/expired checks,
+      two-process lease regression and post-startup clock-failure matrix
+```
+
+The script now runs three separate gates, and they establish **different**
+things. Do not collapse them.
+
+### Gate 1 — the clock probe (1 pass, 53 filtered out)
+
+The ABI assertions and test `13 and 15`. This establishes that the FFI
+adapter returns a sane host-monotonic value on this host, that the C
+compile-time assertions hold against its headers, and that the TypeScript and
+Python readings bracket and agree on one lease's expiry. **It is about the
+clock.** The filtered-out count is 53 here, up from 51 in the runs above,
+because test 18a added two cases to that file.
+
+### Gate 2 — SPEC-26 §6 item 15a (5 pass)
+
+`src/clock-fencing-two-process.test.ts`. Two real Bun processes of different
+ages competing over one shared verified store through the production lease
+path. **It is about the callers of the clock**, which is exactly why 15a was
+amended: an earlier version verified the clock and not its callers. **A
+passing Gate 1 is not partial satisfaction of 15a**, and neither gate
+substitutes for the other.
+
+### Gate 3 — SPEC-26 §6 item 15b (56 pass)
+
+`src/clock-fault-injection.test.ts`. Adapter faults injected after a
+successful startup and driven through claim, takeover and renewal, asserting
+refusal with no authorization and no lease-metadata mutation.
+
+Mutation evidence for gates 2 and 3 is recorded on PR #48; a passing run here
+is not by itself proof that either suite can fail.
