@@ -46,11 +46,16 @@ export function validatedNanoseconds(result: number, output: BigInt64Array): big
   return sec * 1_000_000_000n + nsec
 }
 
+/** Invalid in both fields, so success-with-partial-output cannot look like zero. */
+export function createTimespecBuffer(): BigInt64Array {
+  return new BigInt64Array([-1n, -1n])
+}
+
 export function readMonotonicNs(): bigint {
   const native = nativeLibrary()
   // BigInt64Array gives a 16-byte, 8-byte-aligned timespec on the qualified ABI.
   // Keep the view alive across the synchronous native call and subsequent read.
-  const output = new BigInt64Array(2)
+  const output = createTimespecBuffer()
   const address = ptr(output)
   if (address % 8 !== 0 || output.byteLength !== 16) {
     throw new MonotonicClockError('unaligned or incorrectly sized timespec')
