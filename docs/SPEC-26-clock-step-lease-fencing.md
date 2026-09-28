@@ -41,6 +41,13 @@ Read off the code, not assumed:
 
 - **TypeScript** defaults to `~/.claude/fleet-bus-dedup-<botName>.sqlite`
   (`src/fleet-bus.ts:903`). Per bot, per home directory.
+
+  **SUPERSEDED 2026-09-28 by #29: that default no longer exists.** Both ports now
+  REQUIRE an explicit path (or an injected store) and fail at startup without
+  one, so "per home directory" is no longer a property of any deployment — the
+  locality question below is answered by whatever path the operator configures.
+  Left in place rather than rewritten because the preconditions this document
+  reasons from were true when it was written.
 - **Python** defaults to **`/var/lib/yugo/<bot_name>-dedup.sqlite`**
   (`yugo/fleet_bus.py:1377-1378`, via `load_config_from_env`, which `bot.py:152`
   uses), overridable with `YUGO_DEDUP_STORE_PATH`. **File-backed, per bot.**

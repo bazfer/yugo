@@ -126,6 +126,9 @@ def test_adapter_never_subscribes_the_post_jetstream_inbox_subject():
         allowed_from=frozenset({"yugo"}),
         plugin_version="0.3a",
         audit_log_path=None,
+        # Required (#29). This test only reads `subjects`, so an in-process
+        # store is the isolated choice — nothing to leave on disk.
+        dedup_store_path=":memory:",
     )
     subjects = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None)).subjects
     assert subjects == (
@@ -482,3 +485,48 @@ def test_no_http_error_construction_reports_credential_attachment():
                 "so there is no request whose attachment it could describe. The "
                 "audit already records the origins the credential reached."
             )
+
+def test_no_sqlite_database_is_tracked_in_the_repo():
+    """A dedup store is runtime state and never a committed artifact.
+
+    PR #47 shipped ``yugo/   `` — a 16 KiB ``envelope_dedup_v2`` database whose
+    name was three spaces. It was created during mutation testing: with the
+    blank-path guard deliberately removed, the test that passes ``"   "`` turned
+    that string into a real file in the working directory. The guard is correct
+    and the mutant was reverted; the file it created outlived it and got
+    committed.
+
+    Both Ohm and Codex caught it by reading the diff. That is the wrong place for
+    a machine to catch a stray binary, and a whitespace-only filename is exactly
+    what a human reviewer skims past. This matches on the SQLite magic header
+    rather than on a filename pattern, so it holds for any name.
+    """
+    import subprocess
+
+    root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    tracked = subprocess.run(
+        ["git", "-C", root, "ls-files", "-z"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split("\0")
+
+    magic = b"SQLite format 3\x00"
+    offenders = []
+    for name in tracked:
+        if not name:
+            continue
+        path = Path(root) / name
+        try:
+            with path.open("rb") as handle:
+                if handle.read(len(magic)) == magic:
+                    offenders.append(name)
+        except OSError:
+            continue
+
+    assert not offenders, (
+        "tracked SQLite databases found: "
+        + ", ".join(repr(name) for name in offenders)
+        + " — a claim store is runtime state; add it to .gitignore or delete it"
+    )

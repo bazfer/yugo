@@ -334,6 +334,8 @@ def outbound_bus(nats_server, tmp_path):  # noqa: F811 — pytest fixture inject
             audit_log_path=str(audit_path),
             heartbeat_interval_s=HEARTBEAT_S,
             reconnect_time_wait_s=RECONNECT_WAIT_S,
+            # Required (#29), one file per harness under pytest's tmp_path.
+            dedup_store_path=str(tmp_path / f"outbound-dedup-{len(started)}.sqlite"),
         )
         bus = fleet_bus.FleetBus(
             config, fleet_bus.AuditLog(str(audit_path)), on_envelope=_hook
@@ -872,6 +874,9 @@ async def test_two_bots_do_not_ping_pong(nats_server, tmp_path):  # noqa: F811
             audit_log_path=str(audit_path),
             heartbeat_interval_s=HEARTBEAT_S,
             reconnect_time_wait_s=RECONNECT_WAIT_S,
+            # One store per bot: the two halves of the ping-pong must not
+            # suppress each other's envelope ids.
+            dedup_store_path=str(tmp_path / f"pingpong-dedup-{name}.sqlite"),
         )
         bus = fleet_bus.FleetBus(
             config, fleet_bus.AuditLog(str(audit_path)), on_envelope=_hook
@@ -941,6 +946,7 @@ async def test_publishing_without_a_connection_is_audited_not_raised():
         allowed_from=ALLOWED,
         plugin_version="0.3c-test",
         audit_log_path=None,
+        dedup_store_path=":memory:",
     )
     bus = fleet_bus.FleetBus(config, _RecordingAudit(None))
 
@@ -977,6 +983,7 @@ async def test_a_recipient_the_model_invented_cannot_flood_the_audit_log(
         allowed_from=ALLOWED,
         plugin_version="0.3c-test",
         audit_log_path=None,
+        dedup_store_path=":memory:",
     )
     bus = fleet_bus.FleetBus(config, _RecordingAudit(None))
 
