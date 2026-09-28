@@ -376,9 +376,41 @@ export class DurableEnvelopeDedupStore {
     return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2').get() as { n: number }).n
   }
 
-  /** Rows the TTL says should already be gone. The invariant a sweep must drive to zero. */
+  /** Expired COMPLETED rows — the subset `prune` is able to delete, and the
+   * invariant a sweep must drive to zero.
+   *
+   * It is not a count of everything the TTL has outlived: expired `pending`
+   * rows are excluded, because prune leaves them alone by design. Read
+   * `countPastTtlPending` alongside this one; zero here says the sweep is
+   * keeping up, and nothing at all about the pending backlog. */
   countExpired(nowMs = Date.now()): number {
     return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2 WHERE state=\'completed\' AND first_seen_ms < ?')
+      .get(nowMs - this.ttlMs) as { n: number }).n
+  }
+
+  /** `pending` rows whose WALL-CLOCK age exceeds the TTL. Suspected orphans,
+   * never proven ones.
+   *
+   * The motivating case is real: a consumer SIGKILLed mid-turn leaves its row
+   * `pending` forever, because the stream's 7-day max_age elapses before any
+   * redelivery, so no one completes it, and prune skips it deliberately rather
+   * than delete a row out from under a live lease. This counter exists to make
+   * that backlog visible, since `countExpired` cannot see it.
+   *
+   * What it CANNOT tell you is that any counted row is abandoned. `first_seen_ms`
+   * is wall clock; lease liveness is decided in the MONOTONIC domain, and the
+   * two are different clocks — the whole premise of the lease fencing. A single
+   * forward wall-clock step larger than the TTL counts a perfectly healthy
+   * claim whose lease has not expired and whose consumer is alive. A long turn
+   * held by repeated `renew` does the same, because renewal extends the lease
+   * without moving `first_seen_ms` and the store sets no maximum lifetime.
+   *
+   * So: this count NEVER authorizes deleting anything. It is not a deletion
+   * queue, no sweep drives it to zero, and a row leaves it only by being
+   * completed or released by its owner. Treat a rising number as a prompt to
+   * investigate, and take orphanhood from the lease state, not from this. */
+  countPastTtlPending(nowMs = Date.now()): number {
+    return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2 WHERE state=\'pending\' AND first_seen_ms < ?')
       .get(nowMs - this.ttlMs) as { n: number }).n
   }
 
