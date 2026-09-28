@@ -7,9 +7,8 @@ import {
   type Subscription,
 } from 'nats'
 import { randomBytes, randomUUID } from 'node:crypto'
-import { appendFileSync, chmodSync, mkdirSync, readFileSync } from 'node:fs'
+import { accessSync, appendFileSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { homedir } from 'node:os'
 import { Database } from 'bun:sqlite'
 import { parse as parseYaml } from 'yaml'
 
@@ -81,7 +80,13 @@ export interface Envelope<P = unknown> {
 
 export type FleetBusMode = 'primary' | 'publish-only'
 
-export interface FleetBusConfig {
+/**
+ * Everything a bus needs EXCEPT where its durable dedup claims live.
+ *
+ * Split out so `FleetBusConfig` can make that one choice mandatory; see
+ * `FleetBusDedupStorage`.
+ */
+export interface FleetBusConfigBase {
   botName: string
   url: string
   user: string
@@ -99,11 +104,9 @@ export interface FleetBusConfig {
   evictedLedgerCap?: number
   seenResultLedgerCap?: number
   seenRequestLedgerCap?: number
-  dedupStorePath?: string
   dedupTtlMs?: number
   /** See `DEFAULT_DEDUP_CLAIM_DEADLINE_MS`. Must satisfy `leaseMs <= deadline < dedupTtlMs`. */
   dedupClaimDeadlineMs?: number
-  dedupStore?: DurableEnvelopeDedupStore
   rateLimiters?: FleetBusRateLimiters
   supervisorSleepMs?: number
   /**
@@ -112,6 +115,34 @@ export interface FleetBusConfig {
    */
   connectFn?: (options: ConnectionOptions) => Promise<NatsConnection>
 }
+
+/**
+ * Where this adapter's durable dedup claims live. THERE IS NO DEFAULT.
+ *
+ * Supply `dedupStorePath` — a stable, persistent, bot-specific SQLite file —
+ * or inject a `dedupStore` you built yourself. Tests supply an isolated
+ * temporary path (or `:memory:`) and clean it up.
+ *
+ * The removed default was `~/.claude/fleet-bus-dedup-<botName>.sqlite`: durable,
+ * user-global and cross-process, so any consumer that did not know to override
+ * it wrote real claims into a shared file, and a test run poisoned a live bot's
+ * store (#29). Storage that outlives the process cannot be a zero-config
+ * choice, and a process-scoped temporary store is not an acceptable production
+ * substitute either — a restart would discard exactly the protection the
+ * durable store exists to provide.
+ *
+ * A UNION rather than two optional fields, so that omitting BOTH is a compile
+ * error at every call site rather than a throw at startup. This is the
+ * `replyToken` lesson from plugin 0.7.4: an optional parameter whose omission
+ * breaks the caller compiles clean at every unmigrated call site, which is how
+ * a breaking change ships looking like a safe one. Passing both is allowed and
+ * the store wins; passing neither is not expressible.
+ */
+export type FleetBusDedupStorage =
+  | { dedupStorePath: string; dedupStore?: DurableEnvelopeDedupStore }
+  | { dedupStorePath?: string; dedupStore: DurableEnvelopeDedupStore }
+
+export type FleetBusConfig = FleetBusConfigBase & FleetBusDedupStorage
 
 export interface FleetBusSessionEvent {
   envelope: Envelope
@@ -136,6 +167,73 @@ export interface FleetBusSessionEvent {
   replyToken: string | null
 }
 
+/**
+ * Open the claim database, or throw naming the path and what is wrong with it.
+ *
+ * Every fault here is a STARTUP fault by design. The alternative is a bus that
+ * boots clean and fails at the first inbound envelope, where an unusable store
+ * looks like a dropped message rather than a misconfiguration — see SPEC §6.4
+ * on the cross-port schema collision, which does exactly that.
+ *
+ * The parent directory is required to EXIST rather than being created here. It
+ * used to be `mkdirSync(…, { recursive: true })`, which turns a typo in a
+ * deployment path into a brand-new empty claim database instead of an error —
+ * the same silent-second-store failure #29 is about.
+ */
+function openDedupDatabase(path: string): Database {
+  if (path !== ':memory:') {
+    const dir = dirname(path)
+    let parent: ReturnType<typeof statSync> | undefined
+    try {
+      parent = statSync(dir)
+    } catch {
+      parent = undefined
+    }
+    if (parent === undefined || !parent.isDirectory()) {
+      throw new Error(
+        `durable dedup store path ${path} is unusable: parent directory ${dir} does not exist. `
+        + 'Create it as part of deployment; the store does not create it.',
+      )
+    }
+    try {
+      accessSync(dir, fsConstants.W_OK)
+    } catch {
+      throw new Error(`durable dedup store path ${path} is unusable: parent directory ${dir} is not writable`)
+    }
+    if (existsSync(path)) {
+      try {
+        accessSync(path, fsConstants.W_OK)
+      } catch {
+        throw new Error(`durable dedup store path ${path} is unusable: the file exists and is not writable`)
+      }
+    }
+  }
+  let db: Database | undefined
+  try {
+    db = new Database(path, { create: true })
+    db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000')
+    db.exec(`CREATE TABLE IF NOT EXISTS envelope_dedup_v2 (
+      envelope_id TEXT PRIMARY KEY,
+      first_seen_ms INTEGER NOT NULL,
+      req_id TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','completed')),
+      lease_owner TEXT NOT NULL,
+      lease_until_ms INTEGER NOT NULL
+    )`)
+    db.exec('CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_ms)')
+    return db
+  } catch (error) {
+    // A file that is not a SQLite database gets this far: the open is lazy, and
+    // the first PRAGMA is what reports `file is not a database`. Closing keeps
+    // a failed startup from leaking the handle.
+    db?.close()
+    throw new Error(
+      `durable dedup store at ${path} is unusable: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    )
+  }
+}
+
 /** Durable source of truth for envelope-id deduplication.
  *
  * Eight days exceeds the broker's seven-day max_age by one day, so every
@@ -152,21 +250,16 @@ export class DurableEnvelopeDedupStore {
     private readonly ttlMs = DEFAULT_DEDUP_TTL_MS,
     private readonly leaseMsValue = DEFAULT_DEDUP_LEASE_MS,
   ) {
+    if (path.trim() === '') {
+      throw new Error(
+        'durable dedup store path is required and has no default — pass a stable, '
+        + "bot-specific SQLite path, or ':memory:' for a test that wants no durability",
+      )
+    }
     if (path !== ':memory:' && ttlMs < MIN_DEDUP_TTL_MS) {
       throw new RangeError('durable dedup TTL must be at least the 7-day stream max_age')
     }
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
-    this.db = new Database(path, { create: true })
-    this.db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000')
-    this.db.exec(`CREATE TABLE IF NOT EXISTS envelope_dedup_v2 (
-      envelope_id TEXT PRIMARY KEY,
-      first_seen_ms INTEGER NOT NULL,
-      req_id TEXT NOT NULL,
-      state TEXT NOT NULL CHECK(state IN ('pending','completed')),
-      lease_owner TEXT NOT NULL,
-      lease_until_ms INTEGER NOT NULL
-    )`)
-    this.db.exec('CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_ms)')
+    this.db = openDedupDatabase(path)
   }
 
   claim(envelopeId: string, reqId: string, nowMs = Date.now()): { duplicate: boolean; reqId: string; owner?: string } {
@@ -857,6 +950,24 @@ interface InflightEntry {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * The configured dedup store path, or a startup error naming the bot.
+ *
+ * See `FleetBusDedupStorage` for why there is nothing to fall back to.
+ */
+function requireDedupStorePath(config: FleetBusConfig): string {
+  const path = config.dedupStorePath
+  if (path === undefined || path.trim() === '') {
+    throw new Error(
+      `FleetBus (${config.botName}): dedupStorePath is required and has no default. `
+      + 'Pass a stable, persistent, bot-specific SQLite path, or inject dedupStore. '
+      + 'The former default (~/.claude/fleet-bus-dedup-<botName>.sqlite) was user-global, '
+      + 'so a test run and a live bot shared one durable store (#29).',
+    )
+  }
+  return path
+}
+
+/**
  * Session-owned NATS transport. Stage 3 adds request/reply, supervisor loop,
  * suppression-aware reply inject, and per-key rate limiting.
  */
@@ -941,8 +1052,12 @@ export class FleetBus {
       config.seenRequestLedgerCap ?? DEFAULT_SEEN_REQUEST_LEDGER_CAP,
     )
     this.dedupTtlMs = config.dedupTtlMs ?? DEFAULT_DEDUP_TTL_MS
+    // No fallback path. `FleetBusDedupStorage` makes one of the two mandatory
+    // in the type; this is the same rule for a caller the type never reached
+    // (plain JS, or a config assembled at runtime), and it fires HERE at
+    // construction rather than at the first claim.
     this.durableDedup = config.dedupStore ?? new DurableEnvelopeDedupStore(
-      config.dedupStorePath ?? `${homedir()}/.claude/fleet-bus-dedup-${config.botName}.sqlite`,
+      requireDedupStorePath(config),
       this.dedupTtlMs,
     )
     this.dedupClaimDeadlineMs = config.dedupClaimDeadlineMs ?? DEFAULT_DEDUP_CLAIM_DEADLINE_MS

@@ -1,7 +1,7 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -30,6 +30,7 @@ import {
   type Envelope,
   type FleetBusRequestResult,
   type FleetBusConfig,
+  type FleetBusConfigBase,
   type FleetBusSessionEvent,
   type TokenBucket,
   DEFAULT_DEDUP_LEASE_MS,
@@ -143,6 +144,83 @@ describe('durable envelope dedup', () => {
     expect(crashed.claim('pending', 'original', 100)).toMatchObject({ duplicate: false, reqId: 'original' })
     const restarted = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
     expect(restarted.claim('pending', 'replacement', 111)).toMatchObject({ duplicate: false, reqId: 'original' })
+  })
+})
+
+/**
+ * #29: the dedup store path is required, and an unusable one is a STARTUP
+ * failure. Every test here asserts a refusal, because the harm being fixed was
+ * a silent success — a bus that booted happily against a store nobody chose.
+ */
+describe('dedup store path is required and validated', () => {
+  const dirs: string[] = []
+  const tempDir = (prefix: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), prefix))
+    dirs.push(dir)
+    return dir
+  }
+  const baseConfig = { botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused' }
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) {
+      // chmod back first: the unwritable-directory case leaves a mode that
+      // would defeat the cleanup it is testing.
+      try { chmodSync(dir, 0o700) } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a bus given neither a path nor a store refuses to construct', () => {
+    // `FleetBusConfig` makes this a compile error, which is the point — this
+    // cast is what a plain-JS consumer or a runtime-assembled config looks
+    // like, and that caller must be refused too, at startup rather than at the
+    // first inbound envelope.
+    const config = baseConfig as unknown as FleetBusConfig
+    expect(() => new FleetBus(config, allowlist)).toThrow(/dedupStorePath is required/)
+  })
+
+  test('a blank path is not a path, in either constructor', () => {
+    expect(() => new FleetBus({ ...baseConfig, dedupStorePath: '   ' }, allowlist))
+      .toThrow(/dedupStorePath is required/)
+    expect(() => new DurableEnvelopeDedupStore('')).toThrow(/path is required and has no default/)
+  })
+
+  test('a missing parent directory fails at construction and names it', () => {
+    const parent = join(tempDir('fleet-dedup-noparent-'), 'not-created-by-us')
+    const path = join(parent, 'dedup.sqlite')
+    expect(() => new DurableEnvelopeDedupStore(path))
+      .toThrow(new RegExp(`parent directory ${parent} does not exist`))
+    // And it stayed missing: the old `mkdirSync(…, { recursive: true })` is
+    // what turned a wrong deployment path into a second, empty claim store.
+    expect(existsSync(parent)).toBe(false)
+  })
+
+  test('an absent store FILE is still created — yugo SPEC §14 INITIAL', () => {
+    // The file's absence is a load-bearing signal in §14 (initial creation vs
+    // re-creation, hence DeliverPolicy New vs All). Only the DIRECTORY is
+    // required to pre-exist; refusing a missing file would break that path.
+    const path = join(tempDir('fleet-dedup-initial-'), 'dedup.sqlite')
+    expect(existsSync(path)).toBe(false)
+    const store = new DurableEnvelopeDedupStore(path)
+    expect(store.claim('env-initial', 'req-initial', 1_000).duplicate).toBe(false)
+    expect(existsSync(path)).toBe(true)
+  })
+
+  test.skipIf(process.getuid?.() === 0)('an unwritable parent directory fails at construction', () => {
+    // Skipped as root, which ignores the mode bits this asserts on.
+    const dir = tempDir('fleet-dedup-readonly-')
+    chmodSync(dir, 0o500)
+    expect(() => new DurableEnvelopeDedupStore(join(dir, 'dedup.sqlite')))
+      .toThrow(/parent directory .* is not writable/)
+  })
+
+  test('a file that is not a SQLite database fails at construction and names the path', () => {
+    const path = join(tempDir('fleet-dedup-notadb-'), 'dedup.sqlite')
+    writeFileSync(path, 'this file is not a database')
+    // The open is lazy, so without the wrap this surfaces as a bare
+    // `file is not a database` with no mention of which file.
+    expect(() => new DurableEnvelopeDedupStore(path))
+      .toThrow(new RegExp(`durable dedup store at ${path} is unusable: .*not a database`))
   })
 })
 
@@ -455,8 +533,21 @@ function fakeMessage(subject: string, envelope: unknown): Msg {
   return { subject, data: jc.encode(envelope) } as Msg
 }
 
+/**
+ * A bus config for a test that does not care where the claims live.
+ *
+ * `FleetBusConfig` requires one of `dedupStorePath` / `dedupStore` (#29); this
+ * is the one place allowed to omit both, and `TestFleetBus` then supplies
+ * `:memory:` — a store isolated to that bus instance, with nothing left on disk
+ * to leak into the next run. Tests that are ABOUT durability pass a temp path.
+ */
+type TestFleetBusConfig = FleetBusConfigBase & {
+  dedupStorePath?: string
+  dedupStore?: DurableEnvelopeDedupStore
+}
+
 class TestFleetBus extends FleetBus {
-  constructor(config: FleetBusConfig, allowed: ReadonlySet<string>) {
+  constructor(config: TestFleetBusConfig, allowed: ReadonlySet<string>) {
     super({ ...config, dedupStorePath: config.dedupStorePath ?? ':memory:' }, allowed)
   }
   attachFakeNc(nc: FakeNatsConnection): void {
@@ -2464,8 +2555,11 @@ describe('envelope-id dedup', () => {
  * which of its tests cannot fail is worse than a smaller one.
  */
 describe('pending claim age deadline', () => {
+  // `:memory:` unless an override names a store: every test here injects its
+  // own `dedupStore`, and the ones that do not are not about durability.
   const claimConfig = (overrides: Partial<FleetBusConfig>): FleetBusConfig => ({
-    botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', ...overrides,
+    botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+    dedupStorePath: ':memory:', ...overrides,
   })
   const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -3011,7 +3105,7 @@ describe('publish-only mode', () => {
     const nc = new FakeNatsConnection()
     const bus = new FleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      mode: 'publish-only',
+      mode: 'publish-only', dedupStorePath: ':memory:',
       connectFn: async () => nc as unknown as NatsConnection,
     }, allowlist)
     await bus.connect()
@@ -3025,7 +3119,7 @@ describe('publish-only mode', () => {
     const nc = new FakeNatsConnection()
     const bus = new FleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      mode: 'publish-only',
+      mode: 'publish-only', dedupStorePath: ':memory:',
       connectFn: async () => nc as unknown as NatsConnection,
     }, allowlist)
     await bus.connect()
@@ -3039,7 +3133,7 @@ describe('publish-only mode', () => {
     const nc = new FakeNatsConnection()
     const bus = new FleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      mode: 'publish-only',
+      mode: 'publish-only', dedupStorePath: ':memory:',
       connectFn: async () => nc as unknown as NatsConnection,
     }, allowlist)
     await bus.connect()
@@ -3053,7 +3147,7 @@ describe('publish-only mode', () => {
     const nc = new FakeNatsConnection()
     const bus = new FleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      mode: 'publish-only',
+      mode: 'publish-only', dedupStorePath: ':memory:',
       connectFn: async () => nc as unknown as NatsConnection,
     }, allowlist)
     await bus.connect()
@@ -3070,7 +3164,7 @@ describe('supervisor loop', () => {
     const connections: FakeNatsConnection[] = []
     const bus = new FleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      supervisorSleepMs: 10,
+      supervisorSleepMs: 10, dedupStorePath: ':memory:',
       connectFn: async () => {
         const nc = new FakeNatsConnection()
         connections.push(nc)
@@ -3092,7 +3186,7 @@ describe('supervisor loop', () => {
   test('runSupervisor helper returns bus + done promise', async () => {
     const { bus, done } = runSupervisor({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      supervisorSleepMs: 10,
+      supervisorSleepMs: 10, dedupStorePath: ':memory:',
       connectFn: async () => new FakeNatsConnection() as unknown as NatsConnection,
     }, allowlist)
     await new Promise(r => setTimeout(r, 30))
@@ -3108,7 +3202,7 @@ describe('supervisor loop', () => {
     const connections: FakeNatsConnection[] = []
     const bus = new FleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
-      supervisorSleepMs: 10,
+      supervisorSleepMs: 10, dedupStorePath: ':memory:',
       connectFn: async () => {
         const isFirst = connections.length === 0
         const nc = new FakeNatsConnection()

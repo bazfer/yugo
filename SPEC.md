@@ -311,6 +311,21 @@ The same error appeared in the #26 design document, where Codex and Ohm caught
 it; it is recorded here because the identical claim was living in two places and
 only one was fixed.
 
+**Amended 2026-09-28 (#29).** There is no constructor fallback any more, in
+either port. Both `dedupStorePath` (TypeScript) and `dedup_store_path` (Python)
+are **required**, with no default at any layer of the library: absent or unusable
+is a startup failure naming the path, not a store chosen on the caller's behalf.
+The TypeScript default that was removed — `~/.claude/fleet-bus-dedup-<botName>.sqlite`
+— was durable, user-global and cross-process, so a consumer that did not know to
+override it wrote real claims into a shared file and a test run poisoned a live
+bot's store. `load_config_from_env` still resolves
+`$YUGO_DEDUP_STORE_PATH` (default `/var/lib/yugo/<bot_name>-dedup.sqlite`), which
+is where the Python production path gets its explicit value; the sentences above
+about Python being a file-backed participant are unchanged by this. `:memory:` is
+still accepted as an explicit value, and the paragraph below about it still holds
+— it is now the only way to ask for a non-durable store, and it can no longer be
+arrived at by omission.
+
 **So: the yugo Python adapter is a file-backed participant in a store shared by
 OTHER PYTHON PROCESSES POINTED AT THE SAME FILE.** Note that the default path is
 **per bot name** (`<bot_name>-dedup.sqlite`), so in the shipped topology the

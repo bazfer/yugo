@@ -1,6 +1,7 @@
 """Durable envelope-id deduplication controls."""
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 import sqlite3
 import asyncio
 from datetime import datetime, timezone
@@ -616,3 +617,85 @@ async def test_a_transport_publish_failure_leaves_the_claim_recoverable(tmp_path
     assert rival.claim(f"transport-{mode}", "retry")[0] is False, (
         f"{mode}: an undelivered answer is not recoverable — suppressed for the full TTL"
     )
+
+
+# ---------- #29: the store path is required, and unusable is fatal ----------
+#
+# Every test below asserts a REFUSAL. The harm being fixed was a silent
+# success: a bus that booted happily against a store nobody chose, because a
+# falsy path meant `":memory:"` here and a user-global file in the TypeScript
+# port.
+
+
+def _config(**overrides):
+    base = dict(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec"}), plugin_version="test",
+        audit_log_path=None, dedup_store_path=":memory:",
+    )
+    base.update(overrides)
+    return fleet_bus.FleetBusConfig(**base)
+
+
+def test_the_config_cannot_be_built_without_a_dedup_store_path():
+    """`dedup_store_path` has no default, so omission is a TypeError at the
+    dataclass rather than a bus running on a store nobody chose."""
+    base = dict(
+        bot_name="vec", url="nats://unused", user="vec", password="x",
+        allowed_from=frozenset({"vec"}), plugin_version="test",
+        audit_log_path=None,
+    )
+    with pytest.raises(TypeError, match="dedup_store_path"):
+        fleet_bus.FleetBusConfig(**base)
+
+
+def test_a_blank_dedup_store_path_is_refused_at_construction():
+    with pytest.raises(fleet_bus.FleetBusConfigError, match="required and has no default"):
+        fleet_bus.DurableEnvelopeDedupStore("   ")
+    with pytest.raises(fleet_bus.FleetBusConfigError, match="required and has no default"):
+        fleet_bus.FleetBus(_config(dedup_store_path=""), fleet_bus.AuditLog(None))
+
+
+def test_a_missing_parent_directory_fails_at_startup_and_names_it(tmp_path):
+    parent = tmp_path / "not-created-by-us"
+    path = parent / "dedup.sqlite"
+    with pytest.raises(fleet_bus.FleetBusConfigError, match="parent directory .* does not exist"):
+        fleet_bus.DurableEnvelopeDedupStore(str(path))
+    # And it stayed missing: the old `mkdir(parents=True, exist_ok=True)` is
+    # what turned a wrong deployment path into a second, empty claim store.
+    assert not parent.exists()
+
+
+def test_an_absent_store_file_is_still_created_spec_14_initial(tmp_path):
+    """SPEC §14 reads the store file's ABSENCE as initial creation
+    (`DeliverPolicy=New`). Only the directory must pre-exist; refusing a
+    missing file would break that path."""
+    path = tmp_path / "dedup.sqlite"
+    assert not path.exists()
+    store = fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert store.claim("env-initial", "req-initial", now_s=1000)[0] is False
+    assert path.exists()
+
+
+def test_an_unwritable_parent_directory_fails_at_startup(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the mode bits this asserts on")
+    directory = tmp_path / "read-only"
+    directory.mkdir()
+    directory.chmod(0o500)
+    try:
+        with pytest.raises(fleet_bus.FleetBusConfigError, match="is not writable"):
+            fleet_bus.DurableEnvelopeDedupStore(str(directory / "dedup.sqlite"))
+    finally:
+        directory.chmod(0o700)
+
+
+def test_a_file_that_is_not_a_database_fails_at_startup_and_names_the_path(tmp_path):
+    """`sqlite3.connect` is lazy, so without the wrap this surfaces at the
+    first PRAGMA as a bare `file is not a database` naming no file at all."""
+    path = tmp_path / "dedup.sqlite"
+    path.write_text("this file is not a database", encoding="utf-8")
+    with pytest.raises(fleet_bus.FleetBusConfigError) as excinfo:
+        fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert str(path) in str(excinfo.value)
+    assert "not a database" in str(excinfo.value)

@@ -123,6 +123,7 @@ def dead_bus(monkeypatch, tmp_path):
         audit_log_path=str(audit_path),
         heartbeat_interval_s=0.2,
         reconnect_time_wait_s=0.05,
+        dedup_store_path=str(tmp_path / "dedup.sqlite"),
     )
     monkeypatch.setattr(bot, "BUS_CONFIG", config)
     monkeypatch.setattr(bot, "_bus", None)

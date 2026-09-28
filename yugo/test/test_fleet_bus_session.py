@@ -139,6 +139,9 @@ def session_bus(nats_server, tmp_path):  # noqa: F811 — pytest fixture injecti
             audit_log_path=str(audit_path),
             heartbeat_interval_s=HEARTBEAT_S,
             reconnect_time_wait_s=RECONNECT_WAIT_S,
+            # Required (#29), one file per harness under pytest's tmp_path so
+            # no two buses — and no two runs — share a claim store.
+            dedup_store_path=str(tmp_path / f"session-dedup-{len(started)}.sqlite"),
         )
         bus = fleet_bus.FleetBus(
             config, fleet_bus.AuditLog(str(audit_path)), on_envelope=_hook
@@ -630,6 +633,7 @@ async def test_the_bot_wires_the_session_hook_into_the_supervisor(
         audit_log_path=str(audit_path),
         heartbeat_interval_s=HEARTBEAT_S,
         reconnect_time_wait_s=RECONNECT_WAIT_S,
+        dedup_store_path=str(tmp_path / "wired-dedup.sqlite"),
     )
     monkeypatch.setattr(bot_module, "BUS_CONFIG", config)
     monkeypatch.setattr(bot_module, "_bus", None)
@@ -852,6 +856,7 @@ async def test_the_hook_receives_the_whole_envelope_including_baton_fields():
         allowed_from=frozenset({BOT_NAME, PEER_NAME}),
         plugin_version="0.3b-test",
         audit_log_path=None,
+        dedup_store_path=":memory:",
     )
     bus = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None, logger=lambda _: None),
                              on_envelope=_hook)

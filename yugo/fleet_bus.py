@@ -1115,6 +1115,38 @@ async def _cancel_task(task: "asyncio.Task | None") -> None:
         pass
 
 
+def _check_dedup_path_usable(path: str) -> None:
+    """Raise FleetBusConfigError naming the path, or return.
+
+    The parent directory must EXIST; this no longer creates it. A directory
+    conjured on demand turns a wrong deployment path into a brand-new empty
+    claim database, which is the silent-second-store failure of #29.
+
+    The store FILE may legitimately be absent — SPEC §14 reads its absence as
+    initial creation (`DeliverPolicy=New`) rather than as a fault — so absence
+    is not checked here. Only a file that exists and cannot be written, or
+    cannot be read as SQLite, is a fault.
+    """
+    parent = Path(path).parent
+    if not parent.is_dir():
+        raise FleetBusConfigError(
+            f"durable dedup store path {path!r} is unusable: parent directory "
+            f"{str(parent)!r} does not exist. Create it as part of deployment; "
+            f"the store does not create it."
+        )
+    if not os.access(parent, os.W_OK):
+        raise FleetBusConfigError(
+            f"durable dedup store path {path!r} is unusable: parent directory "
+            f"{str(parent)!r} is not writable"
+        )
+    target = Path(path)
+    if target.exists() and not os.access(target, os.W_OK):
+        raise FleetBusConfigError(
+            f"durable dedup store path {path!r} is unusable: the file exists "
+            f"and is not writable"
+        )
+
+
 class DurableEnvelopeDedupStore:
     """SQLite envelope-id claims retained for 8d (7d stream age + 1d slack).
 
@@ -1125,25 +1157,47 @@ class DurableEnvelopeDedupStore:
 
     def __init__(self, path: str, ttl_s: int = DEFAULT_DEDUP_TTL_S,
                  lease_s: int = DEFAULT_DEDUP_LEASE_S) -> None:
+        if not path.strip():
+            raise FleetBusConfigError(
+                "durable dedup store path is required and has no default — pass a "
+                "stable, bot-specific SQLite path, or ':memory:' for a test that "
+                "wants no durability"
+            )
         if path != ":memory:" and ttl_s < MIN_DEDUP_TTL_S:
             raise ValueError("durable dedup TTL must be at least the 7-day stream max_age")
         if path != ":memory:":
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        # WAL, matching the TypeScript port. Rollback-journal mode costs ~5ms
-        # per claim+complete against ~2.6ms on WAL — per inbound envelope, on
-        # the event-loop thread that also serves NATS callbacks — and lets a
-        # writer block readers file-wide, which is the regime the concurrency
-        # claim below is counting on.
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=5000")
-        self._db.execute(
-            "CREATE TABLE IF NOT EXISTS envelope_dedup_v2 ("
-            "envelope_id TEXT PRIMARY KEY, first_seen_s REAL NOT NULL, req_id TEXT NOT NULL, "
-            "state TEXT NOT NULL CHECK(state IN ('pending','completed')), "
-            "lease_owner TEXT NOT NULL, lease_until_s REAL NOT NULL)"
-        )
-        self._db.execute("CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_s)")
+            _check_dedup_path_usable(path)
+        db: sqlite3.Connection | None = None
+        try:
+            # Inside the try: an open can fail on its own (a directory at the
+            # store path, a permission the checks above cannot see), and that
+            # error must still name the path.
+            db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+            # WAL, matching the TypeScript port. Rollback-journal mode costs ~5ms
+            # per claim+complete against ~2.6ms on WAL — per inbound envelope, on
+            # the event-loop thread that also serves NATS callbacks — and lets a
+            # writer block readers file-wide, which is the regime the concurrency
+            # claim below is counting on.
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA busy_timeout=5000")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS envelope_dedup_v2 ("
+                "envelope_id TEXT PRIMARY KEY, first_seen_s REAL NOT NULL, req_id TEXT NOT NULL, "
+                "state TEXT NOT NULL CHECK(state IN ('pending','completed')), "
+                "lease_owner TEXT NOT NULL, lease_until_s REAL NOT NULL)"
+            )
+            db.execute("CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_s)")
+        except sqlite3.Error as e:
+            # `connect` is lazy, so a file that is not a SQLite database gets
+            # this far and the first PRAGMA is what reports it. Close, then name
+            # the path — a bare `file is not a database` says nothing about
+            # WHICH file, and the operator has several.
+            if db is not None:
+                db.close()
+            raise FleetBusConfigError(
+                f"durable dedup store at {path!r} is unusable: {e!r}"
+            ) from e
+        self._db = db
         self._ttl_s = ttl_s
         self._lease_s = lease_s
         self._lock = threading.Lock()
@@ -1285,7 +1339,17 @@ class FleetBusConfig:
     heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S
     reconnect_time_wait_s: float = DEFAULT_RECONNECT_TIME_WAIT_S
     drain_timeout_s: float = DEFAULT_DRAIN_TIMEOUT_S
-    dedup_store_path: str | None = None
+    # REQUIRED, and there is no default (#29). `load_config_from_env` resolves
+    # `$YUGO_DEDUP_STORE_PATH` (default `/var/lib/yugo/<bot_name>-dedup.sqlite`)
+    # so the production startup path always supplies one; a test supplies an
+    # isolated temporary file, or `":memory:"` when it wants no durability.
+    # A falsy value used to mean `":memory:"`, which made a durable claim store
+    # silently process-scoped — a restart discarding exactly the protection the
+    # store exists to provide.
+    #
+    # `kw_only` because a field with no default cannot follow fields that have
+    # one; keeping it here, next to `dedup_ttl_s`, is worth the keyword.
+    dedup_store_path: str = field(kw_only=True)
     dedup_ttl_s: int = DEFAULT_DEDUP_TTL_S
 
 
@@ -1429,8 +1493,11 @@ class FleetBus:
         # Reported on every heartbeat from 3b. See create_heartbeat_envelope.
         self._injection_delivered_ts: str | None = None
         self._session_last_response_ts: str | None = None
+        # No fallback: the config type requires the path, and an unusable one
+        # raises HERE, at startup, rather than surfacing as a
+        # `yugo_dedup_store_failed` drop on every inbound envelope (#29).
         self._dedup = DurableEnvelopeDedupStore(
-            config.dedup_store_path or ":memory:", config.dedup_ttl_s
+            config.dedup_store_path, config.dedup_ttl_s
         )
 
     @property

@@ -116,6 +116,8 @@ def bus_factory(nats_server, tmp_path):  # noqa: F811 — pytest fixture injecti
             "audit_log_path": str(audit_path),
             "heartbeat_interval_s": HEARTBEAT_S,
             "reconnect_time_wait_s": RECONNECT_WAIT_S,
+            # Required (#29), one file per harness under pytest's tmp_path.
+            "dedup_store_path": str(tmp_path / f"dedup-{len(started)}.sqlite"),
         }
         # Merged, not splatted alongside the defaults: a test that overrides
         # `password` (the credentials case) would otherwise be a duplicate
@@ -408,6 +410,7 @@ async def test_lifecycle_start_twice_yields_one_client_and_one_task(
         audit_log_path=str(audit_path),
         heartbeat_interval_s=HEARTBEAT_S,
         reconnect_time_wait_s=RECONNECT_WAIT_S,
+        dedup_store_path=str(tmp_path / "wiring-dedup.sqlite"),
     )
     monkeypatch.setattr(bot_module, "BUS_CONFIG", config)
     monkeypatch.setattr(bot_module, "_bus", None)

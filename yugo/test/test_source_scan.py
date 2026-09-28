@@ -126,6 +126,9 @@ def test_adapter_never_subscribes_the_post_jetstream_inbox_subject():
         allowed_from=frozenset({"yugo"}),
         plugin_version="0.3a",
         audit_log_path=None,
+        # Required (#29). This test only reads `subjects`, so an in-process
+        # store is the isolated choice — nothing to leave on disk.
+        dedup_store_path=":memory:",
     )
     subjects = fleet_bus.FleetBus(config, fleet_bus.AuditLog(None)).subjects
     assert subjects == (
