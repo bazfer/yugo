@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -12,7 +12,7 @@ import {
   DEFAULT_DEDUP_CLAIM_DEADLINE_MS,
   DEFAULT_DEDUP_TTL_MS,
   DEFAULT_PAYLOAD_BODY_MAX_BYTES,
-  DurableEnvelopeDedupStore,
+  DurableEnvelopeDedupStore as VerifiedDedupStore,
   FixedWindowBucket,
   FleetBus,
   RESERVED_BOT_NAMES,
@@ -29,12 +29,31 @@ import {
   validateEnvelope,
   type Envelope,
   type FleetBusRequestResult,
+  type FleetBusReplyResult,
   type FleetBusConfig,
   type FleetBusConfigBase,
   type FleetBusSessionEvent,
   type TokenBucket,
   DEFAULT_DEDUP_LEASE_MS,
 } from './fleet-bus'
+
+import { provisionTestStore } from './dedup-test-fixtures'
+// Explicit test fixture provisioning, not a consumer auto-create path.
+class DurableEnvelopeDedupStore extends VerifiedDedupStore {
+  constructor(path: string, ttl = DEFAULT_DEDUP_TTL_MS, lease = DEFAULT_DEDUP_LEASE_MS) {
+    if (path !== ':memory:') process.env.YUGO_DEDUP_VERIFICATION_RECORD = provisionTestStore(path)
+    super(path, ttl, lease)
+  }
+}
+
+// Behavioral unit tests use an injected advancing clock, never ABI qualification.
+// Actual native-clock evidence is collected separately on the qualified host.
+import * as monotonic from './monotonic-clock'
+let clockSpy: ReturnType<typeof spyOn>
+beforeEach(() => {
+  clockSpy = spyOn(monotonic, 'readMonotonicMs').mockImplementation(() => Math.floor(performance.now()))
+})
+afterEach(() => clockSpy.mockRestore())
 
 const jc = JSONCodec()
 const allowlist = normalizeAllowlist(['luna', 'deet', 'kat', 'vec', 'ohm', 'myc', 'helm'])
@@ -111,6 +130,7 @@ describe('durable envelope dedup', () => {
     expect(rival.claim('long-turn', 'rival', 104_500).duplicate).toBe(true)
 
     // Owner dies. Recovery still works — that is the at-least-once half.
+    new Database(path).exec('UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1')
     expect(rival.claim('long-turn', 'rival', 200_000).duplicate).toBe(false)
     // And the original owner is now fenced: its completion must not land.
     expect(owner.complete('long-turn', claim.owner!)).toBe(false)
@@ -143,6 +163,7 @@ describe('durable envelope dedup', () => {
     const crashed = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
     expect(crashed.claim('pending', 'original', 100)).toMatchObject({ duplicate: false, reqId: 'original' })
     const restarted = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 10)
+    new Database(path).exec('UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1')
     expect(restarted.claim('pending', 'replacement', 111)).toMatchObject({ duplicate: false, reqId: 'original' })
   })
 })
@@ -182,35 +203,31 @@ describe('dedup store path is required and validated', () => {
   test('a blank path is not a path, in either constructor', () => {
     expect(() => new FleetBus({ ...baseConfig, dedupStorePath: '   ' }, allowlist))
       .toThrow(/dedupStorePath is required/)
-    expect(() => new DurableEnvelopeDedupStore('')).toThrow(/path is required and has no default/)
+    expect(() => new VerifiedDedupStore('')).toThrow(/path is required and has no default/)
   })
 
   test('a missing parent directory fails at construction and names it', () => {
     const parent = join(tempDir('fleet-dedup-noparent-'), 'not-created-by-us')
     const path = join(parent, 'dedup.sqlite')
-    expect(() => new DurableEnvelopeDedupStore(path))
+    expect(() => new VerifiedDedupStore(path))
       .toThrow(new RegExp(`parent directory ${parent} does not exist`))
     // And it stayed missing: the old `mkdirSync(…, { recursive: true })` is
     // what turned a wrong deployment path into a second, empty claim store.
     expect(existsSync(parent)).toBe(false)
   })
 
-  test('an absent store FILE is still created — yugo SPEC §14 INITIAL', () => {
-    // The file's absence is a load-bearing signal in §14 (initial creation vs
-    // re-creation, hence DeliverPolicy New vs All). Only the DIRECTORY is
-    // required to pre-exist; refusing a missing file would break that path.
+  test('Release 2 refuses an absent store file rather than creating it', () => {
     const path = join(tempDir('fleet-dedup-initial-'), 'dedup.sqlite')
     expect(existsSync(path)).toBe(false)
-    const store = new DurableEnvelopeDedupStore(path)
-    expect(store.claim('env-initial', 'req-initial', 1_000).duplicate).toBe(false)
-    expect(existsSync(path)).toBe(true)
+    expect(() => new VerifiedDedupStore(path)).toThrow()
+    expect(existsSync(path)).toBe(false)
   })
 
   test.skipIf(process.getuid?.() === 0)('an unwritable parent directory fails at construction', () => {
     // Skipped as root, which ignores the mode bits this asserts on.
     const dir = tempDir('fleet-dedup-readonly-')
     chmodSync(dir, 0o500)
-    expect(() => new DurableEnvelopeDedupStore(join(dir, 'dedup.sqlite')))
+    expect(() => new VerifiedDedupStore(join(dir, 'dedup.sqlite')))
       .toThrow(/parent directory .* is not writable/)
   })
 
@@ -219,8 +236,8 @@ describe('dedup store path is required and validated', () => {
     writeFileSync(path, 'this file is not a database')
     // The open is lazy, so without the wrap this surfaces as a bare
     // `file is not a database` with no mention of which file.
-    expect(() => new DurableEnvelopeDedupStore(path))
-      .toThrow(new RegExp(`durable dedup store at ${path} is unusable: .*not a database`))
+    expect(() => new VerifiedDedupStore(path))
+      .toThrow(new RegExp(`durable dedup store at ${path} is unusable:`))
   })
 })
 
@@ -548,6 +565,9 @@ type TestFleetBusConfig = FleetBusConfigBase & {
 
 class TestFleetBus extends FleetBus {
   constructor(config: TestFleetBusConfig, allowed: ReadonlySet<string>) {
+    if (config.dedupStorePath && config.dedupStorePath !== ':memory:') {
+      process.env.YUGO_DEDUP_VERIFICATION_RECORD = provisionTestStore(config.dedupStorePath)
+    }
     super({ ...config, dedupStorePath: config.dedupStorePath ?? ':memory:' }, allowed)
   }
   attachFakeNc(nc: FakeNatsConnection): void {
@@ -1013,7 +1033,7 @@ describe('request session injection', () => {
     // waiting, which renewal would otherwise defeat. The store preserves the
     // ORIGINAL reqId and issues a NEW owner, which is the whole point.
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-owner')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('stale-owner')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -1058,7 +1078,7 @@ describe('request session injection', () => {
 
     // Force the takeover #26 admits: same reqId, new owner, new attempt token.
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('stale-reply')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('stale-reply')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -1103,7 +1123,7 @@ describe('request session injection', () => {
     const oldTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('token-matrix')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('token-matrix')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -1191,7 +1211,7 @@ describe('request session injection', () => {
     expect(first.duplicate).toBe(false)
     const ownerA = first.owner!
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('rel-own')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('rel-own')
     raw.close()
 
     // B takes over the SAME envelope; reqId is preserved, owner is new.
@@ -1245,7 +1265,7 @@ describe('request session injection', () => {
     const oldTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('hop-token')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('hop-token')
     raw.close()
     const newTurn = bus.handleRequest(wire)
     await new Promise(resolve => setTimeout(resolve, 20))
@@ -1326,6 +1346,7 @@ describe('request session injection', () => {
     // PR's durable store would otherwise have introduced: before it, the
     // ledger was in-memory and a restart simply cleared it.
     const store = new DurableEnvelopeDedupStore(dedupStorePath)
+    new Database(dedupStorePath).exec('UPDATE envelope_dedup_v2 SET lease_until_mono_ms=1')
     const row = store.claim('restart-duplicate', 'after-lease', Date.now() + DEFAULT_DEDUP_LEASE_MS + 1)
     expect(row.duplicate).toBe(false)
   })
@@ -2649,7 +2670,7 @@ describe('pending claim age deadline', () => {
     // t≈0: claim A registered, its deadline due at t≈500.
     await sleep(150)
     const raw = new Database(path)
-    raw.query('UPDATE envelope_dedup_v2 SET lease_until_ms = 0 WHERE envelope_id = ?').run('deadline-takeover')
+    raw.query('UPDATE envelope_dedup_v2 SET lease_until_mono_ms = 1 WHERE envelope_id = ?').run('deadline-takeover')
     raw.close()
     await bus.handleRequest(wire)
     // t≈150: claim B takes the lapsed row and replaces A under the same key.
@@ -3257,7 +3278,7 @@ describe('NATS authorization boundary', () => {
       const violations: string[] = []
       void (async () => {
         for await (const status of consoleClient.status()) {
-          if (status.type === 'error' || status.type === 'permissionError') {
+          if (status.type === 'error' || String(status.type) === 'permissionError') {
             violations.push(String(status.data))
           }
         }

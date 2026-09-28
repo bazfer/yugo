@@ -10,6 +10,8 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import { accessSync, appendFileSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Database } from 'bun:sqlite'
+import { readMonotonicMs, checkedDeadline } from './monotonic-clock.ts'
+import { openVerifiedStore, readBootId, validBootId, VerificationError } from './dedup-verification.ts'
 import { parse as parseYaml } from 'yaml'
 
 export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
@@ -208,25 +210,9 @@ function openDedupDatabase(path: string): Database {
       }
     }
   }
-  let db: Database | undefined
   try {
-    db = new Database(path, { create: true })
-    db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000')
-    db.exec(`CREATE TABLE IF NOT EXISTS envelope_dedup_v2 (
-      envelope_id TEXT PRIMARY KEY,
-      first_seen_ms INTEGER NOT NULL,
-      req_id TEXT NOT NULL,
-      state TEXT NOT NULL CHECK(state IN ('pending','completed')),
-      lease_owner TEXT NOT NULL,
-      lease_until_ms INTEGER NOT NULL
-    )`)
-    db.exec('CREATE INDEX IF NOT EXISTS envelope_dedup_v2_first_seen ON envelope_dedup_v2(first_seen_ms)')
-    return db
+    return openVerifiedStore(path)
   } catch (error) {
-    // A file that is not a SQLite database gets this far: the open is lazy, and
-    // the first PRAGMA is what reports `file is not a database`. Closing keeps
-    // a failed startup from leaking the handle.
-    db?.close()
     throw new Error(
       `durable dedup store at ${path} is unusable: ${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
@@ -259,51 +245,77 @@ export class DurableEnvelopeDedupStore {
     if (path !== ':memory:' && ttlMs < MIN_DEDUP_TTL_MS) {
       throw new RangeError('durable dedup TTL must be at least the 7-day stream max_age')
     }
+    if (!Number.isFinite(leaseMsValue) || leaseMsValue <= 0) throw new RangeError('dedup lease must be positive and finite')
     this.db = openDedupDatabase(path)
+  }
+
+  private validateMetadata(boot: unknown, deadline: unknown): void {
+    if (boot === '') return // Supported legacy discriminator.
+    if (!validBootId(boot) || !Number.isSafeInteger(deadline) || (deadline as number) <= 0) {
+      throw new VerificationError('malformed new-format lease metadata')
+    }
+  }
+
+  private leaseClock(): { boot: string; mono: number; deadline: number } {
+    const boot = readBootId() // A failed read never authorizes acquisition.
+    const mono = readMonotonicMs()
+    const deadline = checkedDeadline(mono, this.leaseMsValue)
+    if (!Number.isSafeInteger(mono) || mono < 0 || !Number.isSafeInteger(deadline) || deadline <= mono) {
+      throw new VerificationError('invalid monotonic lease clock')
+    }
+    return { boot, mono, deadline }
   }
 
   claim(envelopeId: string, reqId: string, nowMs = Date.now()): { duplicate: boolean; reqId: string; owner?: string } {
     const owner = randomUUID()
-    // `.immediate()`, matching the Python port's `BEGIN IMMEDIATE`.
-    //
-    // Honest about what it does and does not buy: the arbiter is the PRIMARY
-    // KEY plus `INSERT OR IGNORE`, not the transaction mode. The first
-    // statement here is a DELETE, so a deferred transaction takes the write
-    // lock at that same point and behaves identically — a review confirmed the
-    // exactly-one-winner test passes either way. This is kept for parity with
-    // the sibling port and to state the intent at the top, not because
-    // correctness depends on it.
     const transaction = this.db.transaction(() => {
+      const { boot, mono, deadline } = this.leaseClock()
       this.claims += 1
       if (this.claims % DEDUP_PRUNE_EVERY === 0) this.prune(nowMs)
-      this.db.query('DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND first_seen_ms < ?')
+      this.db.query("DELETE FROM envelope_dedup_v2 WHERE envelope_id=? AND state='completed' AND first_seen_ms < ?")
         .run(envelopeId, nowMs - this.ttlMs)
       const inserted = this.db.query(
-        "INSERT OR IGNORE INTO envelope_dedup_v2 (envelope_id,first_seen_ms,req_id,state,lease_owner,lease_until_ms) VALUES (?,?,?,'pending',?,?)",
-      ).run(envelopeId, nowMs, reqId, owner, nowMs + this.leaseMsValue)
+        "INSERT OR IGNORE INTO envelope_dedup_v2 (envelope_id,first_seen_ms,req_id,state,lease_owner,lease_until_ms,lease_boot_id,lease_until_mono_ms) VALUES (?,?,?,'pending',?,?,?,?)",
+      ).run(envelopeId, nowMs, reqId, owner, nowMs + this.leaseMsValue, boot, deadline)
       if (inserted.changes === 1) return { duplicate: false, reqId, owner }
-      const row = this.db.query('SELECT req_id,state,lease_until_ms FROM envelope_dedup_v2 WHERE envelope_id=?')
-        .get(envelopeId) as { req_id: string; state: string; lease_until_ms: number }
-      if (row.state === 'pending' && row.lease_until_ms <= nowMs) {
-        const recovered = this.db.query(
-          "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_ms=? WHERE envelope_id=? AND state='pending' AND lease_until_ms<=?",
-        ).run(owner, nowMs + this.leaseMsValue, envelopeId, nowMs)
-        if (recovered.changes === 1) return { duplicate: false, reqId: row.req_id, owner }
+      if (inserted.changes !== 0) throw new VerificationError('fresh claim affected an unexpected number of rows')
+      const row = this.db.query('SELECT req_id,state,lease_until_ms,lease_owner,lease_boot_id,lease_until_mono_ms FROM envelope_dedup_v2 WHERE envelope_id=?')
+        .get(envelopeId) as { req_id: string; state: string; lease_until_ms: number; lease_owner: string; lease_boot_id: string; lease_until_mono_ms: number } | null
+      if (!row) throw new VerificationError('fresh claim inserted zero rows without an existing claim')
+      if (row.state === 'pending') {
+        this.validateMetadata(row.lease_boot_id, row.lease_until_mono_ms)
+        const eligible = row.lease_boot_id === ''
+          ? row.lease_until_ms <= nowMs
+          : row.lease_boot_id !== boot || row.lease_until_mono_ms <= mono
+        if (eligible) {
+          // One complete ownership update, conditional on the read snapshot.
+          // IMMEDIATE serializes writers; success still requires exactly one row.
+          const recovered = this.db.query(
+            "UPDATE envelope_dedup_v2 SET lease_owner=?,lease_until_ms=?,lease_boot_id=?,lease_until_mono_ms=? WHERE envelope_id=? AND state='pending' AND lease_owner=? AND lease_until_ms=? AND lease_boot_id=? AND lease_until_mono_ms=?",
+          ).run(owner, nowMs + this.leaseMsValue, boot, deadline, envelopeId, row.lease_owner,
+            row.lease_until_ms, row.lease_boot_id, row.lease_until_mono_ms)
+          if (recovered.changes === 1) return { duplicate: false, reqId: row.req_id, owner }
+        }
       }
       return { duplicate: true, reqId: row.req_id }
     })
+    // Bun commits before returning; a write/commit failure cannot authorize work.
     return transaction.immediate()
   }
 
-  /**
-   * Extend a live owner's lease. `false` means the lease was already lost and
-   * the caller must stop doing externally-visible work: another consumer holds
-   * the envelope, so anything from here on is the duplicate.
-   */
+  /** Extend the owner's lease in the monotonic domain without changing ownership. */
   renew(envelopeId: string, owner: string, nowMs = Date.now()): boolean {
-    return this.db.query(
-      "UPDATE envelope_dedup_v2 SET lease_until_ms=? WHERE envelope_id=? AND lease_owner=? AND state='pending'",
-    ).run(nowMs + this.leaseMsValue, envelopeId, owner).changes === 1
+    return this.db.transaction(() => {
+      const { boot, deadline } = this.leaseClock()
+      const row = this.db.query("SELECT lease_boot_id,lease_until_mono_ms FROM envelope_dedup_v2 WHERE envelope_id=? AND lease_owner=? AND state='pending'")
+        .get(envelopeId, owner) as { lease_boot_id: string; lease_until_mono_ms: number } | null
+      if (!row) return false
+      this.validateMetadata(row.lease_boot_id, row.lease_until_mono_ms)
+      if (row.lease_boot_id !== '' && row.lease_boot_id !== boot) return false
+      return this.db.query(
+        "UPDATE envelope_dedup_v2 SET lease_until_ms=?,lease_boot_id=?,lease_until_mono_ms=? WHERE envelope_id=? AND lease_owner=? AND state='pending'",
+      ).run(nowMs + this.leaseMsValue, boot, deadline, envelopeId, owner).changes === 1
+    }).immediate()
   }
 
   /**
@@ -335,7 +347,7 @@ export class DurableEnvelopeDedupStore {
     while (deleted < budget) {
       const batch = Math.min(DEDUP_PRUNE_LIMIT, budget - deleted)
       const n = this.db.query(
-        'DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 WHERE first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?)',
+        'DELETE FROM envelope_dedup_v2 WHERE rowid IN (SELECT rowid FROM envelope_dedup_v2 WHERE state=\'completed\' AND first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?)',
       ).run(cutoff, batch).changes
       deleted += n
       if (n < batch) break // expired set exhausted
@@ -366,13 +378,13 @@ export class DurableEnvelopeDedupStore {
 
   /** Rows the TTL says should already be gone. The invariant a sweep must drive to zero. */
   countExpired(nowMs = Date.now()): number {
-    return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2 WHERE first_seen_ms < ?')
+    return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2 WHERE state=\'completed\' AND first_seen_ms < ?')
       .get(nowMs - this.ttlMs) as { n: number }).n
   }
 
   prunePlan(): string {
     return this.db.query(
-      'EXPLAIN QUERY PLAN SELECT rowid FROM envelope_dedup_v2 WHERE first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?',
+      'EXPLAIN QUERY PLAN SELECT rowid FROM envelope_dedup_v2 WHERE state=\'completed\' AND first_seen_ms < ? ORDER BY first_seen_ms LIMIT ?',
     ).all(0, DEDUP_PRUNE_LIMIT).map(row => JSON.stringify(row)).join(' ')
   }
 }
