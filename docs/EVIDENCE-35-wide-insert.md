@@ -49,9 +49,18 @@ eight-column INSERT list. Its existing wider-table regression failed with
 `table envelope_dedup_v2 has 9 columns but 8 values were supplied`; restoration
 passed (1 pass, 0 fail). Source was restored and git status inspected.
 
-These are executed proofs in both historical ports and the current TS writer,
-not yet automated CI gates. CI wiring and remaining Release-2 mutation
-coverage are pending.
+The historical proofs are now automated CI gates. The `release1-wide-insert`
+job (`.github/workflows/ci.yml`, wired in `9473108` and `5fd5bfd`) runs both
+ports' seven-column regressions against a pinned `feca116` checkout, then runs
+`conformance/check-release1-mutations.py`, which reverts each port's real named
+INSERT, requires the exact
+`table envelope_dedup_v2 has 7 columns but 6 values were supplied` failure, and
+restores the sources. That script was executed end-to-end before it landed.
+
+Still NOT automated: the current Release-2 TypeScript writer's nine-column
+mutation. Its wider-table regression runs in CI through `bun test src`, but no
+job mutates that writer — the red half above remains a manual proof. Remaining
+Release-2 mutation coverage is still pending.
 
 ## Independent operator reproduction — 2026-09-28
 

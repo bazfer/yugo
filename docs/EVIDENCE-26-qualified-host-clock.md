@@ -48,9 +48,18 @@ subsequent actual-clock test supplies behavioral evidence.
 ## Limits / remaining gates
 
 This is one selected test, not a full conformance or release qualification
-claim. Integration/typecheck repairs, remaining conformance coverage, issue
-#35's actual seven-column INSERT mutation proof, full-suite validation and
-review remain outstanding. No production database was migrated by this run.
+claim. No production database was migrated by this run.
+
+Since this evidence was written, two gates landed in CI (`9473108`,
+`5fd5bfd`). `native-clock-regression` runs the ABI assertion and the
+actual-clock cross-process test on an `ubuntu-24.04` runner — runner
+regression evidence, NOT deployment-host qualification, which still requires
+the host probe recorded above. `release1-wide-insert` automates issue #35's
+seven-column INSERT mutation proof through
+`conformance/check-release1-mutations.py`.
+
+Still outstanding: remaining conformance coverage, Release-2 mutation coverage
+beyond the named-INSERT and startup-clock proofs, and review.
 
 ## Operator-reported rerun — 2026-09-28
 

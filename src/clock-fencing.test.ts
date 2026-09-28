@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
+import * as sqlite from 'bun:sqlite'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -196,6 +197,25 @@ describe('startup interface SPEC-26', () => {
         return value
       })
       expect(() => verification.openVerifiedStore(':memory:')).toThrow()
+    })
+  }
+  for (const backing of ['memory', 'file']) {
+    test(`18a startup clock failure refuses ${backing} before any database opens`, () => {
+      const f = backing === 'file' ? fileFixture() : undefined
+      const before = f && fs.readFileSync(f.path)
+      const broken = spyOn(monotonic, 'readMonotonicMs').mockImplementation(() => {
+        throw new monotonic.MonotonicClockError('native monotonic clock unavailable')
+      })
+      cleanups.push(() => broken.mockRestore())
+      // Reaching the constructor at all is the failure: SPEC-26 §1a.1 refuses
+      // startup on a clock failure without opening a store, including :memory:.
+      const opened: any = spyOn(sqlite, 'Database')
+      opened.mockImplementation(() => { throw new Error('startup opened SQLite before validating the clock') })
+      cleanups.push(() => opened.mockRestore())
+      const open = f ? f.open : () => verification.openVerifiedStore(':memory:')
+      expect(open).toThrow('native monotonic clock unavailable')
+      expect(opened).not.toHaveBeenCalled()
+      if (f) expect(fs.readFileSync(f.path)).toEqual(before!)
     })
   }
   for (const kind of ['missing', 'malformed', 'version', 'unknown']) {
