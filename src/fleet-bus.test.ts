@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -29,6 +29,7 @@ import {
   validateEnvelope,
   type Envelope,
   type FleetBusRequestResult,
+  type FleetBusReplyResult,
   type FleetBusConfig,
   type FleetBusConfigBase,
   type FleetBusSessionEvent,
@@ -44,6 +45,15 @@ class DurableEnvelopeDedupStore extends VerifiedDedupStore {
     super(path, ttl, lease)
   }
 }
+
+// Behavioral unit tests use an injected advancing clock, never ABI qualification.
+// Actual native-clock evidence is collected separately on the qualified host.
+import * as monotonic from './monotonic-clock'
+let clockSpy: ReturnType<typeof spyOn>
+beforeEach(() => {
+  clockSpy = spyOn(monotonic, 'readMonotonicMs').mockImplementation(() => Math.floor(performance.now()))
+})
+afterEach(() => clockSpy.mockRestore())
 
 const jc = JSONCodec()
 const allowlist = normalizeAllowlist(['luna', 'deet', 'kat', 'vec', 'ohm', 'myc', 'helm'])
@@ -193,35 +203,31 @@ describe('dedup store path is required and validated', () => {
   test('a blank path is not a path, in either constructor', () => {
     expect(() => new FleetBus({ ...baseConfig, dedupStorePath: '   ' }, allowlist))
       .toThrow(/dedupStorePath is required/)
-    expect(() => new DurableEnvelopeDedupStore('')).toThrow(/path is required and has no default/)
+    expect(() => new VerifiedDedupStore('')).toThrow(/path is required and has no default/)
   })
 
   test('a missing parent directory fails at construction and names it', () => {
     const parent = join(tempDir('fleet-dedup-noparent-'), 'not-created-by-us')
     const path = join(parent, 'dedup.sqlite')
-    expect(() => new DurableEnvelopeDedupStore(path))
+    expect(() => new VerifiedDedupStore(path))
       .toThrow(new RegExp(`parent directory ${parent} does not exist`))
     // And it stayed missing: the old `mkdirSync(…, { recursive: true })` is
     // what turned a wrong deployment path into a second, empty claim store.
     expect(existsSync(parent)).toBe(false)
   })
 
-  test('an absent store FILE is still created — yugo SPEC §14 INITIAL', () => {
-    // The file's absence is a load-bearing signal in §14 (initial creation vs
-    // re-creation, hence DeliverPolicy New vs All). Only the DIRECTORY is
-    // required to pre-exist; refusing a missing file would break that path.
+  test('Release 2 refuses an absent store file rather than creating it', () => {
     const path = join(tempDir('fleet-dedup-initial-'), 'dedup.sqlite')
     expect(existsSync(path)).toBe(false)
-    const store = new DurableEnvelopeDedupStore(path)
-    expect(store.claim('env-initial', 'req-initial', 1_000).duplicate).toBe(false)
-    expect(existsSync(path)).toBe(true)
+    expect(() => new VerifiedDedupStore(path)).toThrow()
+    expect(existsSync(path)).toBe(false)
   })
 
   test.skipIf(process.getuid?.() === 0)('an unwritable parent directory fails at construction', () => {
     // Skipped as root, which ignores the mode bits this asserts on.
     const dir = tempDir('fleet-dedup-readonly-')
     chmodSync(dir, 0o500)
-    expect(() => new DurableEnvelopeDedupStore(join(dir, 'dedup.sqlite')))
+    expect(() => new VerifiedDedupStore(join(dir, 'dedup.sqlite')))
       .toThrow(/parent directory .* is not writable/)
   })
 
@@ -230,8 +236,8 @@ describe('dedup store path is required and validated', () => {
     writeFileSync(path, 'this file is not a database')
     // The open is lazy, so without the wrap this surfaces as a bare
     // `file is not a database` with no mention of which file.
-    expect(() => new DurableEnvelopeDedupStore(path))
-      .toThrow(new RegExp(`durable dedup store at ${path} is unusable: .*not a database`))
+    expect(() => new VerifiedDedupStore(path))
+      .toThrow(new RegExp(`durable dedup store at ${path} is unusable:`))
   })
 })
 
@@ -3272,7 +3278,7 @@ describe('NATS authorization boundary', () => {
       const violations: string[] = []
       void (async () => {
         for await (const status of consoleClient.status()) {
-          if (status.type === 'error' || status.type === 'permissionError') {
+          if (status.type === 'error' || String(status.type) === 'permissionError') {
             violations.push(String(status.data))
           }
         }

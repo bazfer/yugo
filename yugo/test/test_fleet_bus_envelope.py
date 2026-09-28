@@ -792,6 +792,7 @@ def test_audit_appends_rather_than_truncating(tmp_path):
     assert ids == ["0", "1", "2"]
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory write permissions")
 def test_audit_write_failure_does_not_raise(tmp_path):
     """The bus is the thing being audited. A full disk or a read-only mount is
     not a wire fault and must not take the connection down."""

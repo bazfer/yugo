@@ -1,3 +1,34 @@
+# Release 2 checkpoint — 2026-09-28, unfinished / not deployable
+
+- Main through feca116 is integrated; `bun x tsc --noEmit` passes.
+- TypeScript source suites: 233 passed, 3 skipped, 0 failed.
+  Behavioral suites inject a test clock. The real-clock test is explicitly
+  host-only (`YUGO_QUALIFIED_CLOCK_TEST=1`, set by the host probe script).
+- Python full test directory: 864 passed, 70 skipped, 1 xfailed,
+  51 subtests passed. Run with `FLEET_BUS_ENABLED=0` to isolate collection
+  from the agent container's bus-enabled environment. Root-only permission
+  checks and unavailable integration dependencies are among the skips; this
+  is not an assertion that skipped integration coverage passed.
+- Both Release-1 ports passed the seven-column regression, failed after
+  actually removing their named INSERT lists, then passed after restoration.
+  Current TS writer's nine-column test also went red on mutation and green
+  on restoration. See EVIDENCE-35-wide-insert.md.
+- Qualified host actual-clock gate previously passed; see
+  EVIDENCE-26-qualified-host-clock.md. ABI C comment now names host-only
+  qualification, not a nonexistent CI image.
+- Fixed startup refusal tests accidentally going through auto-provisioning
+  wrappers. Removed resulting untracked whitespace-named SQLite artifacts
+  and sidecars; none staged.
+
+Remaining: automate mutation/regression gates, complete adapter-error and
+remaining conformance coverage, run skipped broker/permission integration
+coverage in suitable environments, CI/documentation reconciliation and review.
+No release PR opened; no production store migrated. Clock guard unchanged.
+
+---
+
+## Historical checkpoint (superseded)
+
 # Release 2 implementation checkpoint — BLOCKED, not deployable
 
 2026-09-26. Implementation branch rebased on main at `70068a2`.

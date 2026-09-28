@@ -45,8 +45,8 @@ export function checkClockDomain(): void {
   for (const line of lines) {
     const match = /^(monotonic|boottime)\s+(-?[0-9]+)\s+(-?[0-9]+)\s*$/.exec(line)
     requireCheck(match, 'unparseable timens_offsets line')
-    requireCheck(!clocks.has(match[1]), 'duplicate timens_offsets clock')
-    clocks.set(match[1], [BigInt(match[2]), BigInt(match[3])])
+    requireCheck(!clocks.has(match[1]!), 'duplicate timens_offsets clock')
+    clocks.set(match[1]!, [BigInt(match[2]!), BigInt(match[3]!)])
   }
   requireCheck(clocks.size === 2 && clocks.has('monotonic') && clocks.has('boottime'), 'incomplete timens_offsets')
   const monotonic = clocks.get('monotonic')!
@@ -67,7 +67,7 @@ function timestamp(value: unknown): boolean {
   const year = Number(y), month = Number(mo), day = Number(d)
   const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
   const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1]
+  return year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1]!
     && Number(h) < 24 && Number(mi) < 60 && Number(s) < 60
     && (oh === undefined || (Number(oh) < 24 && Number(om) < 60))
 }
@@ -148,7 +148,7 @@ export function fingerprint(db: Database) {
 }
 function sameSchema(a: typeof SUPPORTED_SCHEMA, b: typeof SUPPORTED_SCHEMA): boolean {
   return a.table === b.table && a.columns.length === b.columns.length
-    && a.columns.every((v, i) => v.name === b.columns[i].name && v.declared_type === b.columns[i].declared_type)
+    && a.columns.every((v, i) => v.name === b.columns[i]!.name && v.declared_type === b.columns[i]!.declared_type)
 }
 export function checkSchema(db: Database, record: any): void {
   const live = fingerprint(db)

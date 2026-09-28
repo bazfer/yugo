@@ -25,6 +25,6 @@ fi
 "$BUN" install --frozen-lockfile
 # No clock spy is installed by this selected test. Python uses its real clock;
 # each port owns a separate in-memory database.
-PYTHON="$PYTHON" "$BUN" test src/clock-fencing.test.ts \
+YUGO_QUALIFIED_CLOCK_TEST=1 PYTHON="$PYTHON" "$BUN" test src/clock-fencing.test.ts \
   --test-name-pattern '^13 and 15 cross-port expiry agrees using actual named clock APIs$'
 printf 'PASS: native ABI and actual-clock cross-port bracketing/live/expired checks\n'

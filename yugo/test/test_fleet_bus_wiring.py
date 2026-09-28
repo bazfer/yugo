@@ -125,6 +125,14 @@ def dead_bus(monkeypatch, tmp_path):
         reconnect_time_wait_s=0.05,
         dedup_store_path=str(tmp_path / "dedup.sqlite"),
     )
+    from dedup_admin import provision
+    record = str(tmp_path / "verification.json")
+    provision(config.dedup_store_path, record, "python", "test",
+              dict(device_path="test", mount_point="unresolved", fstype="unresolved",
+                   mount_id_source="unresolved", backing="local-virtual",
+                   determined_by="test fixture", inspected_at="2026-09-24T19:00:00Z"),
+              [dict(process="test", user="test", path=config.dedup_store_path, method="fixture")])
+    monkeypatch.setenv("YUGO_DEDUP_VERIFICATION_RECORD", record)
     monkeypatch.setattr(bot, "BUS_CONFIG", config)
     monkeypatch.setattr(bot, "_bus", None)
     monkeypatch.setattr(bot, "_bus_task", None)

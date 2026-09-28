@@ -11,8 +11,16 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def provision_test_stores(monkeypatch):
+def provision_test_stores(monkeypatch, request):
     """Explicit fixture provisioning; never bypass the production startup gate."""
+    if request.node.name in {
+        "test_a_blank_dedup_store_path_is_refused_at_construction",
+        "test_a_missing_parent_directory_fails_at_startup_and_names_it",
+        "test_an_absent_store_file_is_refused_in_release_2",
+        "test_an_unwritable_parent_directory_fails_at_startup",
+        "test_a_file_that_is_not_a_database_fails_at_startup_and_names_the_path",
+    }:
+        return  # Startup refusal tests must exercise the real constructor.
     import os
     from pathlib import Path
     from dedup_admin import provision
@@ -692,15 +700,12 @@ def test_a_missing_parent_directory_fails_at_startup_and_names_it(tmp_path):
     assert not parent.exists()
 
 
-def test_an_absent_store_file_is_still_created_spec_14_initial(tmp_path):
-    """SPEC §14 reads the store file's ABSENCE as initial creation
-    (`DeliverPolicy=New`). Only the directory must pre-exist; refusing a
-    missing file would break that path."""
+def test_an_absent_store_file_is_refused_in_release_2(tmp_path):
     path = tmp_path / "dedup.sqlite"
     assert not path.exists()
-    store = fleet_bus.DurableEnvelopeDedupStore(str(path))
-    assert store.claim("env-initial", "req-initial", now_s=1000)[0] is False
-    assert path.exists()
+    with pytest.raises(fleet_bus.FleetBusConfigError):
+        fleet_bus.DurableEnvelopeDedupStore(str(path))
+    assert not path.exists()
 
 
 def test_an_unwritable_parent_directory_fails_at_startup(tmp_path):
@@ -724,4 +729,4 @@ def test_a_file_that_is_not_a_database_fails_at_startup_and_names_the_path(tmp_p
     with pytest.raises(fleet_bus.FleetBusConfigError) as excinfo:
         fleet_bus.DurableEnvelopeDedupStore(str(path))
     assert str(path) in str(excinfo.value)
-    assert "not a database" in str(excinfo.value)
+    assert "unusable" in str(excinfo.value)

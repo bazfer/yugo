@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -31,7 +31,7 @@ function fileFixture() {
   const save = () => fs.writeFileSync(record, JSON.stringify(data))
   return { path, record, data, open, save }
 }
-function interceptRead(fn: (path: string) => string | undefined) {
+function interceptRead(fn: (path: string) => string | undefined | void) {
   const original = fs.readFileSync
   const mock = spyOn(fs, 'readFileSync').mockImplementation(((path: any, options: any) => {
     const value = fn(String(path))
@@ -133,7 +133,7 @@ describe('lease protocol SPEC-26', () => {
     expect(Object.keys(row(s)).length).toBe(8) // No generation/owner discriminator.
     expect(s.claim('e', 'rival', 1_001_000).duplicate).toBe(true)
   })
-  for (const [boot, deadline] of [[OTHER, 0], [OTHER, -1], [OTHER, 'bad'], [OTHER, 1.5], ['garbage', 160000]]) {
+  for (const [boot, deadline] of [[OTHER, 0], [OTHER, -1], [OTHER, 'bad'], [OTHER, 1.5], ['garbage', 160000]] as const) {
     test(`11a malformed metadata refuses ${boot} ${deadline}`, () => {
       const s = store(); s.claim('e', 'req', 100_000)
       db(s).query('UPDATE envelope_dedup_v2 SET lease_boot_id=?,lease_until_mono_ms=?').run(boot, deadline)
@@ -183,6 +183,7 @@ describe('lease protocol SPEC-26', () => {
 })
 
 describe('startup interface SPEC-26', () => {
+  beforeEach(clock)
   test('17 nonzero clock refuses', () => {
     interceptRead(path => path === verification.TIMENS_PATH ? 'monotonic 0 1\nboottime 0 0\n' : undefined)
     expect(() => verification.openVerifiedStore(':memory:')).toThrow('non-zero')
@@ -314,7 +315,7 @@ function pythonClock(input: object): any {
 test('9 cross-port same normalized behavior', () => {
   clock()
   const s = new DurableEnvelopeDedupStore(':memory:')
-  const steps = [[100000, 100000], [1000000, 100000], [-1000, 160000], [1000000, 160000]]
+  const steps: [number, number][] = [[100000, 100000], [1000000, 100000], [-1000, 160000], [1000000, 160000]]
   const outputs = steps.map(([wall, value], index) => {
     mono = value
     const result = s.claim('e', index === 0 ? 'original' : 'rival', wall)
@@ -324,7 +325,7 @@ test('9 cross-port same normalized behavior', () => {
   expect(pythonClock({ mode: 'parity', steps })).toEqual(outputs)
 })
 
-test('13 and 15 cross-port expiry agrees using actual named clock APIs', () => {
+test.skipIf(process.env.YUGO_QUALIFIED_CLOCK_TEST !== '1')('13 and 15 cross-port expiry agrees using actual named clock APIs', () => {
   // The ports MUST NOT share a SQLite file. Transfer the common lease metadata
   // for one logical row into each port's own schema, not the wall-clock columns.
   const s = new DurableEnvelopeDedupStore(':memory:')
