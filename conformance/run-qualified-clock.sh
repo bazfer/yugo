@@ -12,7 +12,13 @@ printf 'runtime: '; "$BUN" --version
 uname -sm
 getconf GNU_LIBC_VERSION
 printf 'self mount namespace: '; readlink /proc/self/ns/mnt
-printf 'init mount namespace: '; readlink /proc/1/ns/mnt
+# Diagnostic only: namespace inode numbers are not portable host identities.
+# Host placement is operator-attested; do not elevate the qualification run.
+if init_ns="$(readlink /proc/1/ns/mnt 2>/dev/null)"; then
+  printf 'init mount namespace: %s\n' "$init_ns"
+else
+  printf 'init mount namespace: unreadable unprivileged; diagnostic skipped (host placement requires operator attestation)\n'
+fi
 "${CC:-cc}" -std=c11 -D_POSIX_C_SOURCE=200809L conformance/clock-abi.c -o "$scratch/clock-abi"
 "$scratch/clock-abi"
 "$PYTHON" -c 'import yaml'
