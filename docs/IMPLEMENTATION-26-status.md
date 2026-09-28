@@ -1,12 +1,29 @@
 # Release 2 checkpoint — 2026-09-28, unfinished / not deployable
 
 - Main through feca116 is integrated; `bun x tsc --noEmit` passes.
-- TypeScript source suites (`bun test`): 245 passed, 2 skipped, 0 failed.
-  Behavioral suites inject a test clock. The real-clock test is explicitly
-  host-only (`YUGO_QUALIFIED_CLOCK_TEST=1`, set by the host probe script).
+- TypeScript source suites (`bun test src`): 245 passed, 65 skipped, 0 failed
+  off the qualified runtime; 307 passed, 1 skipped with
+  `YUGO_QUALIFIED_CLOCK_TEST=1` on it. Behavioral suites inject a test clock.
+  The real-clock tests are explicitly host-only, gated by that variable and
+  visibly skipped — never silently passed — elsewhere.
   The startup clock probe is the exception: `18a` makes `readMonotonicMs`
   throw and asserts no `Database` is constructed, so the ordering the
   `:170` comment claims is now enforced in both ports.
+- SPEC-26 §6 item 15a is `src/clock-fencing-two-process.test.ts`: two real Bun
+  processes of different ages driving the production lease path against one
+  shared verified store, covering older-rival/younger-owner, renewal, the
+  reverse owner, genuine expiry, and adapter/`time.monotonic_ns` bracketing.
+  `conformance/lease-clock-bun-repro.ts` stays the historical, printing-only
+  reproduction; this is the asserting form of the same scenario.
+- SPEC-26 §6 item 15b is `src/clock-fault-injection.test.ts` with
+  `conformance/clock-fault-probe.ts`: initialisation failure, nonzero C return,
+  unwritten and partially written output, invalid `tv_sec`/`tv_nsec`, unsafe
+  millisecond conversion and deadline overflow, injected at the native adapter
+  boundary AFTER a successful startup and driven through fresh claim, takeover
+  and renewal for both `:memory:` and file stores. A `tv_sec == 0` control
+  asserts the valid case is still accepted, so refusing everything cannot pass.
+- Both run in the `native-clock-regression` CI job and in
+  `conformance/run-qualified-clock.sh`. Mutation evidence is recorded on PR #48.
 - Python full test directory (`pytest test/ -q -rs`, with and without
   `FLEET_BUS_ENABLED=0`): 946 passed, 0 skipped, 1 xfailed, 51 subtests
   passed. This workstation run, unprivileged and with every optional
@@ -24,7 +41,7 @@
   wrappers. Removed resulting untracked whitespace-named SQLite artifacts
   and sidecars; none staged.
 
-Remaining: complete adapter-error and remaining conformance coverage, run
+Remaining: complete the rest of the conformance coverage, run
 skipped broker/permission integration coverage in suitable environments,
 CI/documentation reconciliation and review. The Release-1 named-INSERT
 mutation gate and the native-clock runner regression are automated as of

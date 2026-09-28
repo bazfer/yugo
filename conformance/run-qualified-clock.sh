@@ -27,4 +27,9 @@ fi
 # each port owns a separate in-memory database.
 YUGO_QUALIFIED_CLOCK_TEST=1 PYTHON="$PYTHON" "$BUN" test src/clock-fencing.test.ts \
   --test-name-pattern '^13 and 15 cross-port expiry agrees using actual named clock APIs$'
-printf 'PASS: native ABI and actual-clock cross-port bracketing/live/expired checks\n'
+# SPEC-26 §6 items 15a and 15b. Both spawn their own Bun processes against their
+# own temporary stores; no clock spy and no production store is involved.
+YUGO_QUALIFIED_CLOCK_TEST=1 PYTHON="$PYTHON" "$BUN" test src/clock-fencing-two-process.test.ts
+YUGO_QUALIFIED_CLOCK_TEST=1 "$BUN" test src/clock-fault-injection.test.ts
+printf 'PASS: native ABI and actual-clock cross-port bracketing/live/expired checks,\n'
+printf '      two-process lease regression and post-startup clock-failure matrix\n'

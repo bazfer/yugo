@@ -178,6 +178,15 @@ jobs:
           YUGO_QUALIFIED_CLOCK_TEST: "1"
           PYTHON: python
         run: bun test src/clock-fencing.test.ts --test-name-pattern '^13 and 15 cross-port expiry agrees using actual named clock APIs$'
+      - name: SPEC-26 15a two-process lease regression
+        env:
+          YUGO_QUALIFIED_CLOCK_TEST: "1"
+          PYTHON: python
+        run: bun test src/clock-fencing-two-process.test.ts
+      - name: SPEC-26 15b post-startup clock failure and no-mutation matrix
+        env:
+          YUGO_QUALIFIED_CLOCK_TEST: "1"
+        run: bun test src/clock-fault-injection.test.ts
       - name: Native result validation regressions
         run: bun test src/monotonic-clock.test.ts
 
