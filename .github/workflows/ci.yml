@@ -201,3 +201,7 @@ jobs:
         run: |
           PYTHONPATH="$GITHUB_WORKSPACE/release1-checkout/yugo" python conformance/release1-wide-insert.py
           RELEASE1_CHECKOUT="$GITHUB_WORKSPACE/release1-checkout" bun conformance/release1-wide-insert.ts
+      - name: Revert real named INSERTs and require the exact regression failure
+        env:
+          RELEASE1_CHECKOUT: ${{ github.workspace }}/release1-checkout
+        run: python conformance/check-release1-mutations.py
