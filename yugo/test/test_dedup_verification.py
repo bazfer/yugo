@@ -304,3 +304,33 @@ def test_record_must_not_overwrite_store(environment):
     e = environment
     with pytest.raises(v.VerificationError, match="overwrite"):
         admin.provision(str(e.store), str(e.store), "python", "test", e.evidence, e.inventory, record_only=True)
+
+
+@pytest.mark.parametrize("memory", [False, True])
+@pytest.mark.parametrize("reading", [None, -1, True, 1.5, (2**53) * 1_000_000])
+def test_startup_clock_failure_refuses_before_database_open(environment, monkeypatch, memory, reading):
+    import fleet_bus
+    e = environment
+    monkeypatch.setenv("YUGO_DEDUP_VERIFICATION_RECORD", str(e.record))
+    before = e.store.read_bytes()
+
+    def clock():
+        if reading is None:
+            raise OSError("native monotonic clock unavailable")
+        return reading
+
+    def forbidden_open(*args, **kwargs):
+        pytest.fail("startup opened SQLite before validating the clock")
+
+    monkeypatch.setattr(v.time, "monotonic_ns", clock)
+    monkeypatch.setattr(v.sqlite3, "connect", forbidden_open)
+    with pytest.raises(fleet_bus.FleetBusConfigError, match="monotonic clock"):
+        fleet_bus.DurableEnvelopeDedupStore(":memory:" if memory else str(e.store))
+    assert e.store.read_bytes() == before
+
+
+@pytest.mark.parametrize("reading", [0, (2**53 - 1) * 1_000_000])
+def test_startup_clock_accepts_valid_boundaries(environment, monkeypatch, reading):
+    monkeypatch.setattr(v.time, "monotonic_ns", lambda: reading)
+    db = v.open_verified_store(":memory:")
+    db.close()

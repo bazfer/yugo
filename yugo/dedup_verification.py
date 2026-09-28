@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -188,6 +189,12 @@ def open_verified_store(path: str, record_path: str | None = None) -> sqlite3.Co
     db = None
     try:
         check_clock_domain()
+        # Probe before opening any database, including :memory:. A process
+        # whose native clock is broken must never advertise healthy startup.
+        mono_ns = time.monotonic_ns()
+        require(type(mono_ns) is int and mono_ns >= 0
+                and mono_ns // 1_000_000 <= 2**53 - 1,
+                "invalid startup monotonic clock")
         if path == ":memory:":
             read_boot_id()
             db = sqlite3.connect(":memory:", isolation_level=None, check_same_thread=False)
