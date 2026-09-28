@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provision_bus_stores")
+
 import bot as bot_module
 import fleet_bus
 import history

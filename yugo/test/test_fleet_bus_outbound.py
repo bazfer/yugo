@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provision_bus_stores")
+
 import fleet_bus
 from test.nats_server import (  # noqa: F401 — `nats_server` is a fixture
     BOT_NAME,

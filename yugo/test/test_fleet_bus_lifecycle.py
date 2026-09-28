@@ -50,7 +50,7 @@ from test.nats_server import (  # noqa: F401 — `nats_server` is a fixture
     nats_server,
 )
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("provision_bus_stores")]
 
 HEARTBEAT_S = 0.3
 RECONNECT_WAIT_S = 0.05
