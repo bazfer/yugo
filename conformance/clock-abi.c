@@ -1,4 +1,7 @@
-/* Qualified Linux x86_64 glibc timespec ABI. Compile/run on the qualified deployment host via run-qualified-clock.sh; not a CI-runner qualification. */
+/* Linux x86_64 glibc timespec ABI cross-check.
+ * CI compilation is runner regression evidence only. Deployment qualification
+ * requires run-qualified-clock.sh on the actual qualified deployment host.
+ */
 #include <time.h>
 #include <stddef.h>
 #include <stdio.h>
