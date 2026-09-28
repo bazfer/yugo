@@ -52,3 +52,12 @@ passed (1 pass, 0 fail). Source was restored and git status inspected.
 These are executed proofs in both historical ports and the current TS writer,
 not yet automated CI gates. CI wiring and remaining Release-2 mutation
 coverage are pending.
+
+## Independent operator reproduction — 2026-09-28
+
+In fleet-bus message `c3863a9f-e3ef-42f4-ae9f-c7309a3d9354`, Deet reported
+independently reproducing the Python historical proof with a separate detached
+worktree at feca116 and a separate venv: original passed (exit 0), removing the
+real writer's column list failed from claim() with the exact seven-column/six-
+value SQLite error (exit 1), and restoration passed (exit 0), leaving a clean
+worktree. This is operator-reported corroboration, not another Vec-local run.

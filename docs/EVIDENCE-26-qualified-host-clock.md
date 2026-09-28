@@ -51,3 +51,15 @@ This is one selected test, not a full conformance or release qualification
 claim. Integration/typecheck repairs, remaining conformance coverage, issue
 #35's actual seven-column INSERT mutation proof, full-suite validation and
 review remain outstanding. No production database was migrated by this run.
+
+## Operator-reported rerun — 2026-09-28
+
+Deet reported another successful run in fleet-bus message
+`c3863a9f-e3ef-42f4-ae9f-c7309a3d9354`, at revision
+`291dfc87b63d4c3fbddb057b40f856c73b33418b`, using the same command and
+qualified-host environment described above.
+
+Result: exit 0, 1 pass, 51 filtered out, 0 fail, 9 assertions, final PASS line.
+This rerun includes the script's explicit `YUGO_QUALIFIED_CLOCK_TEST=1` setting.
+Deet separately checked that omitting the variable visibly skips the test
+(0 pass, 1 skip, 0 fail). Vec did not independently execute this host run.
