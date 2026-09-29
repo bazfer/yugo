@@ -30,6 +30,17 @@ COPY yugo/http_tools.py .
 COPY yugo/IDENTITY.md .
 COPY yugo/.env.example .
 
+# The dedup startup gate refuses a file-backed store with no verification
+# record and tells the operator to `run yugo dedup provision`. Without this the
+# image has `dedup_admin.py` but not the CLI that error names, so the
+# instruction is unfollowable (#51). Pure stdlib over already-copied modules,
+# so it pulls in nothing new. entrypoint.sh dispatches bot/coordinator only —
+# reach this with `docker run --entrypoint yugo`.
+COPY bin/yugo /usr/local/bin/yugo
+# bin/yugo resolves its imports relative to a repo checkout (`../yugo`), which
+# does not exist here because the image flattens the module dir into /app.
+ENV PYTHONPATH=/app
+
 # The contract now lives in this repository. Copy the authoritative files from
 # the root build context so schema/vector changes and their Python adaptations
 # can land atomically in one commit.

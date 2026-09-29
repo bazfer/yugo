@@ -33,6 +33,10 @@ jobs:
               - 'yugo/**'
               - 'schema/**'
               - 'conformance/**'
+              # bin/yugo is COPYed into the image and is the command the dedup
+              # startup gate's error names, so a change to it can break a bot's
+              # only documented recovery. Outside yugo/, hence its own line.
+              - 'bin/**'
               - '.github/workflows/ci.yml'
 
   typescript:
@@ -118,6 +122,125 @@ jobs:
           test $code -ne 0 || { echo "expected a startup abort, got exit 0"; exit 1; }
           echo "$out" | grep -q FLEET_BUS_TOKEN_FILE \
             || { echo "abort message did not name FLEET_BUS_TOKEN_FILE"; exit 1; }
+      # The steps above all run with the bus off, so nothing here ever built a
+      # durable dedup store and SPEC-26 §8's hard startup gate had no container
+      # coverage at all (#51). This walks the operator's documented recovery
+      # using the paths the docs name, so the INSTRUCTIONS are under test and
+      # not just the mechanism: a record provisioned against some other mount
+      # binds an inode the bot never opens and refuses all over again.
+      #
+      # The one thing it cannot use is the real entrypoint. `start_bus` is
+      # called from discord.py's `setup_hook`, which runs only after a
+      # successful `static_login`, so an unprovisioned container run normally
+      # dies on `LoginFailure` long before the dedup gate. Reaching the gate
+      # through `docker compose up` would need a live Discord token. The probe
+      # below calls the same `bot.start_bus()` that `setup_hook` calls.
+      - name: verify the file-backed dedup gate refuses, names a command the image has, and clears
+        run: |
+          set -euo pipefail
+          # Read the mount off compose.example.yml rather than hardcoding it, so
+          # that moving the mount without updating .env.example fails here.
+          read -r host_dir container_dir <<EOF
+          $(python3 -c "
+          import yaml
+          volumes = yaml.safe_load(open('yugo/compose.example.yml'))['services']['bot']['volumes']
+          source, target = next(v.rsplit(':', 1) for v in volumes if v.endswith('/var/lib/yugo'))
+          print(source.lstrip('./'), target)
+          ")
+          EOF
+          # A failed command substitution inside a heredoc does not trip `set -e`,
+          # and empty values would make every grep below match anything.
+          test -n "$host_dir" && test -n "$container_dir" \
+            || { echo "could not read the bot service's /var/lib/yugo mount from yugo/compose.example.yml"; exit 1; }
+          echo "compose mounts ./$host_dir at $container_dir"
+          grep -q -- "$host_dir:$container_dir" yugo/.env.example \
+            || { echo ".env.example does not provision into compose's $host_dir:$container_dir mount"; exit 1; }
+          store="$container_dir/yugo-dedup.sqlite"       # the documented blank-YUGO_DEDUP_STORE_PATH default
+          record="$container_dir/yugo-dedup.record.json"  # the documented --record path
+          grep -q -- "YUGO_DEDUP_VERIFICATION_RECORD=$container_dir/" yugo/.env.example \
+            || { echo ".env.example does not show the in-container record path to assign"; exit 1; }
+
+          deploy="$RUNNER_TEMP/deploy"
+          rm -rf "$deploy" && mkdir -p "$deploy/$host_dir"
+          printf 'ci-token\n' > "$deploy/token"
+          printf 'bot_names: [yugo]\n' > "$deploy/fleet-manifest.yaml"
+          # `setup_hook`'s call, without the Discord login that guards it.
+          cat > "$deploy/probe.py" <<'PY'
+          import asyncio, bot
+          async def main():
+              task = bot.start_bus()
+              task.cancel()   # asserts nothing about NATS: unreachable is not a config fault
+              await asyncio.gather(task, return_exceptions=True)
+          asyncio.run(main())
+          print("BUS STARTED")
+          PY
+          # YUGO_DEDUP_STORE_PATH is deliberately NOT overridden: blank is what
+          # .env.example ships, and its default has to land inside this mount.
+          busrun() {
+            docker run --rm \
+              -v "$deploy/$host_dir:$container_dir" \
+              -v "$deploy/probe.py:/probe.py:ro" \
+              --env-file yugo/.env.example \
+              -e FLEET_BUS_ENABLED=1 -e BOT_NAME=yugo \
+              -e FLEET_BUS_TOKEN_FILE=/probe-token \
+              -e FLEET_BUS_MANIFEST_PATH=/probe-manifest.yaml \
+              -e FLEET_BUS_AUDIT_LOG="$container_dir/fleet-bus-log.jsonl" \
+              -v "$deploy/token:/probe-token:ro" \
+              -v "$deploy/fleet-manifest.yaml:/probe-manifest.yaml:ro" \
+              "$@"
+          }
+          provision() {
+            printf 'STOPPED\n%s\n%s\nATTEST\n' \
+              "{\"device_path\":\"unresolved\",\"mount_point\":\"$container_dir\",\"fstype\":\"unresolved\",\"mount_id_source\":\"unresolved\",\"backing\":\"local-block\",\"determined_by\":\"CI fixture, not a deployment attestation\",\"inspected_at\":\"2026-09-29T00:00:00Z\"}" \
+              "[{\"process\":\"ci-probe\",\"user\":\"root\",\"path\":\"$store\",\"method\":\"none\"}]" \
+              | busrun -i --entrypoint yugo yugo-ci dedup provision \
+                  --port python --attested-by yugo-docker-build \
+                  --store "$store" --record "$record" "$@"
+          }
+          # 1. The variable must be declared in the documented deployment env,
+          #    or the operator meets the gate for the first time in production.
+          docker run --rm --env-file yugo/.env.example --entrypoint python yugo-ci -c \
+            "import os, sys; sys.exit('YUGO_DEDUP_VERIFICATION_RECORD' not in os.environ)" \
+            || { echo "YUGO_DEDUP_VERIFICATION_RECORD is not declared in yugo/.env.example"; exit 1; }
+          # 2. Unprovisioned, the container must refuse rather than start blind.
+          set +e
+          refusal=$(busrun --entrypoint python yugo-ci /probe.py 2>&1)
+          refusal_code=$?
+          set -e
+          echo "$refusal"
+          test $refusal_code -ne 0 || { echo "expected a dedup startup refusal, got exit 0"; exit 1; }
+          echo "$refusal" | grep -q "$store" \
+            || { echo "refusal did not name the documented default store path"; exit 1; }
+          echo "$refusal" | grep -q 'missing verification record' \
+            || { echo "refusal did not name the missing verification record"; exit 1; }
+          # 3. The command that refusal names must exist in THIS image.
+          echo "$refusal" | grep -q 'run yugo dedup provision' \
+            || { echo "refusal did not name the provisioning command"; exit 1; }
+          docker run --rm --entrypoint yugo yugo-ci dedup provision --help > /dev/null \
+            || { echo "the image lacks the 'yugo dedup provision' its own error names"; exit 1; }
+          # 4. Following the documented provision must clear the refusal.
+          provision
+          started=$(busrun -e YUGO_DEDUP_VERIFICATION_RECORD="$record" \
+            --entrypoint python yugo-ci /probe.py 2>&1)
+          echo "$started"
+          echo "$started" | grep -q 'BUS STARTED' \
+            || { echo "provisioning did not clear the refusal"; exit 1; }
+          # 5. Re-attestation is a different documented operation (SPEC-26 §8.5,
+          #    and §8.6 step 5). A fresh provision over an existing store must
+          #    refuse, and --record-only must work and keep the bot starting.
+          set +e
+          again=$(provision 2>&1)
+          again_code=$?
+          set -e
+          echo "$again"
+          test $again_code -ne 0 \
+            || { echo "a fresh provision overwrote an existing store"; exit 1; }
+          provision --record-only
+          reattested=$(busrun -e YUGO_DEDUP_VERIFICATION_RECORD="$record" \
+            --entrypoint python yugo-ci /probe.py 2>&1)
+          echo "$reattested"
+          echo "$reattested" | grep -q 'BUS STARTED' \
+            || { echo "--record-only re-attestation did not produce a usable record"; exit 1; }
 
   yugo-pytest:
     needs: changes
