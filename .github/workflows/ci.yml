@@ -33,6 +33,7 @@ jobs:
               - 'yugo/**'
               - 'schema/**'
               - 'conformance/**'
+              - 'bin/**'
               - '.github/workflows/ci.yml'
 
   typescript:
