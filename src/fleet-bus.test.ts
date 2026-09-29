@@ -102,6 +102,52 @@ describe('durable envelope dedup', () => {
     expect(live).toBeLessThanOrEqual(ttl + 1)
   })
 
+  test('past-TTL pending rows are counted even though countExpired and prune both skip them', () => {
+    // yugo#50: prune is restricted to completed rows so it cannot delete a row
+    // under a live lease, and countExpired shares that restriction — so it read
+    // zero while SIGKILL orphans accumulated permanently. Both halves of the
+    // issue's reproduction: 500 abandoned pending + 500 completed, all past TTL.
+    const ttl = 100
+    const store = new DurableEnvelopeDedupStore(':memory:', ttl)
+    for (let i = 0; i < 500; i += 1) {
+      store.claim(`orphan-${i}`, `req-orphan-${i}`, 0) // SIGKILLed mid-turn: never completed, never released.
+      const done = store.claim(`done-${i}`, `req-done-${i}`, 0)
+      store.complete(`done-${i}`, done.owner!)
+    }
+    const now = ttl + 1
+    expect(store.count()).toBe(1_000)
+    expect(store.countExpired(now)).toBe(500)
+    expect(store.countPastTtlPending(now)).toBe(500)
+
+    expect(store.prune(now)).toBe(500)
+    expect(store.count()).toBe(500) // The pending rows, and no sweep will take them.
+    expect(store.countExpired(now)).toBe(0) // Clean signal from a still-growing store.
+    expect(store.countPastTtlPending(now)).toBe(500) // The gauge that still sees them.
+
+    // A pending row inside the TTL is a live turn and is not counted.
+    store.claim('in-flight', 'req-in-flight', now)
+    expect(store.count()).toBe(501)
+    expect(store.countPastTtlPending(now)).toBe(500)
+  })
+
+  test('a wall-clock step past the production TTL counts a claim whose monotonic lease is still live', () => {
+    // Ohm's reproduction on #52. The counter is wall-clock; lease liveness is
+    // monotonic. Stepping ONLY wall time past the real 8-day TTL counts a
+    // healthy claim, so being counted never proves abandonment and never
+    // authorizes deletion. Monotonic time here advances by the real duration of
+    // this test — microseconds — so the lease has genuinely not expired.
+    const store = new DurableEnvelopeDedupStore(':memory:')
+    const claim = store.claim('long-turn', 'req-original', 1_000)
+    expect(claim.duplicate).toBe(false)
+
+    const afterWallStep = 1_000 + DEFAULT_DEDUP_TTL_MS + 1
+    expect(store.countPastTtlPending(afterWallStep)).toBe(1)
+    // Same row, same instant: the lease fencing refuses the takeover, which is
+    // the direct contradiction of reading the count above as an orphan.
+    expect(store.claim('long-turn', 'req-rival', afterWallStep)).toEqual({ duplicate: true, reqId: 'req-original' })
+    expect(store.renew('long-turn', claim.owner!, afterWallStep)).toBe(true)
+  })
+
   test('pruneIdle sweeps a quiet lane', () => {
     const store = new DurableEnvelopeDedupStore(':memory:', 10)
     for (let i = 0; i < 50; i += 1) {
