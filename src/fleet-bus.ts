@@ -406,9 +406,13 @@ export class DurableEnvelopeDedupStore {
    * without moving `first_seen_ms` and the store sets no maximum lifetime.
    *
    * So: this count NEVER authorizes deleting anything. It is not a deletion
-   * queue, no sweep drives it to zero, and a row leaves it only by being
-   * completed or released by its owner. Treat a rising number as a prompt to
-   * investigate, and take orphanhood from the lease state, not from this. */
+   * queue and no sweep drives it to zero. A row leaves it by being completed or
+   * released by its owner — or by a BACKWARD wall-clock step, which un-ages rows
+   * that never changed, so the number can fall without anything being resolved.
+   *
+   * Nor does the lease settle it. An expired lease PERMITS takeover; it does not
+   * prove the worker died, and it does not make deletion safe. Treat a rising
+   * number as a prompt to investigate, never as an answer. */
   countPastTtlPending(nowMs = Date.now()): number {
     return (this.db.query('SELECT COUNT(*) AS n FROM envelope_dedup_v2 WHERE state=\'pending\' AND first_seen_ms < ?')
       .get(nowMs - this.ttlMs) as { n: number }).n
