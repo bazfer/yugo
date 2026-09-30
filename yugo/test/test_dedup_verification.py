@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 import shutil
 import sqlite3
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -334,3 +336,47 @@ def test_startup_clock_accepts_valid_boundaries(environment, monkeypatch, readin
     monkeypatch.setattr(v.time, "monotonic_ns", lambda: reading)
     db = v.open_verified_store(":memory:")
     db.close()
+
+
+# ---------- the operator CLI's error path (yugo#56) ----------
+
+_CLI = Path(__file__).resolve().parents[2] / "bin" / "yugo"
+
+
+def _run_cli(*args: str, stdin: str) -> subprocess.CompletedProcess:
+    """Run `bin/yugo` as the operator does — a real process, not an import."""
+    return subprocess.run([sys.executable, str(_CLI), *args],
+                          input=stdin, capture_output=True, text=True)
+
+
+def test_the_cli_reports_a_bad_attestation_as_a_message_not_a_traceback(tmp_path):
+    """`bin/yugo` calls `dedup_admin.main()` directly, so a handler under
+    `if __name__ == "__main__"` never ran for the only entry point operators
+    use: a mistyped `backing` produced a full traceback. Provisioning is a
+    mandatory step before a bus-enabled bot with a file-backed store starts, so
+    this is the error path of a required command at the moment the input is
+    most likely wrong.
+
+    The absence of the traceback is the load-bearing assertion. A traceback's
+    last line carries the message too, and it exits 1 all the same, so neither
+    the message nor the exit code can tell the two apart on its own.
+    """
+    evidence = dict(device_path="/dev/nfs", mount_point="/var/lib/yugo", fstype="nfs4",
+                    mount_id_source="unresolved", backing="nfs",   # not local-block/local-virtual
+                    determined_by="test fixture only", inspected_at="2026-09-29T00:00:00Z")
+    store, record = tmp_path / "store.sqlite", tmp_path / "record.json"
+    inventory = [dict(process="test", user="test", path=str(store), method="fixture")]
+    result = _run_cli("dedup", "provision", "--port", "python", "--attested-by", "test",
+                      "--store", str(store), "--record", str(record),
+                      stdin="STOPPED\n" + json.dumps(evidence) + "\n" + json.dumps(inventory) + "\nATTEST\n")
+
+    assert "Traceback (most recent call last)" not in result.stderr + result.stdout, (
+        f"the CLI raised through bin/yugo instead of reporting; stderr={result.stderr!r}"
+    )
+    # Exact and last: `lsof` writes its own warnings to this stream, so the
+    # requirement is that the CLI's own last word is the one readable sentence.
+    assert result.stderr.strip().splitlines()[-1] == (
+        "dedup verification refused: network or unknown backing; run yugo dedup provision"
+    ), f"stderr does not end with the refusal as one line; stderr={result.stderr!r}"
+    assert result.returncode == 1, f"expected exit 1; got {result.returncode}"
+    assert not record.exists(), "a refused attestation must not write a record"

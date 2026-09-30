@@ -2914,8 +2914,37 @@ describe('pending claim age deadline', () => {
     // cycle, not only at shutdown, so that would have made ordinary connection
     // churn a lease-loss event for healthy in-flight work. Renewal is a local
     // SQLite write and has no business depending on the bus connection.
+    //
+    // DETERMINISM (yugo#57). This ran on fixed sleeps against a 200ms lease
+    // renewed every 80ms, and failed in CI on a branch carrying no TypeScript
+    // change. A rival's eligibility is `lease_until_mono_ms <= mono`, so an
+    // event-loop stall longer than the lease expires a live lease and the rival
+    // wins legitimately — the failing run spent 1961ms on ~750ms of sleeps, and
+    // busy-waiting 300ms before the rival claim reproduces it exactly against
+    // unmodified code. So the monotonic domain is frozen and stepped by hand,
+    // and every wait below is on an OBSERVED renewal rather than on elapsed
+    // time: no assertion here can be decided by runner load.
+    //
+    // The regression it guards now shows up as a MISSING renewal rather than a
+    // rival's verdict: stop renewal in `disconnect()` and the awaited renewal
+    // never arrives, so `awaitRenewal` below fails and names it.
+    const leaseMs = 200
+    let mono = 0
+    clockSpy.mockImplementation(() => mono)
     const path = join(mkdtempSync(join(tmpdir(), 'fleet-deadline-disconnect-')), 'dedup.sqlite')
-    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
+    const store = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, leaseMs)
+    let onRenew: (() => void) | undefined
+    const renewed = (): Promise<void> => new Promise<void>(resolve => { onRenew = resolve })
+    const held: boolean[] = []
+    const realRenew = store.renew.bind(store)
+    spyOn(store, 'renew').mockImplementation((envelopeId: string, owner: string, nowMs?: number) => {
+      const result = nowMs === undefined ? realRenew(envelopeId, owner) : realRenew(envelopeId, owner, nowMs)
+      held.push(result)
+      const resolve = onRenew
+      onRenew = undefined
+      resolve?.()
+      return result
+    })
     let releaseCallback: (() => void) | undefined
     const bus = new TestFleetBus(claimConfig({
       dedupStore: store, dedupClaimDeadlineMs: 5_000,
@@ -2923,15 +2952,44 @@ describe('pending claim age deadline', () => {
     }), allowlist)
     bus.attachFakeNc(new FakeNatsConnection())
 
+    // A bound only so the regression this guards fails by NAME rather than as
+    // the suite's anonymous timeout. It is not a timing assertion: bun already
+    // caps the test at 5s, and a renewal that is still running arrives within
+    // one 80ms cadence.
+    const awaitRenewal = async (renewal: Promise<void>, when: string): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([renewal, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(
+            `no lease renewal ${when}: renewal stopped, which disconnect() must never do`,
+          )), 4_000)
+        })])
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    }
+
+    const firstRenewal = renewed()
     const turn = bus.handleRequest(envelope({ id: 'deadline-disconnect', to: 'vec', from: 'kat' }))
-    await sleep(50)
+    await awaitRenewal(firstRenewal, 'before disconnect()')   // the claim is live and renewing
     await bus.disconnect()
 
     // Several lease periods after the disconnect, a rival must still be locked
-    // out: the turn is running and renewal is what says so.
-    await sleep(700)
-    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, 200)
-    expect(rival.claim('deadline-disconnect', 'rival-during').duplicate).toBe(true)
+    // out: the turn is running and renewal is what says so. Each step stops one
+    // millisecond short of expiry, so only a renewal that ran AFTER the step
+    // can keep the rival out.
+    const rival = new DurableEnvelopeDedupStore(path, DEFAULT_DEDUP_TTL_MS, leaseMs)
+    for (const round of [0, 1, 2]) {
+      const nextRenewal = renewed()
+      mono += leaseMs - 1
+      await awaitRenewal(nextRenewal, `in round ${round} after disconnect()`)
+      expect(rival.claim('deadline-disconnect', `rival-during-${round}`).duplicate).toBe(true)
+    }
+    // Past the lease the original claim took out, so the lockout above is
+    // renewal's work and not the first lease still running.
+    expect(mono).toBeGreaterThan(leaseMs)
+    expect(held).not.toBeEmpty()
+    expect(held.every(Boolean)).toBe(true)
     releaseCallback?.()
     await turn
   })

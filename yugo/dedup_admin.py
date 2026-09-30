@@ -119,7 +119,7 @@ def provision(store: str, record_path: str, port: str, attested_by: str,
             db.close()
 
 
-def main() -> None:
+def run() -> None:
     parser = argparse.ArgumentParser(prog="yugo")
     dedup = parser.add_subparsers(dest="group", required=True).add_parser("dedup")
     commands = dedup.add_subparsers(dest="command", required=True)
@@ -163,8 +163,20 @@ def main() -> None:
     print(f"Record written ({record['device']['binding']} binding). This is attestation, not proof of locality.")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """The ONLY entry point, so the two callers cannot diverge on error output.
+
+    `bin/yugo` imports and calls this directly, which used to bypass the
+    handler below when it lived under `if __name__ == "__main__"` — an operator
+    who mistyped the storage evidence got a traceback instead of the sentence
+    naming the fault, on the error path of a command startup now requires
+    (yugo#56).
+    """
     try:
-        main()
+        run()
     except (VerificationError, OSError, ValueError, sqlite3.Error) as exc:
         raise SystemExit(str(exc))
+
+
+if __name__ == "__main__":
+    main()
