@@ -1,10 +1,17 @@
-# yugo — specification (v12.17)
+# yugo — specification (v12.18)
 
 **Status:** v0.1 scaffold shipped (native harness only). v0.2+ evolves to the full coordination platform described here.
 
 **Audience:** implementers, operators, prospective adopters.
 
 **Fable ship-verdict:** v12 verified SHIP-AS-IS by fable-arch review pass 2026-08-26. v12.1 folds in the two post-ship polish items fable flagged as non-blocking, so the shipped SPEC has zero known issues.
+
+**Changes from v12.17** (one defect, in this document's own target state, plus the written record around it):
+
+- **§4.7's target authz map made yugo #22 unimplementable, and said so in a shape nobody read as a contradiction.** It granted every bot `fleet.*.request` — no sender token — so two bot users held byte-identical publish permission on the lane that carries instructions. `envelope.from` cannot be authenticated against that map by any component: the broker has nothing to distinguish, and §4.3 offers no later point. The *target* state, not merely the deployment, was the blocker. New **§4.7.1** states sender-bound grants (`fleet.*.request.<self>`, `fleet.broadcast.*.<self>`), **keeps every receiver exactly where it is** on `fleet.<self>.inbox`, and carries the enforcement table and the deployment order.
+- **The receiver half of the published plan was false for this architecture.** Root `SPEC.md` §4 said receivers "derive identity from the subject token, not the body". The coordinator rewrites the subject on forward, so a receiver on `.inbox` never sees the token the broker enforced — only the coordinator does. Broker-enforced identity reaches a receiver as a coordinator-written field (`verified_from`) or not at all. That sentence was written on 2026-08-25, against core NATS with one TypeScript port, no coordinator and no JetStream; **#22 cited it as "the fix, already specified", and Fernando records that the effort estimate built on that citation was badly wrong.** Both specs now mark the line planned and name the architecture it was written for.
+- **Enforcement is now stated per clause, with the gaps named rather than implied.** Every "X must Y" in §4.7.1 carries the component that refuses when Y is absent, and the four clauses that nothing refuses yet say so in the table rather than reading as live controls. That includes the interim prose instruction in the codex bots' system prompt: it is recorded as **not a mechanism**, because a sentence cannot tell a forged `from` from a real one.
+- **Sequencing is normative, because the publish path has no PubAck.** Bots publish with core `nc.publish`. A publisher that flips to the four-token subject before the stream and the coordinator accept it loses every message **silently** — success locally, captured by nothing, with its own audit record claiming the envelope was sent. §4.7.1 fixes the order (widen capture and stamp first, publishers second, revoke last) and states what breaks at each inversion.
 
 **Changes from v12.16** (three sequencing/erratum fixes and one real defect, all transport-independent — they hold whichever way the JetStream question was decided, and Fernando ruled to KEEP JetStream on 2026-08-30):
 
@@ -453,9 +460,9 @@ sequenceDiagram
     participant B as Bot B (recipient)
     participant H as Human via Discord
 
-    A->>JS: publish envelope to fleet.&lt;B&gt;.request (JetStream stream)
-    JS-->>A: PubAck (durable)
-    C->>JS: pull from fleet.&lt;B&gt;.request (coordinator is sole consumer of this stream)
+    A->>JS: publish envelope to fleet.&lt;B&gt;.request.&lt;A&gt; (JetStream stream)
+    JS-->>A: PubAck — ONLY if A used js.publish; no shipped adapter does
+    C->>JS: pull from fleet.&lt;B&gt;.request.* (coordinator is sole consumer of this stream)
     JS-->>C: envelope + delivery info
     C->>C: policy check — hold?
     alt Auto-release
@@ -475,6 +482,11 @@ sequenceDiagram
       end
     end
 ```
+
+**Two labels on that diagram are targets rather than shipped behaviour, and both matter to anyone implementing it:**
+
+- **The sender token in the publish subject is §4.7.1's target**, reached by the ordered sequence in that subsection. Today a sender publishes `fleet.<B>.request`, three tokens, and the coordinator's durable filters the same shape.
+- **The PubAck is not happening.** Both adapters publish with core `nc.publish` and neither inspects a reply, so a publisher learns nothing about whether its envelope was captured. The stream still captures a core publish (root `SPEC.md` §6.3), which is why this works at all — but the sender's success is local, and a publish to a subject no stream captures is lost in silence. §4.7.1's step order exists entirely because of this line.
 
 Topology change enabled by JetStream:
 - Bots no longer subscribe directly to `fleet.<bot>.request` (the sender-facing topic).
@@ -578,20 +590,20 @@ flowchart TB
         CO2[tap / console user]
       end
       subgraph SUBS[subjects]
-        REQ["fleet.*.request<br/>(JetStream stream)"]
+        REQ["fleet.*.request.&lt;sender&gt;<br/>(JetStream stream)"]
         INB["fleet.*.inbox<br/>(JetStream stream)"]
         STA[fleet.*.status]
-        BRO[fleet.broadcast.>]
+        BRO["fleet.broadcast.&lt;kind&gt;.&lt;sender&gt;"]
       end
     end
-    BOT -->|publish to| REQ
+    BOT -->|"publish .request.&lt;self&gt; only"| REQ
     BOT -->|publish self.status| STA
-    BOT -->|publish| BRO
+    BOT -->|"publish .&lt;kind&gt;.&lt;self&gt; only"| BRO
     BOT -->|subscribe self.inbox| INB
     BOT -->|subscribe self.status| STA
     BOT -->|subscribe| BRO
     BOT -.->|subscribe self.request DENIED| REQ
-    CO -->|pull consumer on| REQ
+    CO -->|"pull consumer on (both subject shapes)"| REQ
     CO -->|publish to| INB
     CO -->|publish self.status| STA
     CO -->|subscribe .status of all| STA
@@ -614,10 +626,176 @@ flowchart TB
 
 - Coordinator has narrowly scoped publish (only to `.inbox`).
 - Tap has zero publish.
-- Bots publish to `.request`/`.broadcast` freely, subscribe only to their own `.inbox`/`.status` + `.broadcast.>`. **Bot subscribe to own `.request` is DENIED** — coordinator is the sole consumer. This closes the SEV1-1 gap where a still-active `.request` subscription would bypass coordinator holds.
+- **Bots publish SENDER-BOUND.** A bot's request-lane grant is `fleet.*.request.<self>` — recipient in token 2, **sender in token 4** — and its broadcast-lane grant is `fleet.broadcast.*.<self>`. `.status` was already `fleet.<self>.status`. The publish grants of two different bots are therefore never byte-identical, which is the property `envelope.from` needs in order to be enforceable at all; **§4.7.1 is normative for this clause, including what enforces it today (nothing) and the order in which it may be deployed.** Earlier revisions of this map granted a bare `fleet.*.request`, under which no broker decision can distinguish two senders — see §4.7.1's opening paragraph. Bots subscribe only to their own `.inbox`/`.status` + `.broadcast.>`. **Bot subscribe to own `.request` is DENIED** — coordinator is the sole consumer. This closes the SEV1-1 gap where a still-active `.request` subscription would bypass coordinator holds.
 - `.result` subject class is REMOVED (was in v4 spec). Replies travel as ordinary `.request` envelopes with an `in_reply_to` field; coordinator gates them by matching `root_id`. See §7A.1 (`strict` mode return-gate).
 - **Both `.request` and `.inbox` are JetStream STREAMS** (SEV1-D v6 fix). `.request` gates the first hop; `.inbox` gates the last hop — approved envelopes are not lost if a recipient bot is restarting. Bots subscribe `.inbox` as durable consumers with `DeliverPolicy: New` on first-creation (skip historical backlog); adapter contract also requires persistent envelope-id de-dup (see §14). This prevents FB-3-flip replay of historical `prod_op`/`spend` envelopes.
 - **Migration-window exception:** during FB-3 per-adapter migration (§15), the migrating adapter's bot user retains temporary subscribe permission on `fleet.<self>.request`. Grant is revoked in the same PR that flips the adapter to `.inbox`-only. End state (post-FB-3-for-all-adapters) is as diagrammed above.
+
+### 4.7.1 Sender-bound publish grants (the amendment yugo #22 needs before it can be built)
+
+**Why this subsection exists.** §4.7's map, through v12.17, granted every bot
+`fleet.*.request` — one grant covering every recipient, carrying **no sender token
+at all**. Under that map `envelope.from` is unenforceable *by construction*: two
+different bot users hold byte-identical publish permission on the request lane, so
+no broker decision can tell them apart, and §4.3's path offers no later point
+where the check could live. #22 asks for sender authentication; the target state in
+this document forbade it. **Fixing #22 therefore starts here, in the spec, not in
+`nats.conf`.**
+
+**Target grants.** `<self>` is the bot's NATS username, which §4.7 already treats
+as its subject identity.
+
+| User | Publish | Subscribe |
+| --- | --- | --- |
+| bot `<self>` | `fleet.*.request.<self>`, `fleet.broadcast.*.<self>`, `fleet.<self>.status`, plus the JetStream API surface for its own `.inbox` durable | `fleet.<self>.inbox`, `fleet.*.status`, `fleet.broadcast.>` |
+| `coordinator` | `fleet.*.inbox` (three tokens, **unchanged**), `fleet.*.status` | pull consumer on `FLEET_REQUEST` covering both the three- and four-token request shapes, `fleet.*.status`, `fleet.broadcast.>` |
+| `console` / tap | none (`deny: [">"]`) | `fleet.>` |
+
+**The sender token goes LAST and the recipient stays in token 2.** Addressing is
+unchanged — `fleet.<recipient>.request.>` still selects exactly one recipient's
+lane — and a bot's grant is a literal final token, which is the one thing a NATS
+permission can pin without a wildcard. Putting the sender earlier
+(`fleet.<self>.request.<recipient>`) would re-key every stream, consumer filter and
+routing rule in §4.3 on the sender, which is a different migration with no relation
+to this one.
+
+**`.status` is the precedent, not a new idea.** `fleet.<self>.status` has been
+sender-bound since FB-1 and is **the only grant in the live fleet whose identity the
+broker enforces.** This amendment generalises the shape that already works to the
+two lanes that carry instructions.
+
+**Receivers do not move. That is why this shape was chosen** over per-sender inbox
+subjects or an envelope signature: a bot's consumption subject stays exactly
+`fleet.<self>.inbox`, its durable stays bound to `FLEET_INBOX`, and **no adapter
+changes a subscription, a filter or a de-dup key.** FB-3 (§15) is unaffected and
+neither blocks nor is blocked by this work.
+
+**The consequence of receivers not moving, stated plainly, because it is the whole
+enforcement story.** The coordinator rewrites the subject when it forwards —
+`fleet.<recipient>.inbox`, `coordinator.py` `inbox_subject` — so **the token the
+broker enforced is not visible to the receiving adapter.** A receiver on `.inbox`
+cannot derive identity from the subject; only the coordinator can. Broker-enforced
+identity therefore reaches a receiver **as a field the coordinator writes**, or it
+does not reach it at all. Any sentence of the form "receivers derive identity from
+the subject token" is false for every receiver sitting behind the coordinator, which
+post-FB-3 is every receiver in the fleet. One such sentence exists, in the root
+`SPEC.md` §4, written on 2026-08-25 against core NATS with no coordinator in the
+architecture; see that section for its amendment and for why citing it as current
+produced a wrong estimate of this work.
+
+**`verified_from` — the coordinator stamp.** Additive within envelope v1 per root
+`SPEC.md` Clause 1, so a receiver that has not been taught the field ignores it.
+
+- The coordinator takes the final token off the delivered `.request` subject and
+  writes `verified_from: "<token>"` onto the envelope before publishing it to
+  `fleet.<recipient>.inbox`.
+- The coordinator **MUST NOT modify `from`.** The publisher's claim and the
+  broker-enforced fact are kept as two fields **so that a disagreement between them
+  is evidence**. Overwriting `from` with the enforced token would make a forgery
+  attempt invisible in precisely the log that exists to record it — and #22's second
+  stated benefit is that the audit `from` becomes evidence.
+- A receiver that finds `verified_from` present and unequal to `from` **drops** the
+  envelope with reason `from_subject_mismatch` (root `SPEC.md` §5).
+- A receiver MAY emit `authenticated="true"` on an injection frame (root `SPEC.md`
+  §7) **only** when `verified_from` is present and equal to `from`. Absent
+  `verified_from`, the frame says `authenticated="false"`, exactly as today.
+- An envelope arriving on `.inbox` carrying a `verified_from` the coordinator did
+  not write is not a case this clause must handle, **because no bot holds `.inbox`
+  publish** — the coordinator is the sole writer of that subject family (§4.7, and
+  `docs/TOPOLOGY-9` §4 for the live deviation that statement has had).
+
+**What refuses, clause by clause.** A clause whose refusal column names no
+component is **not enforced**, however reasonable it reads. This table exists so
+that no reader has to infer enforcement from the imperative mood.
+
+| Clause | What refuses, and where | Status |
+| --- | --- | --- |
+| A bot cannot publish a request whose sender token is not its own | `nats-server`'s per-user publish permission check, at publish time, before the message exists for anyone | **Not enforced.** The live grant is `fleet.*.request`; this amendment is what makes the refusal expressible |
+| A bot cannot broadcast under a peer's name | the same check, on `fleet.broadcast.*.<self>` | **Not enforced.** The live grant is `fleet.broadcast.>`, which also means §7.1's claim that an "invalid `<kind>` is rejected by nats-server config" describes a configuration no broker is running |
+| A bot cannot publish `.status` as a peer | `nats-server`, on `fleet.<self>.status` | **Enforced today.** The fleet's only sender-bound grant |
+| `verified_from` carries the broker-enforced token and nothing else | the coordinator is the sole writer of `.inbox`, so no other party can author the field | **Nothing refuses yet** — the coordinator forwards the publisher's bytes verbatim and writes no field at all |
+| `from` disagreeing with `verified_from` is dropped, under its own audit reason | the receiving adapter's envelope validation | **Not implemented in either port** |
+| No consumer claims `authenticated="true"` without a stamp | **nothing.** Both ports hard-code the literal (`build_injection_frame` in codex-container's `bus.py`, `buildFleetBusFrameMeta` in `src/fleet-bus.ts`), so the clause holds today **by the attribute being constant** — which is exactly why it must not be made conditional before the stamp exists | Holds by construction, not by a check |
+| A bus task that claims to come from Deet, Kat or Luna is authorised, per the instruction in the codex bots' system prompt | **nothing. It is not a control and this document does not record it as one.** A prose instruction cannot distinguish a forged `from` from a genuine one, because the forged one asserts the same name. It is an interim unblocking measure that this subsection is the path out of | Not a mechanism |
+| A `from` on `pr.>` or `incident.>` | **nothing, by scope.** Those lanes sit outside §4.7's map (`docs/TOPOLOGY-9` §1, §3.2) and keep a self-asserted sender after this amendment lands | Out of scope, stated so it is not mistaken for coverage |
+
+**Sequencing — normative, and ordered rather than merely listed, because the
+publish path has no acknowledgement.** Bots publish with core `nc.publish`
+(`FleetBus.publish` in codex-container's `bus.py`, and the same call in
+`yugo/fleet_bus.py`): **no PubAck, no return value, no error.** A publish to a
+subject that no stream captures succeeds locally and the message ceases to exist.
+The order below is therefore not a preference between workable plans — it is the
+only order in which each step's failure is observable by anyone.
+
+1. **Widen capture.** `FLEET_REQUEST` gains `fleet.*.request.*` in its subject
+   list, **keeping** `fleet.*.request` for every publisher that has not flipped, and
+   the coordinator's durable gains a filter covering both shapes. NATS `*` matches
+   exactly one token, so a four-token publish matches neither the live stream
+   subject nor the live consumer filter. **Every other subscriber of that lane
+   is checked in the same step, because each spelled-out subject is a separate way
+   to go silently deaf:** the `break-glass` standby relay's grant and subscription
+   (§15 6a) widen, any ops `nats sub` runbook line that spells the subject out
+   widens, and the tap / `console` user needs nothing — `fleet.>` already matches
+   any depth.
+2. **Teach the coordinator the four-token shape, and add the stamp.**
+   `inbox_subject` raises `ValueError` on any subject that is not exactly three
+   tokens, so a four-token delivery to today's coordinator is not a mis-forward: it
+   raises inside the pull loop, the message is never acked, JetStream redelivers it,
+   and the same exception repeats until `max_age` expires it seven days later.
+3. **Grant the new publish subject to every bot user, in addition to the old
+   one.** Both shapes authorised at once. Nothing is revoked in this step.
+4. **Flip publishers, one adapter per PR** — the same unit of work, and the same
+   per-adapter gate, as FB-3.
+5. **Teach receivers `verified_from`** — the mismatch drop and the conditional
+   `authenticated` attribute. May land any time after step 2 and **MUST NOT** land
+   before it: a mismatch drop installed while no stamp exists drops nothing and its
+   test passes over a dead branch, which is indistinguishable from working.
+6. **Revoke the broad `fleet.*.request` publish grant,** once no publisher uses
+   it. **This is the step that makes a forged sender impossible.** Every step before
+   it is preparation, and a migration that stops at step 5 has changed subject
+   shapes and bought no authentication whatsoever.
+
+**What breaks when the order is violated, per step, because "do them in order" is
+not a reason:**
+
+- **4 before 1 — total silent loss, and the worst outcome available here.** The core
+  publish reports success, no stream captures the subject, no consumer ever sees it,
+  and the publisher writes its own `out` audit record saying the envelope was sent.
+  The bot looks healthy and every task it sends vanishes. It is also the easiest
+  order to get wrong, because the publisher's change is the smallest one in the
+  list.
+- **4 before 2 — no loss, one dead lane for seven days.** The envelope is captured
+  and redelivered into the same `ValueError` until `max_age` culls it; that bot's
+  traffic does not move and the coordinator logs one exception forever.
+- **4 before 3 — loud and harmless.** `permissions violation`, connection torn
+  down, operator informed immediately. The only violation in this list that
+  announces itself.
+- **6 before 4 — loud, and fleet-wide.** Publishers still using the broad subject
+  lose it; every unflipped bot takes a permissions violation at once.
+- **5 before 2 — a passing test over nothing.** See step 5.
+
+**The gate on step 6, stated so it is checkable.** No bot user may retain
+`fleet.*.request` publish after its own step 4, and the revoking PR for the last
+adapter MUST carry the conformance test that a direct
+`nats pub fleet.<peer>.request` from that bot's user is denied with
+`permissions violation` — the same shape §15's FB-3 items (e) and (h) already
+require, for the same reason: a topology is not removed while a credential can
+still use it.
+
+**The hazard this order works around, named so it is not rediscovered as a
+surprise.** A JetStream publish with a checked PubAck would make step 1's omission
+*loud* instead of silent and would reduce this whole sequence to a preference.
+Moving publishers to `js.publish` is **not in scope here** and is not a
+prerequisite; it is the structural fix for a class of silent loss this spec
+currently handles by ordering alone, and it belongs in its own slice.
+
+**What this amendment does not do**, restating #22's own scope note so a later
+reader does not oversell it: everyone who can publish is already inside the trust
+boundary, so this is not intrusion defence. Two things improve — a confused bot can
+no longer impersonate a peer by accident, which is by far the likelier failure, and
+the `from` field in the audit log stops being a claim. It does **not** stop a bot
+writing straight into a peer's `.inbox`; that is a separate publish-grant control
+(`docs/TOPOLOGY-9` §4), and neither control substitutes for the other.
 
 ## 5 — Config surface
 
@@ -683,7 +861,7 @@ Loaded once at startup from `$PERSONA_FILE` (default `/root/persona.md`) or bund
 
 ## 7 — Fleet-bus wire (v0.3+)
 
-- **Native harness** ALWAYS publishes to `fleet.<BOT_NAME>.request`. Subscribes to `fleet.<BOT_NAME>.inbox` (as durable JetStream consumer per §14) + `.status` + optional `fleet.broadcast.>`. Pre-FB-3 per-adapter flip, the adapter still subscribes `.request` directly for backward-compat; the FB-3 PR for that adapter switches subscription to `.inbox` only and revokes the `.request` subscribe permission. **Bots never publish to `.inbox` directly and (post-FB-3) never subscribe to `.request`** — NATS authz enforces both.
+- **Native harness** publishes to `fleet.<recipient>.request` today and to `fleet.<recipient>.request.<BOT_NAME>` after §4.7.1's step 4 — **the flip is gated on §4.7.1's sequencing and MUST NOT be made early**, because a core publish to an uncaptured subject is lost with no error anywhere. Subscribes to `fleet.<BOT_NAME>.inbox` (as durable JetStream consumer per §14) + `.status` + optional `fleet.broadcast.>`. Pre-FB-3 per-adapter flip, the adapter still subscribes `.request` directly for backward-compat; the FB-3 PR for that adapter switches subscription to `.inbox` only and revokes the `.request` subscribe permission. **Bots never publish to `.inbox` directly and (post-FB-3) never subscribe to `.request`** — NATS authz enforces both.
 - **Coordinator** (v0.6+) uses its own NATS user (`coordinator`), NOT the console role. Subscribes broadly for visibility, publishes to `.inbox` (envelope forwards) and to `fleet.coordinator.status` (own presence heartbeat). **Coordinator IS the message relay from v0.6a onward** — no separate FB-2b service ever exists (see SEV1-4 fix in §15). v0.6a runs forward-only (audit + forward); v0.7a adds policy eval; v0.7b starts holding.
 - **Tap** (existing) continues as separate container with `console` NATS user (subscribe-only, deny-all publish). Not replaced by coordinator.
 - **Baton protocol** (per fleet-bus baton spec) fields (`root_id`, `origin`, `owner`, `hops`) drive coordinator's task visibility and HITL policy rules (§7A).
@@ -1000,7 +1178,7 @@ Audit path is OUTSIDE any bot's `write_file` scope (per §9). The **coordinator 
 - `bot.py` hard-rejects messages where `msg.author.bot` is true. No allowlist mode. Bots reach other bots via fleet-bus, period.
 - `.env` chmod 600, gitignored. API keys never in Discord messages, logs, replies.
 - Persona file is read-only bind-mount.
-- Fleet-bus injection frames carry `authenticated="false"` per fleet-bus SPEC §4 — `from` is allowlist-checked against fleet-manifest.yaml but not cryptographically bound. Model treats bus payloads as untrusted external input.
+- Fleet-bus injection frames carry `authenticated="false"` per fleet-bus SPEC §4 — `from` is allowlist-checked against fleet-manifest.yaml but not bound to the authenticated NATS user. Model treats bus payloads as untrusted external input. **The attribute is a constant in both adapters, not the result of a check** (§4.7.1); it may become conditional only once the coordinator writes `verified_from`. Until then, an instruction in a bot's system prompt that a bus task from a named peer is authorised is an operational unblocking measure and **not** a sender-authentication control — nothing refuses a forged `from`, because nothing inspects one.
 
 ## 9 — Tool sandbox (v0.4)
 
@@ -1910,7 +2088,7 @@ Blocks yugo v0.6 AND v0.7 (SEV1-C v6 correction; earlier drafts wrongly claimed 
   - Coordinator emits a heartbeat on `fleet.coordinator.status` (v8: subject renamed per S2-ii; falls in STA authz family) every `COORDINATOR_HEARTBEAT_MS` (default 5000).
   - Tap alerts to `COORDINATOR_CHANNEL_ID` (and paging channel if configured) when heartbeat silent for `>3× heartbeat_ms`.
   - Coordinator container runs under supervisor (systemd, k8s, docker restart:always) with auto-restart on crash.
-  - **Break-glass STANDBY RELAY (SEV1-C v8, hardened v10 per SEV1-1 fix — commented-out-by-default):** a dedicated `break-glass` NATS user with permissions `subscribe fleet.*.request` + `publish fleet.*.inbox`. Standby relay is a headless process (10-line `nats sub / nats pub` shell loop OR a minimal Bun/Python one-file container) that pulls `.request` and republishes to `.inbox` forward-only, ack-after-forward.
+  - **Break-glass STANDBY RELAY (SEV1-C v8, hardened v10 per SEV1-1 fix — commented-out-by-default):** a dedicated `break-glass` NATS user with permissions `subscribe fleet.*.request` + `publish fleet.*.inbox`. **That subscribe pattern is deaf to a sender-bound publish** — NATS `*` matches exactly one token — so §4.7.1's step 1 widens this grant and the relay's own subscription alongside the stream and the coordinator's filter. A break-glass relay that cannot see the traffic it exists to rescue is worse than none, because it is opened during an outage and reports nothing wrong. Standby relay is a headless process (10-line `nats sub / nats pub` shell loop OR a minimal Bun/Python one-file container) that pulls `.request` and republishes to `.inbox` forward-only, ack-after-forward.
     - **The `break-glass` account is COMMENTED-OUT by default in `nats.conf`** — physically cannot authenticate while commented. This replaces v9's paper-only "alert on connect" claim (which was unimplementable: NATS auth events only surface on `$SYS.>` subjects that no component in the architecture has grant to subscribe, AND during legitimate use the coord is DOWN so can't emit alerts anyway). "Any connection while disabled" is now STRUCTURALLY impossible, not a control that needs plumbing.
     - **Runbook (`/ops/break-glass-relay.sh`) — 4 steps, published in-repo:**
       1. Operator SSH's to NATS host, uncomments `break-glass` block in `nats.conf`, runs `nats-server --signal reload` (SIGHUP; live reload, no restart needed).
