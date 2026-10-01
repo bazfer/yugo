@@ -13,6 +13,17 @@ blocks FB-3 (#10).
 > places. Read `yugo/SPEC.md` §4.3, §4.7, §14 and §15 before changing anything
 > here.
 
+> **§2 and §4's live facts are dated 2026-09-27 and at least one of them is known
+> stale.** While amending §3 for yugo #22 (2026-10-01) the deployed broker was read
+> again and **the `fleet.*.inbox` publish grant that §2.2 lists, and that §4 asks to
+> have revoked, is absent from the running configuration** — the config's mtime and
+> the server's `config_load_time` are both 2026-09-29, i.e. after §2's verification.
+> §2 and §4 are deliberately **not** re-dated here: correcting one line of a dated
+> live-state section means re-verifying all of it, which is its own PR. Treat §4's
+> "required action" as likely already done and **re-run §6 before acting on either
+> section.** That observation is Deet's, from the host, by the §6 commands; it is not
+> part of the amendment's reviewed content and no reviewer has endorsed it.
+
 This document states **two lists, separately**: the transitional topology live
 today, and the post-FB-3 target. The issue requires them stated apart because the
 live broker is mid-migration and several grants exist for subjects nothing
@@ -24,7 +35,7 @@ currently uses — and, as §4 records, one grant exists that the target forbids
 
 | Subject | Direction | Meaning |
 |---|---|---|
-| `fleet.<bot>.request` | inbound, **coordinator-consumed** | A request addressed to `<bot>`. JetStream stream `FLEET_REQUEST`. Gates the first hop. |
+| `fleet.<bot>.request` | inbound, **coordinator-consumed** | A request addressed to `<bot>`. JetStream stream `FLEET_REQUEST`. Gates the first hop. **Target shape is `fleet.<bot>.request.<sender>`** — see §3.2 and `yugo/SPEC.md` §4.7.1. |
 | `fleet.<bot>.inbox` | inbound to `<bot>` | The coordinator's released envelope. JetStream stream `FLEET_INBOX`. Gates the last hop. |
 | `fleet.<bot>.result` | inbound to `<bot>` | **Transitional only.** A reply correlated to an earlier request. Removed by FB-3. |
 | `fleet.<bot>.status` | outbound from `<bot>` | Heartbeat and liveness. |
@@ -122,16 +133,54 @@ Transcribed from `yugo/SPEC.md` §4.7 ("NATS authz map, v0.7 target"), not deriv
 
 | Stream | Fate |
 |---|---|
-| `FLEET_REQUEST` | Retained. **Coordinator is the sole consumer.** |
+| `FLEET_REQUEST` | Retained. **Coordinator is the sole consumer.** Its subject list and the coordinator consumer's filter both widen to cover `fleet.*.request.*` alongside `fleet.*.request` before any publisher adopts the sender token (§3.2). |
 | `FLEET_INBOX` | Retained. Consumed by each bot through its own durable JetStream consumer. |
 | `FLEET_RESULT` | **Removed** once no adapter subscribes it (#10 item 9). |
 
 ### 3.2 Per-bot grants
 
 - **subscribe:** `fleet.<self>.inbox`, **`fleet.<self>.status` (self only)**,
-  `fleet.broadcast.>`
-- **publish:** `fleet.*.request`, `fleet.<self>.status`, `fleet.broadcast.>`,
-  plus the JetStream API surface needed to bind and ack its own `.inbox` durable
+  `fleet.broadcast.>` — **unchanged by sender-binding. Receivers do not move.**
+- **publish:** **`fleet.*.request.<self>`**, **`fleet.broadcast.*.<self>`**,
+  `fleet.<self>.status`, plus the JetStream API surface needed to bind and ack its
+  own `.inbox` durable
+
+  **The sender is a literal final token, and that is the entire authentication
+  mechanism** (`yugo/SPEC.md` §4.7.1, amended 2026-10-01 for yugo #22). Earlier
+  revisions of this document transcribed `fleet.*.request` and
+  `fleet.broadcast.>`, because §4.7 said so: one grant per lane, identical for
+  every bot, carrying no sender. Under that map `envelope.from` is unenforceable by
+  any component, which is the gap #22 describes. **This document transcribes; it
+  did not derive the old shape and does not derive the new one.**
+
+  Three facts a reader of this section needs, each stated where it belongs rather
+  than left to the system spec:
+
+  - **A request receiver never sees the enforced token.** The coordinator rewrites
+    the subject when it forwards to `fleet.<recipient>.inbox`
+    (`yugo/coordinator.py` `inbox_subject`), so broker-enforced identity reaches a
+    bot only as a **coordinator-written NATS header**, `Yugo-Verified-From`. A body
+    field is **not** usable for this: the coordinator forwards publisher bytes
+    verbatim, so a sender can write one itself. §4.7.1 forbids the body field,
+    requires the coordinator to strip it and to construct rather than propagate
+    headers, and gives the per-path provenance table whose default is *unstamped*.
+    **Broadcast is the exception** — it does not pass the coordinator, so a
+    broadcast receiver reads the publisher's own subject and derives the sender from
+    its final token.
+  - **Nothing enforces this yet.** The live grant is `fleet.*.request` (§2.2) and
+    the coordinator writes no header and strips no field. §4.7.1 carries the
+    clause-by-clause table of what refuses and what does not.
+  - **FB-3 is a prerequisite, not a parallel track.** No adapter subscribes
+    `.inbox` in either port (§2.4), so a four-token envelope addressed to an
+    unmigrated recipient is captured, forwarded and never read — and then skipped
+    when that recipient's first durable starts at `DeliverPolicy=New`. "Receivers do
+    not move" describes the amendment's diff, not the state of the receive path.
+  - **The deployment order is normative and the publish path has no PubAck.**
+    `FLEET_REQUEST`'s subject list and the coordinator's consumer filter are both
+    `fleet.*.request` today, and NATS `*` matches exactly one token — so a
+    four-token publish matches neither, and a core publish that lands in no stream
+    is lost with no error at either end. Recipients ready, then stream and
+    coordinator, then publishers, then each publisher's broad grant (§4.7.1).
 - **denied:** `fleet.<self>.request` **subscribe** — the coordinator is the sole
   consumer, closing SEV1-1
 - **denied:** `fleet.*.inbox` **publish** — see §4
@@ -286,13 +335,72 @@ exception above. That PR must carry:
 
 Durability is not landed until those conditions pass.
 
+### 5.1 Sender-binding is a third migration, and it runs AFTER #10's request-lane half
+
+`yugo/SPEC.md` §4.7.1 (yugo #22) changes the **publish** side of §3.2 while leaving
+every subscription where it is. Its hazard is different in kind from #10's, and its
+own contraction step is per-user rather than gated globally — **but it is not
+independent of #10.** #10 item 2 above, the request-lane delivery move, is a
+**prerequisite**: until a recipient consumes `.inbox` durably, a four-token envelope
+addressed to it is forwarded successfully and read by nobody (§2.4, §3.5). An earlier
+revision of this section and of §4.7.1 both claimed the two were independent; Ohm
+caught it against the adapters' actual subscription lists.
+
+Its order, normatively in §4.7.1 and repeated here because this document is what an
+operator reads before touching the topology:
+
+0. **gate: every destination a flipped publisher can address consumes
+   `fleet.<self>.inbox` durably — i.e. FB-3 is done for it.** This gate is why
+   sender-binding is *not* independent of #10's request-lane half, and the first
+   draft of the amendment got it wrong
+1. widen `FLEET_REQUEST`'s subjects and the coordinator consumer's filter to cover
+   `fleet.*.request.*`, keeping the three-token shape — **and the `break-glass`
+   relay's subscribe grant with them**, since `fleet.*.request` cannot see a
+   four-token subject and a break-glass relay is opened precisely when nobody is
+   watching for silence
+2. teach the coordinator the four-token subject; **strip any publisher-supplied
+   `verified_from` on every path, legacy included**; stamp `Yugo-Verified-From` from
+   the subject on four-token deliveries, with freshly constructed headers
+3. grant the new publish subject **in addition to** the old one
+4. flip publishers, one adapter per PR
+5. teach receivers the header, the provenance default and the mismatch drop
+6. revoke `fleet.*.request` publish **for that bot, right after its own step 4** —
+   a per-user grant, so there is no flag day; the migration is done when the last
+   publisher's row is complete
+7. the **broadcast** lane separately: publishers to `fleet.broadcast.<kind>.<self>`,
+   receivers deriving the sender off the subject, then each bot's
+   `fleet.broadcast.>` grant replaced by `fleet.broadcast.*.<self>`. **Steps 1–6 do
+   not cover this**, and until step 7 lands for a bot that bot can forge a broadcast
+   sender
+
+**Two inversions worth naming, because neither announces itself:**
+
+- **4 before 1 is total silent loss for that bot** — the publish succeeds, no stream
+  captures it, nothing is delivered, and the sender's own audit record says it was
+  sent. The cheapest inversion to make by accident, because the publisher's change
+  is a single subject string.
+- **4 before 2 stops the request lane for the whole fleet.** `inbox_subject`'s
+  `ValueError` escapes the relay loop and `coordinator_main` treats that as fatal, so
+  the coordinator exits and crash-loops on the unacked message until an operator
+  purges it or retention evicts it — eviction being loss, not recovery.
+
+**A denied publish is quiet.** NATS reports a publish permission violation
+asynchronously and does not close the connection; on the pinned `nats-py==2.15.0` it
+reaches `error_cb` while the publish call has already returned success. Any
+permission-revocation step therefore needs a wired, observed error path before it is
+called safe, and a denial test must assert through `error_cb` rather than expecting a
+raise or a disconnect.
+
 ---
 
 ## 6. How to re-verify this document
 
 ```sh
-# streams and their consumers
-curl -s 'http://127.0.0.1:8222/jsz?streams=1&consumers=1'
+# streams, their subject lists and their consumers' filter subjects
+curl -s 'http://127.0.0.1:8222/jsz?streams=1&consumers=1&config=1'
+
+# whether the running broker has reloaded the config file on disk
+curl -s http://127.0.0.1:8222/varz   # compare config_load_time with the file mtime
 
 # what each adapter actually subscribes
 grep -n 'this.nc.subscribe' src/fleet-bus.ts
@@ -310,4 +418,26 @@ grep -n 'DeliverPolicy' yugo/SPEC.md
 Broker grants live in the fleet-bus NATS configuration, which is deployment
 infrastructure and not in this repository. Read the `authorization` block there;
 the passwords are `$VAR` references resolved from a separate included file and
-must never be quoted into a document or a review.
+must never be quoted into a document or a review. **Confirm it is the file the
+server loaded** — `varz`'s `config_load_time` against the file's mtime — because a
+config edited and never SIGHUP'd is not a grant.
+
+**`yugo/config/nats-coordinator-authz.conf` in this repository is a template and is
+not what runs.** It describes an `accounts` isolation model with `CHANGEME`
+placeholders. Quoting its permissions as live — as yugo #22 did — describes a file
+nothing loads, and its bot grant (`fleet.>` with `.inbox` denied) is **wider** than
+what the host serves.
+
+**Attribution for the live-state claims in this paragraph and in §2's staleness
+note.** Both are Deet's readings of the deployment on **2026-10-01**, taken on the
+host by the commands above — the `authorization` block of the file the server loaded,
+`varz`'s `config_load_time` against that file's mtime, and
+`jsz?streams=1&consumers=1&config=1` for the stream subjects and consumer filters.
+The findings were: no `accounts` block, a flat `authorization { users = [...] }`, per-bot
+publish of `fleet.*.request` / `fleet.*.result` / `fleet.<self>.status` /
+`fleet.broadcast.>` / `pr.>` / `incident.>` and no `fleet.*.inbox`, and
+`FLEET_REQUEST` capturing exactly `fleet.*.request` with its sole consumer filtering
+the same. **No reviewer has independently inspected the running fleet configuration,
+and the amendment's normative content does not depend on these readings** — they
+motivate the ordering and the staleness note. Re-run the commands rather than citing
+this paragraph.

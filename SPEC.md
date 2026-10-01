@@ -58,19 +58,33 @@ Consumers MAY introduce project-specific kinds. Unknown `kind` values MUST NOT b
 
 ## 4 — Sender identity
 
-`envelope.from` is:
+**CURRENT — what every shipped consumer does today.** `envelope.from` is:
 
 - **Normalized** to lowercase, NFKC, matching `/^[a-z0-9_-]+$/`
 - **Allowlist-checked** against a fleet manifest (`~/vault/infra/fleet-manifest.yaml`, `bot_names` list)
-- **Not cryptographically bound** to the authenticated NATS user — a spoofing gap tracked in [`artifice-ia/claude-discord` task #18]
+- **Not bound to the authenticated NATS user.** The broker authenticates the *connection*; nothing checks that a connection is entitled to the `from` it asserts. The guarantee an envelope carries is *"some credentialed fleet member sent this"*, never *"this bot sent this"*. Tracked as **yugo #22**; the original ticket was [`artifice-ia/claude-discord` task #18]
 
-Consumers that surface `envelope.from` to a downstream trust boundary (e.g., injecting it into an LLM session) MUST also surface `authenticated="false"` explicitly so the model knows the sender claim is unverified.
+Consumers that surface `envelope.from` to a downstream trust boundary (e.g., injecting it into an LLM session) MUST also surface `authenticated="false"` explicitly so the model knows the sender claim is unverified. **In both shipped ports that attribute is a hard-coded literal rather than the result of a check** (§7), which is correct while nothing can verify a sender and is the reason it must not be made conditional before something can.
 
-**Planned closure of the gap (v1.x additive):** subject-encoded sender per Deet's spec — `publish: ["fleet.*.request.<user>"]` in nats.conf, receivers derive identity from the subject token, not the body. This is a NATS-config change plus a receiver patch; the envelope schema itself is unchanged.
+**PLANNED — not current, and not what an earlier revision of this section implied.** The closure is **subject-encoded sender**, and the authoritative statement of it is **`yugo/SPEC.md` §4.7 and §4.7.1**, which carry the grant shapes, the enforcement table and a normative deployment order. This section carries only the wire-visible half:
+
+- A bot's publish grant becomes `fleet.*.request.<self>` — recipient in token 2, sender in token 4 — so the broker refuses a forged sender at publish time. **This is a `nats.conf` change plus a coordinator change; the envelope schema is unchanged** apart from one additive v1 field, per Clause 1.
+- Because the coordinator rewrites the subject on forward, the enforced token reaches a receiver only as something the coordinator writes. **It is a NATS header on the coordinator's `.inbox` publish, `Yugo-Verified-From`, and NOT an envelope field.** The coordinator MUST NOT modify `from` — the claim and the enforced fact are kept apart so that a disagreement is evidence rather than a silent correction.
+- **A body field named `verified_from` is FORBIDDEN and MUST be ignored by every receiver.** The coordinator deletes any it finds, on every path. The reason is a compatibility one and it is the reason this is a header: `FLEET_INBOX` retains seven days of envelopes published under the old assumption, any of which may already carry a sender-authored `verified_from`, and nothing a receiver can read in the body distinguishes those from a genuine stamp. A header no pre-cutover publisher ever set is simply absent on all of them.
+- **Presence is not provenance.** A receiver MUST treat the stamp as absent unless it can establish that a stamping coordinator wrote it on the message in hand. Legacy `.request` consumed directly, anything retained from before the stamp shipped, and anything relayed verbatim by the break-glass relay are all **unstamped**, whatever they contain. `yugo/SPEC.md` §4.7.1 carries the full path table.
+- A receiver whose stamp disagrees with `from` drops the envelope with `from_subject_mismatch` (§5), recording both values.
+- **On the broadcast lane the original idea does hold:** broadcasts do not pass the coordinator, so a receiver reads the publisher's own subject and derives the sender from its final token with no stamp at all. That lane has its own migration in `yugo/SPEC.md` §4.7.1 and is **not** closed by revoking the request grant.
+
+**Correcting this section's own earlier text, because it was cited as current and the citation was expensive.** Through 2026-09-30 this section read: *"subject-encoded sender per Deet's spec — `publish: ["fleet.*.request.<user>"]` in nats.conf, receivers derive identity from the subject token, not the body."* Two problems with reading that as the specification:
+
+1. **It was written on 2026-08-25**, against core NATS, one TypeScript consumer, no coordinator and no JetStream. `yugo/SPEC.md` never contained the phrase "subject-encoded sender" at all, and its §4.7 target map granted a sender-less `fleet.*.request` — so the system spec's target state actively contradicted this line. yugo #22 quoted it as *"the fix, already specified"*; it was a one-sentence intention, and treating it as a specification produced a badly wrong estimate of the work.
+2. **"Receivers derive identity from the subject" is false for this architecture.** The coordinator rewrites the subject when it forwards, so a receiver consuming `fleet.<self>.inbox` never sees the token the broker enforced. Receivers deliberately **do not move** — that is why this shape was chosen — and the price of not moving is that the coordinator must stamp the identity into the envelope. There is no receiver-side subject derivation to implement, and a patch written from the old sentence would have reached for one.
+
+**`yugo/config/nats-coordinator-authz.conf` is a template and is not deployed.** The live broker runs a flat `authorization { users = [...] }` block with no `accounts` block, so the per-bot account permissions quoted in #22 describe a file nothing loads. The live per-bot publish grant — **Deet's reading of the host on 2026-10-01**, off the `authorization` block of the file the server reports loading (`varz`'s `config_load_time` 2026-09-29 matches that file's mtime), reviewed by nobody else — is `fleet.*.request`, `fleet.*.result`, `fleet.<self>.status`, `fleet.broadcast.>`, `pr.>`, `incident.>`, `_INBOX_<self>.>` and two `$JS.API` read verbs. **Narrower** than the template's `fleet.>`, and still wide enough for any bot to publish as any bot, which is the gap this section is about. Re-read the deployment rather than citing this sentence; `docs/TOPOLOGY-9-fleet-bus-subjects.md` §6 carries the commands.
 
 ## 5 — Validation reject codes
 
-Every consumer MUST emit exactly these reject codes on validation failure (this makes cross-language debugging tractable):
+Every consumer MUST emit exactly these reject codes on validation failure (this makes cross-language debugging tractable). **One row is marked PLANNED and is not part of the MUST yet** — no shipped consumer can emit it, because nothing writes the field it compares; a conformance vector for it lands with the receiver work in §4's planned half, not before.
 
 | Code | Meaning |
 | --- | --- |
@@ -86,6 +100,7 @@ Every consumer MUST emit exactly these reject codes on validation failure (this 
 | `payload_not_serializable` | `payload` cannot round-trip through JSON |
 | `envelope_too_large` | Encoded envelope exceeds `maxBytes` (default 1_044_480 = 1MB - 4KB headroom) |
 | `recipient_mismatch` | `to` present, but does not equal the local bot name (direct requests only) |
+| `from_subject_mismatch` | **PLANNED, not yet emitted by any consumer.** A stamp whose provenance the receiver has established disagrees with `from` — on the request lane the `Yugo-Verified-From` header, on the broadcast lane the subject's final token (§4). Reserved here so the two ports cannot pick different spellings. A consumer that does not yet read the header conforms, and a consumer MUST NOT emit this code off a body `verified_from`, which is forbidden and carries no provenance |
 
 ## 6 — NATS subject conventions
 
@@ -235,6 +250,21 @@ these are the running values, not a proposal.
 |---|---|---|---|---|---|
 | `FLEET_REQUEST` | `fleet.*.request` | 7 days | 100,000 | old | file |
 | `FLEET_RESULT` | `fleet.*.result` | 7 days | 100,000 | old | file |
+
+**`FLEET_INBOX` exists too**, capturing `fleet.*.inbox`, and is absent from the
+table above because this section predates it. Its limits are declared by
+`yugo/SPEC.md` FB-1 and were read off the live broker on 2026-09-27
+(`docs/TOPOLOGY-9-fleet-bus-subjects.md` §2.1); the subject list above was
+re-confirmed unchanged on 2026-10-01.
+
+**This table is step 1 of §4's planned work, and the reason that work has a
+mandatory order.** NATS `*` matches exactly one token, so a publish to
+`fleet.<peer>.request.<self>` matches **neither** this stream's subject nor the
+coordinator consumer's identical filter. Both must widen before any publisher adopts
+the four-token shape. The first consequence below — that a core publish is captured
+without any JetStream permission — has an unstated converse: a core publish to a
+subject **no** stream captures is equally quiet. It returns success, nothing stores
+it, nothing delivers it, and no error reaches either end.
 
 `fleet.*.status` and `fleet.broadcast.>` are deliberately **not** captured:
 heartbeats are presence, and replaying a broadcast to a bot that was offline
@@ -496,7 +526,8 @@ When a consumer injects a received envelope into an LLM session as a channel fra
 
 - `env_id` is the publisher's `envelope.id` unchanged (correlates with the audit log)
 - `req_id` is a consumer-local nonce (`crypto.randomBytes(16).toString('hex')`), used to bind subsequent `bus_reply` calls to the specific injected request
-- `authenticated="false"` is REQUIRED — no consumer may claim `authenticated="true"` on a fleet-bus frame until subject-encoded sender lands (see §4)
+- `authenticated="false"` is REQUIRED — no consumer may claim `authenticated="true"` on a fleet-bus frame until subject-encoded sender lands (see §4). **Stated as a mechanism rather than a rule:** nothing enforces this clause, and nothing needs to, because both ports emit the attribute as a constant. It is true by construction. The moment it becomes conditional it needs the condition written here, so the condition is written here now — **a consumer MAY emit `authenticated="true"` only when all three hold: the envelope arrived on a path whose stamp provenance it can establish, that stamp is present, and it equals `from`.** Otherwise `authenticated="false"`, and a consumer that cannot tell which path it is on MUST assume it cannot establish provenance. A consumer that flips the attribute on any other signal — a manifest hit, a `to` match, a **body** `verified_from`, the subject it happened to arrive on — is claiming a guarantee the bus does not provide. A body `verified_from` is the specific trap: it is writable by the sender, which is why §4 forbids reading it.
+- When a provenance-established stamp is present the frame SHOULD carry it as a distinct attribute rather than folding it into `from_claim`: `from_claim` is what the sender said and the stamp is what the broker enforced, and an operator reading a frame after an incident needs both, including the ability to see that a frame carried no stamp at all. Where they agree the frame is `authenticated="true"`; where they disagree the envelope was dropped before any frame existed (§5 `from_subject_mismatch`)
 
 The reference TypeScript implementation exposes this via `buildFleetBusFrameMeta` in [`src/fleet-bus.ts`](./src/fleet-bus.ts).
 
@@ -533,7 +564,7 @@ The fleet-bus repo does not run consumer-side CI. Consumers (`claude-discord`, `
 
 ## 11 — Rollout order and known limitations
 
-Current rollout state (2026-08-25):
+Current rollout state (2026-08-25 — **the date is load-bearing: this list describes core NATS with one TypeScript consumer, before JetStream, before the coordinator and before the Python port. Nothing in it should be read as present-tense.** Live state is re-verified per-run in `docs/TOPOLOGY-9-fleet-bus-subjects.md` §2 and §6):
 
 - ✅ Envelope v1 schema live in `artifice-ia/claude-discord`, powering three Claude Code sessions (Luna, Deet, Kat)
 - ✅ NATS + per-bot users + tap-based supervision deployed on norstar
@@ -542,10 +573,10 @@ Current rollout state (2026-08-25):
 - ⏳ Plugin refactor to consume this repo — pending
 - ⏳ Baton protocol (v1.x additive fields) — spec at `~/vault/shared/projects/fleet-bus/BATON-PROTOCOL-SPEC.md`, implementation pending
 - ⏳ Codex-container Python adapter — pending, design in Luna's memory notes
-- ⏳ Subject-encoded sender (closes the `from_claim` spoofing gap) — pending
+- ⏳ Subject-encoded sender (closes the `from_claim` spoofing gap **on the request lane; the broadcast lane needs its own pass**) — **pending, specified at `yugo/SPEC.md` §4.7.1, tracked as yugo #22.** Gated on FB-3 first (no adapter consumes `.inbox` in either port, so a flipped publisher's envelope would be forwarded and never read), then six ordered steps of which the first three are broker and coordinator work. Nothing in this item is deployed. The interim measure in use — a line in the codex bots' system prompt saying a bus task from Deet, Kat or Luna is authorised — is an operational unblock, not authentication: it cannot distinguish a forged `from` from a genuine one. **`from` remains a claim after this work lands**; what the stamped paths add is an enforced value beside it
 
 **Known limitations for v1:**
 
-- `from` is allowlist-checked but not cryptographically bound to the authenticated NATS user (see §4).
+- `from` is allowlist-checked but not bound to the authenticated NATS user (see §4). Every bot's publish grant on the request lane is identical, so the broker has nothing to distinguish senders with; the receiving adapter is honest about this and stamps every inbound frame `authenticated="false"`.
 - Core NATS is lossy — messages published while no subscriber exists are dropped. This is documented behavior, not a bug. Baton `abandoned` semantics (originator-side timeout) exist to cover the lost-in-flight case.
 - Orphaned batons if `origin` disconnects mid-flight (baton spec §"Also worth surfacing") — no fix in v1.
