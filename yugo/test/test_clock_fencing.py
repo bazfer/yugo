@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pytest
+import dedup_store as d
 import fleet_bus as f
 import dedup_verification as v
 from dedup_admin import provision
@@ -18,7 +19,7 @@ OTHER = "22222222-2222-4222-8222-222222222222"
 @pytest.fixture
 def clock(monkeypatch):
     state = [100_000]
-    monkeypatch.setattr(f.time, "monotonic_ns", lambda: state[0] * 1_000_000)
+    monkeypatch.setattr(d.time, "monotonic_ns", lambda: state[0] * 1_000_000)
     return state
 
 
@@ -74,7 +75,7 @@ def test_6_pending_exempt_every_ttl_path(store, path):
     if path == "target":
         assert store.claim("e", "rival", future)[0] is True
     elif path == "periodic":
-        store._claims = f.DEDUP_PRUNE_EVERY - 1
+        store._claims = d.DEDUP_PRUNE_EVERY - 1
         store.claim("trigger", "trigger", future)
     elif path == "idle":
         assert store.prune_idle(future) == 1
@@ -178,7 +179,7 @@ def test_14_boot_failure_live_new_row_and_fresh_refuse(store, monkeypatch):
     before = row(store)
     def unreadable():
         raise OSError("boot unreadable")
-    monkeypatch.setattr(f, "read_boot_id", unreadable)
+    monkeypatch.setattr(d, "read_boot_id", unreadable)
     for envelope in ("e", "fresh"):
         with pytest.raises(OSError, match="boot unreadable"):
             store.claim(envelope, "rival", 1000)
