@@ -6,6 +6,7 @@ import sqlite3
 import asyncio
 from datetime import datetime, timezone
 
+import dedup_store
 import fleet_bus
 import pytest
 
@@ -72,7 +73,7 @@ def test_pending_lease_recovers_and_prune_uses_index_with_bounded_batch(tmp_path
     assert restarted.claim("pending", "replacement", now_s=103)[:2] == (False, "original")
     plan = restarted._db.execute(
         "EXPLAIN QUERY PLAN SELECT rowid FROM envelope_dedup_v2 "
-        "WHERE first_seen_s < ? ORDER BY first_seen_s LIMIT ?", (0, fleet_bus.DEDUP_PRUNE_LIMIT)
+        "WHERE first_seen_s < ? ORDER BY first_seen_s LIMIT ?", (0, dedup_store.DEDUP_PRUNE_LIMIT)
     ).fetchall()
     assert "envelope_dedup_v2_first_seen" in repr(plan)
     for index in range(101):
