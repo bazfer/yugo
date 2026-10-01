@@ -928,6 +928,102 @@ bind.** Provisioning is therefore two-phase and operator-driven:
   refuses and writes nothing. Otherwise it would mint a record blessing a
   half-migrated store, and step 10's three-way check would then be comparing two
   agreeing wrong answers against the one right one.
+
+  **A refused provisioning MUST leave no store behind (yugo#60).** The first draft
+  created the store with `O_CREAT|O_EXCL` and validated the record afterwards, so
+  input it refused still left the file on disk — and the operator's retry of the
+  corrected command then failed on the path existing, which is the condition
+  `O_EXCL` is there to detect. Since §8.4 made provisioning mandatory before any
+  bus-enabled bot with a file-backed store will start, that is the retry path of a
+  required command, taken at the moment the input is most likely wrong. Two rules,
+  because one of them cannot cover the whole window:
+
+  1. **Validate first.** Everything judgeable from the operator's own input — the
+     seven `storage_evidence` keys, the `participant_inventory`, `attested_by`,
+     that `--record`'s directory exists, and that `--record` is not itself a
+     directory — is refused **before anything is created**. The rest of the record
+     is read off the store (`inode`, `device`, `schema_fingerprint`) and cannot be
+     checked earlier, so those refusals **discard the store this run created**.
+     What makes the discard safe is stated narrowly, because the first
+     implementation of it over-read `O_EXCL`: `O_EXCL` establishes that **the main
+     path** held no file a moment earlier — nothing about the sidecars — and the
+     discard additionally re-checks `st_dev`/`st_ino` before unlinking, so it
+     cannot remove a file that replaced the store at that path either.
+  2. **A store found in the way names itself, and the advice is DERIVED from one
+     classification.** Where a store survives anyway — a kill, a failed discard —
+     the refusal must state that a store is already at that path, what was found
+     there, and the recovery. A bare "file exists" makes the operator infer that
+     their first failure caused their second.
+
+     **The structure is normative, not just the outcomes.** Seven review findings
+     on the change that introduced this section were one defect: a claim in the
+     advice reaching past the check behind it. Written per branch, each new branch
+     re-derived its own safety argument, and two of them got it wrong — a cold
+     `-journal` SQLite never read, and the command's own `-wal`. **The advice must
+     therefore be derived from a single classification of every artifact found,
+     never assembled per case.** One function enumerates the store and every
+     fixed-name sidecar beside it and labels each:
+
+     | Label | Established by | May be offered for deletion |
+     |---|---|---|
+     | **accounted** | Its contents were read, or it is zero bytes. For the store: the supported schema, an empty dedup table, and no `sqlite_master` object — by **`(type, name)` pair** — that `create_schema` did not make. | Yes |
+     | **appeared here** | Absent when the command started looking, present now. | Yes |
+     | **unaccounted** | It has bytes, it predates the command, and nothing read them. | **No** |
+
+     Deletion is offered only when **nothing found is unaccounted**, and then the
+     advice lists every path found — otherwise it names the unaccounted ones and
+     points at `--record-only`.
+
+     **A sidecar's contents are never established, so it is never cleared by a
+     claim about the store.** The row count establishes what SQLite *read*; SQLite
+     ignores a cold or truncated `-journal`, and a `-wal` whose header does not
+     match the database beside it, so a sidecar can hold bytes no read ever
+     touched. The earlier per-branch version asserted the opposite — *"nothing in
+     them is unaccounted for, since the row count was read through them"* — and
+     named a pre-existing journal for deletion on the strength of it.
+
+     **Two measured facts the labels depend on.** Reading a WAL database through a
+     `mode=ro` handle **creates** `-wal` and `-shm`, and a read-only handle cannot
+     remove them on close; so the sidecar snapshot must be taken **before** the
+     inspection, and the advice must list what is there **after** it, since the
+     operator has to clear those too. And that same handle **does** recover an
+     uncheckpointed `-wal`, so rows living only there are counted — verified
+     against a fixture whose main file genuinely lacks the row, because a fixture
+     that checkpoints it makes the control vacuous.
+
+     **The zero-byte store with a sidecar beside it** is the case this structure
+     gets right for free: the file is accounted (empty), the sidecar is
+     unaccounted, so deletion is withheld — the file is empty and the sidecar is
+     where that store's rows are.
+
+  **A sidecar with no database beside it refuses, before anything is created.**
+  `O_EXCL` proves the *main* path is new and says nothing about `<store>-wal`,
+  `<store>-shm` or `<store>-journal`. One of those can predate the command — a
+  `-wal` left by a database since lost is exactly that, and §8.6 step 3 exists
+  because a WAL can hold committed transactions the main file does not. **SQLite deletes an orphaned WAL the
+  instant it opens the empty store provisioning would create** — measured against
+  the SQLite bundled with CPython 3.12, and not a documented SQLite guarantee,
+  which argues *for* refusing rather than against it since the refusal does not
+  depend on what SQLite would have done. So no cleanup can preserve it: the
+  refusal has to
+  come before the create. It is gated on the main store being absent, because a
+  live store with its own uncheckpointed WAL is the ordinary case and belongs to
+  the rule above it. **This is also why the discard names only the store it
+  created, pinned by `st_dev`/`st_ino`, and never the sidecars** — closing the
+  last handle is measured to remove the `-wal` and `-shm` this run created, so an
+  unlink loop would add nothing but an ownership guess from a file having been
+  absent a moment earlier. **SQLite is no judge of ownership here either** — the
+  paragraph above is it deleting a WAL that was not its own — which is why the
+  rule is a refusal before the create and not care taken afterwards. Codex caught
+  the first draft of this
+  section's implementation deleting an orphaned WAL on exactly that inference:
+  **the fix for a bug about leftover files had introduced a worse one about
+  deleted files**, and a leftover costs a retry while a deleted WAL can be
+  unrecoverable.
+
+  **No `--force`.** A retry must not be able to destroy a store with rows in it,
+  and an operator four bots into a runbook is exactly who would reach for the
+  flag. Clearing the path stays a deliberate, separate act.
 - **Phase B — run.** Startup validates §8.4 and never writes the record.
 
 | Situation | Disposition |
@@ -940,6 +1036,8 @@ bind.** Provisioning is therefore two-phase and operator-driven:
 | **Reboot, `binding: "devno"`** | Device numbers may have changed → **re-attestation required.** |
 | Store moved to another filesystem | Device mismatch → refuse. Re-provision. |
 | Accessor set changed | Record is stale — the inventory is part of the evidence. Re-provision. |
+| **Store file present from a refused or killed provisioning, no record** | **Provisioning refuses and names it.** A retry must not read as a new fault, and must not clear the path on its own. `--record-only` where the schema is supported; deletion only where the command has established there are no rows. |
+| **A `-wal`, `-shm` or `-journal` present with no store beside it** | **Refuse before creating anything, and never delete it.** The store is partly deleted or partly restored, and a `-wal` there can hold the only copy of committed transactions. Recover it, or move it aside deliberately. |
 | **Release 2 column migration** | See §8.6. |
 
 **`:memory:` keeps its narrowly scoped exception (§2):** no record is required —
@@ -1062,6 +1160,50 @@ standard — delete the guard, watch the named test go red.
 32. **WAL-aware backup:** a store with committed-but-uncheckpointed transactions,
     backed up per §8.6 step 3, restores with those rows present — and a
     main-file-only copy is shown to lose them.
+33. **A refused provisioning leaves no store (yugo#60).** Each refusal reachable
+    from operator input — `backing`, a blank or missing evidence key, an extra
+    one, an unoffset `inspected_at`, an empty or malformed inventory, a blank
+    `attested_by`, a `--record` directory that does not exist, a `--record` that
+    names a directory — refuses with **no store, no `-wal`, no `-shm` and no
+    record** on disk.
+34. **The ordering, separately from the outcome.** `os.open` is made to fail the
+    test if it is called at all, and a bad `backing` still refuses. Asserting
+    only that the file is absent afterwards is satisfied by a cleanup path, which
+    leaves a window where a kill reproduces the bug.
+35. **A store already there is named, and never silently cleared.** One control
+    per state the retry can find — zero bytes; supported schema, no rows and
+    no other schema object; supported schema **with** rows; supported schema and an empty
+    dedup table but **another object beside it** — an extra table, empty or
+    populated, and a populated table wearing the expected index's name; a store
+    whose only row lives in an uncheckpointed `-wal`; a zero-byte file with a
+    populated `-wal` beside it; a schema this port does not support — each asserting the message names that situation and
+    its recovery, and that the file is still there afterwards. Only the first two
+    may mention deletion; for the rest the **absence** of deletion advice is the
+    assertion, and the other table's rows are counted afterwards. The empty-store
+    control then executes the `--record-only` the message named and checks it
+    produces a loadable record: a recovery that is only named is not a recovery.
+    And two controls the other way — a file that really does hold nothing else
+    **must** still be offered for deletion, or "never offer deletion" passes as a
+    fix; and where sidecars are present that advice must **name them**, or it
+    sends the operator into the orphan refusal.
+
+    **And one control, over every branch that offers deletion, that executes the
+    advice and asserts BOTH halves.** It deletes exactly the paths the message
+    lists and nothing else, requires no residue, requires the retry to succeed —
+    and then reconstructs what was on disk before the command ran and requires
+    that nothing holding rows, and no non-empty file that predated the command,
+    was among the paths named. **A successful retry proves recovery works, not
+    that deleting every named artifact was safe** (Ohm); the first version of this
+    control asserted only the first half, and only for a clean empty store.
+36. **A sidecar that predates the run survives it**, one control per member of
+    the family — `-wal`, `-shm`, `-journal` — plus one against a real orphaned
+    WAL built by SQLite with committed rows in it. **The survival assertion comes
+    first and unconditionally**, before any assertion that the command refused:
+    with the pre-flight removed, provisioning *succeeds* and eats the WAL on the
+    way, so a `pytest.raises` wrapper reports "did not raise" and never reaches
+    the data. Two further controls: a live store's own uncheckpointed WAL must
+    still get the store-already-exists message rather than this one, and the
+    discard must leave a file that replaced the store at that path alone.
 
 ## Review history
 
