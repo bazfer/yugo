@@ -359,8 +359,13 @@ operator reads before touching the topology:
    four-token subject and a break-glass relay is opened precisely when nobody is
    watching for silence
 2. teach the coordinator the four-token subject; **strip any publisher-supplied
-   `verified_from` on every path, legacy included**; stamp `Yugo-Verified-From` from
-   the subject on four-token deliveries, with freshly constructed headers
+   stamp on every path, legacy included** — the body `verified_from` field and the
+   `Yugo-Verified-From` header alike; stamp `Yugo-Verified-From` from the subject on
+   four-token deliveries, with freshly constructed headers. **The control that proves
+   the strip is the LEGACY one** (`yugo/SPEC.md` §11): a three-token request carrying
+   an inbound `Yugo-Verified-From` must reach `.inbox` without it. On the four-token
+   path the derived value overwrites an offered one, so a test there passes against a
+   coordinator that propagates headers — it cannot see what it overwrote
 3. grant the new publish subject **in addition to** the old one
 4. flip publishers, one adapter per PR
 5. teach receivers the header, the provenance default and the mismatch drop
