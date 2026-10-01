@@ -12,7 +12,7 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 BOOT_PATH = "/proc/sys/kernel/random/boot_id"
 TIMENS_PATH = "/proc/self/timens_offsets"
@@ -20,6 +20,12 @@ UUID_DIRECTORY = "/dev/disk/by-uuid"
 PORT = "python"
 PROVISION_HINT = "run yugo dedup provision"
 BOOT_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII)
+# §8.3.3's seven keys, every one of them typed by the operator at provisioning
+# time. `uuid_resolution` is the eighth and is read off the live filesystem, so
+# it is the one evidence field provisioning cannot check before it has a store.
+OPERATOR_EVIDENCE_FIELDS = {"device_path", "mount_point", "fstype", "mount_id_source",
+                            "backing", "determined_by", "inspected_at"}
+DERIVED_EVIDENCE_FIELDS = {"uuid_resolution"}
 SCHEMAS = {
     port: {"table": "envelope_dedup_v2", "columns": [
         {"name": "envelope_id", "declared_type": "TEXT"},
@@ -38,9 +44,14 @@ class VerificationError(RuntimeError):
     pass
 
 
+def refuse(reason: str) -> NoReturn:
+    """The one refusal format, for the paths that know they are refusing."""
+    raise VerificationError(f"dedup verification refused: {reason}; {PROVISION_HINT}")
+
+
 def require(condition: bool, reason: str) -> None:
     if not condition:
-        raise VerificationError(f"dedup verification refused: {reason}; {PROVISION_HINT}")
+        refuse(reason)
 
 
 def valid_boot_id(value: Any) -> bool:
@@ -87,6 +98,38 @@ def timestamp(value: Any) -> bool:
         return False
 
 
+def operator_evidence(evidence: Any) -> Any:
+    """`evidence` without the fields provisioning fills in from the filesystem.
+
+    Provisioning overwrites `uuid_resolution` whatever was passed for it — §8.3.3
+    prints it in the example block operators copy — so the pre-flight below must
+    not start refusing a call that worked before yugo#60 added it.
+    """
+    require(type(evidence) is dict, "invalid storage evidence fields")
+    return {key: value for key, value in evidence.items() if key not in DERIVED_EVIDENCE_FIELDS}
+
+
+def validate_operator_inputs(evidence: Any, inventory: Any, attested_by: Any) -> None:
+    """The §8.3.3/§3 record rules that depend only on what the operator typed.
+
+    Provisioning runs this BEFORE it creates anything, so input it refuses
+    leaves no store on disk for the retry to trip over (yugo#60) — the seven
+    evidence keys, the inventory and `attested_by` are the fields an operator
+    gets wrong, and none of them needs a store to check. `validate_record` runs
+    it again over the assembled record, so the pre-flight and the real gate
+    cannot drift apart about what is well formed.
+    """
+    exact_fields(evidence, OPERATOR_EVIDENCE_FIELDS, "storage evidence")
+    require(all(nonempty(v) for v in evidence.values()), "storage evidence strings")
+    require(evidence["backing"] in ("local-block", "local-virtual"), "network or unknown backing")
+    require(timestamp(evidence["inspected_at"]), "inspection timestamp")
+    require(type(inventory) is list and bool(inventory), "participant inventory")
+    for participant in inventory:
+        exact_fields(participant, {"process", "user", "path", "method"}, "participant")
+        require(all(nonempty(v) for v in participant.values()), "participant strings")
+    require(nonempty(attested_by), "attestation")
+
+
 def validate_record(record: Any) -> dict:
     exact_fields(record, {"record_version", "canonical_path", "device", "inode", "port",
                          "schema_fingerprint", "storage_evidence", "participant_inventory",
@@ -114,17 +157,11 @@ def validate_record(record: Any) -> dict:
         exact_fields(column, {"name", "declared_type"}, "column")
         require(nonempty(column["name"]) and nonempty(column["declared_type"]), "column strings")
     evidence = record["storage_evidence"]
-    exact_fields(evidence, {"device_path", "mount_point", "fstype", "mount_id_source", "backing",
-                            "determined_by", "uuid_resolution", "inspected_at"}, "storage evidence")
-    require(all(nonempty(v) for v in evidence.values()), "storage evidence strings")
-    require(evidence["backing"] in ("local-block", "local-virtual"), "network or unknown backing")
-    require(timestamp(evidence["inspected_at"]), "inspection timestamp")
-    inventory = record["participant_inventory"]
-    require(type(inventory) is list and bool(inventory), "participant inventory")
-    for participant in inventory:
-        exact_fields(participant, {"process", "user", "path", "method"}, "participant")
-        require(all(nonempty(v) for v in participant.values()), "participant strings")
-    require(nonempty(record["attested_by"]) and timestamp(record["attested_at"]), "attestation")
+    exact_fields(evidence, OPERATOR_EVIDENCE_FIELDS | DERIVED_EVIDENCE_FIELDS, "storage evidence")
+    require(nonempty(evidence["uuid_resolution"]), "storage evidence strings")
+    validate_operator_inputs(operator_evidence(evidence),
+                             record["participant_inventory"], record["attested_by"])
+    require(timestamp(record["attested_at"]), "attestation")
     return record
 
 
