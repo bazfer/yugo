@@ -35,9 +35,15 @@ given by the environment:
 - `bus-publish.ts` reads the NATS password from the file named by `FLEET_BUS_TOKEN_FILE`,
   never inline
 
-The imported `.gitignore` already excludes `.env*`. Verified before import: no `.env`, no
-`*.pem`, no `*.key` in the source directory, and no token-, webhook- or key-shaped literals
-anywhere in these files.
+Verified before import: no `.env`, no `*.pem`, no `*.key` in the source directory, and no
+token-, webhook- or key-shaped literals anywhere in these files.
+
+**CORRECTION (Ohm, review of 615f79b): the imported `.gitignore` does NOT cover `.env*`.**
+It lists `.env`, `.env.development.local`, `.env.test.local`, `.env.production.local` and
+`.env.local` — so **`.env.production`, `.env.staging` and `.env.backup` are NOT ignored**,
+confirmed with `git check-ignore`. Nothing is leaked today because no such file exists, but
+it is a live foot-gun for whoever adds one. Hardening it changes an imported file, so it is
+deliberately left to the follow-up PR rather than smuggled into a baseline.
 
 ## Known gaps, carried as-is rather than fixed here
 
@@ -51,10 +57,20 @@ see the delta.
    exits and Docker restarts it — **losing all in-memory state.**
 2. **`drain()` uses `fetch` with no timeout** under a `draining` flag. One hung POST stalls
    mirroring **silently and indefinitely**.
-3. **No liveness signal of its own.** No `HEALTHCHECK`, nothing logged or posted on start.
+3. **No liveness signal on any surface anyone watches.** **CORRECTED (Ohm):** it *does*
+   log on startup — `[tap] connected to <url> as console` and `[tap] subscribed to fleet.>`
+   — via `process.stderr.write` (lines 27 and 147), which my first pass missed by grepping
+   for `console.log`. The real gap is narrower and still real: those lines reach only
+   `docker logs`, **nothing is posted to Discord on start**, and there is no `HEALTHCHECK`.
    Nobody watches the watcher.
 4. **No last-seen map and no silence timer**, so a bot that goes quiet on the bus produces
    no signal — which is the gap the deaf-bus detector is meant to close.
+5. **A numeric envelope `id` crashes the tap** (Ohm, reproduced). `format()` at line 93 does
+   `parsed.id.slice(0, 8)`; `id` is typed `id?: string` but that is compile-time only, so an
+   envelope carrying `id: 42` raises an uncaught `TypeError` and **terminates the process**.
+   Line 92 has the same shape for `in_reply_to`. A single malformed envelope from any
+   publisher takes the tap down — which is the same family as defects 1-3: the component
+   that is supposed to notice silence can itself be silenced.
 
 ## Deployment
 
