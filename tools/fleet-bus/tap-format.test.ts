@@ -9,7 +9,16 @@
  * Run: bun test tools/fleet-bus/tap-format.test.ts
  */
 import { expect, test, describe } from 'bun:test'
-import { short, normalizeUsername, format, dedupeKey, statusStateHash, isEnvelope } from './tap-format'
+import { short, safeText, normalizeUsername, format, dedupeKey, statusStateHash, isEnvelope } from './tap-format'
+
+/**
+ * Ordinary wire JSON that cannot be converted to a primitive.
+ *
+ * JSON.parse is used deliberately rather than an object literal: the point is that
+ * a PUBLISHER can produce this, with no proxies and no functions. Shadowing
+ * toString with null leaves String(x) and `${x}` throwing "No default value".
+ */
+const hostile = () => JSON.parse('{"toString":null}')
 
 const env = (over: Record<string, unknown> = {}) => ({
   envelope_version: 1,
@@ -44,6 +53,81 @@ describe('a non-string value cannot crash the tap', () => {
   test('object and boolean values are survivable too', () => {
     expect(() => format('fleet.vec.request', env({ id: { a: 1 }, in_reply_to: true }))).not.toThrow()
     expect(() => normalizeUsername({ a: 1 })).not.toThrow()
+  })
+})
+
+describe('wire JSON that cannot be converted to a primitive (Ohm, PR #67)', () => {
+  // String() and template interpolation BOTH throw on these. The earlier {a:1}
+  // case passed because an intact inherited toString renders '[object Object]' —
+  // it exercised the wrong thing while the real case still killed the tap.
+
+  test('the fixture really is unconvertible, or these tests prove nothing', () => {
+    expect(() => String(hostile())).toThrow()
+    expect(() => `${hostile()}`).toThrow()
+    // and the escape hatch the fix relies on still works
+    expect(JSON.stringify(hostile())).toBe('{"toString":null}')
+  })
+
+  for (const field of ['id', 'in_reply_to', 'from', 'to', 'kind'] as const) {
+    test(`a hostile ${field} does not throw in format()`, () => {
+      expect(() => format('fleet.vec.request', env({ [field]: hostile() }))).not.toThrow()
+    })
+  }
+
+  test('a hostile id does not throw in dedupeKey', () => {
+    // dedupeKey interpolated the id BEFORE its try block, so this killed the
+    // request loop before format() was ever reached.
+    expect(() => dedupeKey('fleet.vec.request', env({ id: hostile() }))).not.toThrow()
+  })
+
+  test('a hostile from does not throw in normalizeUsername', () => {
+    expect(() => normalizeUsername(hostile())).not.toThrow()
+  })
+
+  test('a hostile value in a raw (non-envelope) body does not throw', () => {
+    expect(() => format('fleet.vec.status', { online: hostile() })).not.toThrow()
+  })
+
+  test('a hostile value on a .status subject does not throw in statusStateHash', () => {
+    expect(() => statusStateHash('fleet.vec.status', { online: hostile() })).not.toThrow()
+  })
+
+  test('malformed then valid: the next message still renders correctly', () => {
+    // The sequence that matters. Rendering the bad one must not corrupt or
+    // prevent the good one — the loop has to keep observing.
+    expect(() => format('fleet.vec.request', env({ id: hostile() }))).not.toThrow()
+    expect(format('fleet.vec.request', env())).toBe(
+      '**deet** → **vec** `text_message` on `fleet.vec.request` `abcdef01`',
+    )
+  })
+})
+
+describe('safeText() is total', () => {
+  test('passes strings through', () => {
+    expect(safeText('abc')).toBe('abc')
+  })
+  test('renders primitives', () => {
+    expect(safeText(42)).toBe('42')
+    expect(safeText(true)).toBe('true')
+    expect(safeText(null)).toBe('null')
+    expect(safeText(undefined)).toBe('undefined')
+  })
+  test('renders an unconvertible object via JSON rather than coercion', () => {
+    expect(safeText(hostile())).toBe('{"toString":null}')
+  })
+  test('survives a circular structure', () => {
+    const circular: Record<string, unknown> = { a: 1 }
+    circular.self = circular
+    expect(() => safeText(circular)).not.toThrow()
+    expect(safeText(circular)).toBe('[unrenderable]')
+  })
+  test('survives a throwing toJSON', () => {
+    const bomb = { toJSON() { throw new Error('boom') } }
+    expect(() => safeText(bomb)).not.toThrow()
+    expect(safeText(bomb)).toBe('[unrenderable]')
+  })
+  test('survives a symbol, which JSON.stringify returns undefined for', () => {
+    expect(safeText(Symbol('s'))).toBe('[unrenderable]')
   })
 })
 

@@ -25,10 +25,13 @@ const PASS = process.env.FLEET_BUS_CONSOLE_PASS
 const WEBHOOK = process.env.FLEET_BUS_WEBHOOK_URL
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 const CHANNEL = process.env.FLEET_BUS_CHANNEL || '1541513867127955626'
-const POST_TIMEOUT_MS = Number(process.env.FLEET_BUS_POST_TIMEOUT_MS ?? 15_000)
+const POST_TIMEOUT_MS = validateTimeout(process.env.FLEET_BUS_POST_TIMEOUT_MS, 15_000)
 
 if (!PASS) throw new Error('FLEET_BUS_CONSOLE_PASS required')
 if (!WEBHOOK && !TOKEN) throw new Error('FLEET_BUS_WEBHOOK_URL (preferred) or DISCORD_BOT_TOKEN required')
+// POST_TIMEOUT_MS is validated above by validateTimeout(), which throws here at
+// startup rather than letting AbortSignal.timeout throw per message. See
+// tap-post.ts for why that distinction matters.
 
 /**
  * maxReconnectAttempts: -1 — reconnect forever.
@@ -59,38 +62,26 @@ interface QueueItem {
 const queue: QueueItem[] = []
 let draining = false
 
+const POST_CONFIG = { webhook: WEBHOOK, token: TOKEN, channel: CHANNEL, timeoutMs: POST_TIMEOUT_MS }
+
 async function drain() {
   if (draining) return
   draining = true
-  while (queue.length > 0) {
-    const item = queue.shift()!
-    try {
-      const url = WEBHOOK
-        ? WEBHOOK
-        : `https://discord.com/api/v10/channels/${CHANNEL}/messages`
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (!WEBHOOK) headers['Authorization'] = `Bot ${TOKEN}`
-      const body = WEBHOOK
-        ? JSON.stringify({ content: item.content, username: item.username })
-        : JSON.stringify({ content: item.content })
-      // A POST with no timeout can hang forever. `draining` is still true while it
-      // hangs, so every later drain() returns immediately and the queue stops
-      // moving — silently, with no error and no sign anything is wrong.
-      const res = await fetch(url, {
-        method: 'POST',
-        headers,
-        body,
-        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
-      })
-      if (!res.ok) {
-        process.stderr.write(`[tap] discord post failed ${res.status}: ${await res.text()}\n`)
-      }
-    } catch (err) {
-      process.stderr.write(`[tap] discord post error: ${err}\n`)
+  try {
+    while (queue.length > 0) {
+      const item = queue.shift()!
+      // postOne never throws — see tap-post.ts. The timeout inside it is what
+      // stops a hung POST holding `draining` true forever, which would make every
+      // later drain() return immediately and stop the queue silently.
+      const outcome = await postOne(item, POST_CONFIG, fetch as never)
+      if (!outcome.ok) process.stderr.write(`[tap] ${outcome.error}\n`)
+      await new Promise((r) => setTimeout(r, 250))
     }
-    await new Promise((r) => setTimeout(r, 250))
+  } finally {
+    // finally, not a trailing assignment: if anything above escapes anyway,
+    // `draining` must not be left true — that is the stuck-queue state itself.
+    draining = false
   }
-  draining = false
 }
 
 const lastStatusHash = new Map<string, string>()
@@ -98,6 +89,12 @@ const lastStatusHash = new Map<string, string>()
 const sub = nc.subscribe('fleet.>')
 process.stderr.write(`[tap] subscribed to fleet.>\n`)
 for await (const msg of sub) {
+  // Error boundary. Every helper below is written to be total, but this loop is
+  // the tap's only thread of observation: if ANYTHING in here escapes, the
+  // for-await ends and the tap stops watching the bus entirely. Belt and braces,
+  // because the cost of being wrong is the component that notices silence going
+  // silent. `continue` inside the try still continues this loop.
+  try {
   let parsed: unknown
   try {
     parsed = JSON.parse(sc.decode(msg.data))
@@ -123,9 +120,15 @@ for await (const msg of sub) {
   }
 
   const from = isEnvelope(parsed) ? parsed.from : (msg.subject.split('.')[1] ?? null)
-  // format() and normalizeUsername() both coerce rather than assume string —
-  // see tap-format.ts. A publisher sending a numeric `id`, `in_reply_to` or
-  // `from` used to raise an uncaught TypeError here and kill the process.
+  // The helpers never rely on primitive conversion — see safeText in
+  // tap-format.ts. A numeric `id`, or an object that shadows toString, used to
+  // raise an uncaught TypeError here and kill the process.
   queue.push({ content: format(msg.subject, parsed), username: normalizeUsername(from) })
   drain().catch((e) => process.stderr.write(`[tap] drain error: ${e}\n`))
+  } catch (err) {
+    // Drop this one message, keep observing. Log the subject, because the
+    // envelope is by assumption the thing we could not render — the subject is
+    // what identifies the offending publisher.
+    process.stderr.write(`[tap] dropped a message on ${msg.subject}: ${err}\n`)
+  }
 }
