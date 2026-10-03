@@ -88,26 +88,44 @@ describe('tap.ts end to end', () => {
 
     expect(received.length).toBeGreaterThan(0)
     const body = received[0]
-    expect(body.content).toContain('deet')
-    expect(body.content).toContain('vec')
-    expect(body.content).toContain('baton.handoff')
+
+    // DIRECTIONAL. Asserting that 'deet' and 'vec' merely OCCUR passes against a tap
+    // that swaps them, which Ohm proved by swapping from/to at tap.ts's call site: all
+    // 65 tests still passed. The rendered arrow is the only thing that carries
+    // direction, so the assertion must include it. (Ohm, PR 67.)
+    expect(body.content).toContain('**deet** → **vec**')
+    expect(body.content).not.toContain('**vec** → **deet**')
+
+    expect(body.content).toContain('`baton.handoff`')
+    expect(body.content).toContain('`fleet.vec.request`')
     expect(body.content).toContain('abcdef01')
     expect(body.username).toBe('deet')
   }, 20_000)
 
   test('an envelope with a hostile id still arrives, rather than killing the tap', async () => {
     // The crash class, proven against the running process rather than the helper.
+    // The marker IDENTIFIES this message. Asserting only that the count rose passes if
+    // the tap redelivers the previous envelope instead, so the arrival must be the one
+    // published here and no other. (Ohm, PR 67.)
+    const MARKER = 'hostile-id-probe-7f3a'
     const before = received.length
     const nc = await connect({ servers: NATS_URL, name: 'tap-integration-test-2' })
     const sc = StringCodec()
     nc.publish('fleet.vec.request', sc.encode(
-      '{"envelope_version":1,"id":{"toString":null},"from":"deet","to":"vec","kind":"text_message"}',
+      `{"envelope_version":1,"id":{"toString":null},"from":"deet","to":"vec",` +
+      `"kind":"text_message","payload":{"probe":"${MARKER}"}}`,
     ))
     await nc.flush()
 
-    for (let i = 0; i < 40 && received.length === before; i++) await sleep(100)
+    const found = () => received.some((r) => (r.content || '').includes(MARKER))
+    for (let i = 0; i < 40 && !found(); i++) await sleep(100)
     await nc.close()
+
     expect(received.length).toBeGreaterThan(before)
+    expect(found()).toBe(true)
+    const body = received.find((r) => (r.content || '').includes(MARKER))!
+    // It must render the UNCONVERTIBLE id rather than dropping the message or the field.
+    expect(body.content).toContain('**deet** → **vec**')
   }, 20_000)
 
   test('the tap is still alive after both', () => {
