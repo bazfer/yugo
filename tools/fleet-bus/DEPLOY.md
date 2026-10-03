@@ -57,45 +57,35 @@ Every later deployment uses the section below.
 
 ## Deploying a code change
 
-**WARNING: `compose up -d` alone does not pick up new code.** Compose recreates a
-container when the SERVICE DEFINITION changes. The source is a bind mount, so pulling new
-code does not change the definition, compose treats the service as up to date, and the
-running Bun process keeps the code it loaded at start.
-
-**This is the trap worth stating plainly: the checkout is new and the process is old.**
-Checking `git rev-parse HEAD` then reports the new revision, so the verification agrees
-with itself and both halves are wrong. (Ohm, PR 69.)
-
-Deploying therefore RECREATES explicitly:
-
 ```
-PULLED_AT=$(date -u +%FT%TZ)
-BEFORE=$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
-sudo -u luna git -C /home/luna/yugo pull
-
-# Dependencies. node_modules is gitignored, so a lockfile change does NOT arrive with the
-# pull. Skipping this runs new code against old packages. (Kat, PR 69.)
-if ! sudo -u luna git -C /home/luna/yugo diff --quiet "$BEFORE" HEAD \
-     -- tools/fleet-bus/bun.lock; then
-  sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \
-    oven/bun:latest bun install --frozen-lockfile
-fi
-
-# The image is a floating tag, so --force-recreate alone reuses whatever is cached.
-# Uncomment only when you intend to move the runtime: it changes Bun under the tap, which
-# is a bigger change than the one you are deploying. (Kat, PR 69.)
-# sudo -u luna docker pull oven/bun:latest
-
-sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \
-  up -d --force-recreate
+./tools/fleet-bus/deploy.sh                    # then read #fleet-bus
+./tools/fleet-bus/deploy.sh --mirror-confirmed  # once you have seen traffic there
 ```
 
-**Keep `$PULLED_AT`. Validation check 3 needs it.** Run the deploy and the checks in the
-SAME shell, or write the value down. A new shell loses it, and check 3 is the only check
-that tells a real deployment from a no-op.
+**WARNING: do not substitute `git pull && docker compose up -d`.** Compose recreates a
+container when the SERVICE DEFINITION changes. The source is a bind mount, so new code
+changes no definition, compose reports the service up to date, and the running process
+keeps the code it loaded at start. The checkout is new and the process is old, and a
+revision check then agrees with itself while both halves are wrong.
 
-Run these as the owning user. `env_file` is read by the invoking user, not by the
-daemon, so another user fails with a permission error on `tap.env`.
+What the script does:
+
+- records the time before moving the source, which check 3 needs
+- pulls, then compares `bun.lock` across the pull and installs only if it moved
+  (`node_modules` is gitignored, so a lockfile change does not arrive with the source)
+- removes and recreates the container, because `--force-recreate` alone is not enough
+  once you are doing this by hand
+- runs the four checks below
+
+It does not `docker pull` the image. The tag floats, so pulling changes Bun underneath the
+tap, which is a larger change than the one being deployed. Do that deliberately and
+separately.
+
+**There is no container to preserve.** Renaming it does not retain it, because compose
+identifies containers by project and service labels, so recreating removes the renamed one
+as well. And a retained container would preserve its configuration rather than its
+revision, since the source is a shared bind mount. **The ref the script prints is the
+fallback.** Write it down.
 
 ## Validating a deployment
 
@@ -157,34 +147,28 @@ is no container to keep, per the two reasons above:
 OLD_REF=$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
 ```
 
-To roll back, move the source back first, then recreate:
+To roll back:
 
 ```
-sudo -u luna git -C /home/luna/yugo checkout "$OLD_REF"
-# Only if dependencies changed between the two revisions:
-sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \
-  oven/bun:latest bun install --frozen-lockfile
-sudo -u luna docker rm -f fleet-bus-tap
-sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \
-  up -d --force-recreate
+./tools/fleet-bus/deploy.sh --rollback "$OLD_REF"
 ```
 
-Then run the four validation checks again. **A rollback is a deployment and earns the
-same verification**, including check 4.
+**Use the script rather than running the steps by hand.** Every defect found in this file
+during review was in prose that restated what the script does, and the last one was in
+these very commands: they compared `bun.lock` between `$OLD_REF` and `HEAD` *after*
+checking out `$OLD_REF`, so the diff compared a commit to itself, always succeeded, and
+the install never ran on a rollback. The script records the revision before and after
+separately and is correct. (Kat, PR 69.)
 
-Use the same lockfile comparison as the deploy path, rather than judging it by eye:
+What it does, so you can judge whether it is doing the right thing:
 
-```
-if ! sudo -u luna git -C /home/luna/yugo diff --quiet "$OLD_REF" HEAD \
-     -- tools/fleet-bus/bun.lock; then
-  sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \
-    oven/bun:latest bun install --frozen-lockfile
-fi
-```
+- reverts the source to the ref you name
+- compares `bun.lock` across the move and installs only if it changed, **in either
+  direction**, because a rollback can need OLDER packages than the ones installed
+- recreates the container, which is required rather than optional
+- runs the four checks and refuses to report success until you confirm the mirror
 
-`node_modules` is gitignored, so reverting the source does not revert dependencies. **The
-comparison matters in both directions:** a rollback can need OLDER packages than the ones
-installed.
+**A rollback is a deployment and earns the same verification**, check 4 included.
 
 ## The handover gap
 
