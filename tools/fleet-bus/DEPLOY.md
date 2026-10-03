@@ -45,7 +45,7 @@ sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml up -d
 
 Then run the four validation checks. If they fail, roll the SOURCE back to `$OLD_REF`.
 
-Skipping the rename produces:
+Skipping the `docker rm -f` produces:
 
 ```
 Container fleet-bus-tap  Error response from daemon: Conflict. The container name

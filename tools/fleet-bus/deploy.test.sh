@@ -60,9 +60,9 @@ fi
 # ---- THE REJECTION: a deploy that does not restart the process ----
 # Mutate the script so it skips the recreate entirely, which is precisely what plain
 # "compose up -d" does against a bind mount. Check 3 must catch it.
-# Skip the recreate AND the rename, so the container keeps its name and its original
+# Skip the removal AND --force-recreate, so the container keeps its name and its original
 # process: exactly the state plain "compose up -d" leaves against a bind mount. An
-# earlier version of this test renamed it away and so never reached check 3 at all.
+# earlier version of this test removed the container and so never reached check 3 at all.
 # Disable BOTH the removal and --force-recreate, which is the procedure DEPLOY.md
 # described before this PR: pull, then plain "compose up -d". Compose reports the
 # service up to date and the old process keeps running. The script's own "docker rm -f"
