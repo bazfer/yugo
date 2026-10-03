@@ -18,35 +18,25 @@ it is not in the data path of any bot. A tap outage costs visibility, not delive
 under git publishes every fleet credential. A `.gitignore` is not sufficient protection
 for a directory whose purpose is to hold secrets; the separation above is.
 
-## Deploying a code change
+## The FIRST deployment through this file, step by step
 
-**WARNING: \`compose up -d\` alone does not pick up new code.** Compose recreates a
-container when the SERVICE DEFINITION changes. The source is a bind mount, so pulling new
-code does not change the definition, compose treats the service as up to date, and the
-running Bun process keeps the code it loaded at start.
+The container running today was created with `docker run` and carries no compose labels.
+Compose does not adopt it; it fails on the name.
 
-**This is the trap worth stating plainly: the checkout is new and the process is old.**
-Checking \`git rev-parse HEAD\` then reports the new revision, so the verification agrees
-with itself and both halves are wrong. (Ohm, PR 69.)
-
-Deploying therefore RECREATES explicitly:
+**WARNING: do not `docker rm` the existing container. Rename it.** A remove destroys the
+only fallback you have, and it is the faster thing to type under pressure. (Kat, PR 69.)
 
 ```
-PULLED_AT=\$(date -u +%FT%TZ)
-sudo -u luna git -C /home/luna/yugo pull
-sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \\
-  up -d --force-recreate
+OLD_REF=$(sudo -u luna git -C /home/luna/yugo rev-parse --short HEAD)
+sudo -u luna docker stop fleet-bus-tap
+sudo -u luna docker rename fleet-bus-tap "fleet-bus-tap-$OLD_REF"
+sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml up -d
 ```
 
-Keep \`\$PULLED_AT\`. Validation check 3 needs it.
+Then run the four validation checks. If they fail, the rollback section applies and the
+renamed container is still there.
 
-Run these as the owning user. \`env_file\` is read by the invoking user, not by the
-daemon, so another user fails with a permission error on \`tap.env\`.
-
-## The FIRST compose deployment needs the hand-made container removed
-
-The container running today was created with \`docker run\` and carries no compose
-labels. **Compose does not adopt it. It fails on the name**, verified in a throwaway:
+Skipping the rename produces:
 
 ```
 Container fleet-bus-tap  Error response from daemon: Conflict. The container name
@@ -54,9 +44,49 @@ Container fleet-bus-tap  Error response from daemon: Conflict. The container nam
 that container to be able to reuse that name.
 ```
 
-So the first deployment through this file removes or renames the existing container first,
-which the rollback section below does anyway. Every later deployment is an ordinary
-\`compose up -d\`.
+Every later deployment uses the section below.
+
+## Deploying a code change
+
+**WARNING: `compose up -d` alone does not pick up new code.** Compose recreates a
+container when the SERVICE DEFINITION changes. The source is a bind mount, so pulling new
+code does not change the definition, compose treats the service as up to date, and the
+running Bun process keeps the code it loaded at start.
+
+**This is the trap worth stating plainly: the checkout is new and the process is old.**
+Checking `git rev-parse HEAD` then reports the new revision, so the verification agrees
+with itself and both halves are wrong. (Ohm, PR 69.)
+
+Deploying therefore RECREATES explicitly:
+
+```
+PULLED_AT=$(date -u +%FT%TZ)
+BEFORE=$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
+sudo -u luna git -C /home/luna/yugo pull
+
+# Dependencies. node_modules is gitignored, so a lockfile change does NOT arrive with the
+# pull. Skipping this runs new code against old packages. (Kat, PR 69.)
+if ! sudo -u luna git -C /home/luna/yugo diff --quiet "$BEFORE" HEAD \
+     -- tools/fleet-bus/bun.lock; then
+  sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \
+    oven/bun:latest bun install --frozen-lockfile
+fi
+
+# The image is a floating tag, so --force-recreate alone reuses whatever is cached.
+# Uncomment only when you intend to move the runtime: it changes Bun under the tap, which
+# is a bigger change than the one you are deploying. (Kat, PR 69.)
+# sudo -u luna docker pull oven/bun:latest
+
+sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \
+  up -d --force-recreate
+```
+
+**Keep `$PULLED_AT`. Validation check 3 needs it.** Run the deploy and the checks in the
+SAME shell, or write the value down. A new shell loses it, and check 3 is the only check
+that tells a real deployment from a no-op.
+
+Run these as the owning user. `env_file` is read by the invoking user, not by the
+daemon, so another user fails with a permission error on `tap.env`.
 
 ## Validating a deployment
 
@@ -81,10 +111,15 @@ Four checks, in order. Each one rejects a failure the one before it cannot see.
 
    ```
    sudo -u luna docker inspect fleet-bus-tap --format "{{.State.StartedAt}}"
-   sudo -u luna git -C /home/luna/yugo rev-parse --short HEAD
    ```
 
-   **\`StartedAt\` must be later than \`\$PULLED_AT\`.** Bun reads the source once, at
+   **`StartedAt` must be later than `$PULLED_AT`.** Two timestamps, nothing else.
+
+   **This check deliberately does NOT print the revision.** An earlier version showed
+   `git rev-parse HEAD` beside the start time, which invites comparing a SHA to a
+   timestamp: an impossible comparison that still reads as a check. The revision is
+   precisely the wrong signal here, because it is new whether or not the process
+   restarted, which is the trap this check exists to catch. (Kat, PR 69.) Bun reads the source once, at
    process start, so the start time is what says which code is loaded. Hashing the mounted
    file proves nothing: the mount is live, so the file always matches the checkout.
 
@@ -109,27 +144,27 @@ So a rollback reverts the SOURCE, and the container is incidental.
 Before deploying, record the revision and keep the old container:
 
 ```
-OLD_REF=\$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
-sudo -u luna docker rename fleet-bus-tap fleet-bus-tap-\${OLD_REF:0:7}
+OLD_REF=$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
+sudo -u luna docker rename fleet-bus-tap fleet-bus-tap-${OLD_REF:0:7}
 ```
 
 To roll back, move the source back first, then recreate:
 
 ```
-sudo -u luna git -C /home/luna/yugo checkout "\$OLD_REF"
+sudo -u luna git -C /home/luna/yugo checkout "$OLD_REF"
 # Only if dependencies changed between the two revisions:
-sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \\
+sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \
   oven/bun:latest bun install --frozen-lockfile
 sudo -u luna docker rm -f fleet-bus-tap
-sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \\
+sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \
   up -d --force-recreate
 ```
 
 Then run the four validation checks again. **A rollback is a deployment and earns the
 same verification**, including check 4.
 
-**Check \`bun.lock\` between the two revisions before skipping the install step.**
-\`node_modules\` is gitignored, so reverting the source does not revert dependencies, and
+**Check `bun.lock` between the two revisions before skipping the install step.**
+`node_modules` is gitignored, so reverting the source does not revert dependencies, and
 a lockfile change in either direction leaves the tree wrong for the revision now checked
 out.
 
@@ -156,8 +191,8 @@ ro mount, uid 0, mount -o remount,rw   -> "permission denied", host file unchang
 The positive control matters as much as the negative one: without it, a refused write
 could mean the test cannot write at all rather than that the mount protects anything.
 
-**The limit:** the remount is refused because the container lacks \`CAP_SYS_ADMIN\`.
-Running the tap with \`--privileged\` or \`--cap-add SYS_ADMIN\` removes this
+**The limit:** the remount is refused because the container lacks `CAP_SYS_ADMIN`.
+Running the tap with `--privileged` or `--cap-add SYS_ADMIN` removes this
 protection. Nothing in this file grants either, and nothing should.
 
 ## Dependencies
