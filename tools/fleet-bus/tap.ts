@@ -19,6 +19,7 @@
 import { connect, StringCodec } from 'nats'
 import { isEnvelope, normalizeUsername, format, dedupeKey, statusStateHash } from './tap-format'
 import { postOne, validateTimeout } from './tap-post'
+import { newState, observeStatus, tick, render } from './tap-watch'
 
 const sc = StringCodec()
 const NATS_URL = process.env.FLEET_BUS_URL || 'nats://127.0.0.1:4222'
@@ -87,6 +88,53 @@ async function drain() {
 
 const lastStatusHash = new Map<string, string>()
 
+/**
+ * DEAF-BUS DETECTION.
+ *
+ * A bot can be present and not doing its job, with no signal. bot.py catches a refused
+ * dedup store, logs "bus is DEAF", and retries forever. The heartbeat starts inside
+ * connect(), so a bot that never connects emits NOTHING. From outside it looks like a
+ * healthy idle bot.
+ *
+ * The signal is already on the wire. Until now nothing consumed it.
+ *
+ * OFF BY DEFAULT. An unset FLEET_BUS_WATCH_BOTS means no watching and no new traffic.
+ * The list cannot be read from the fleet manifest because that file is not mounted into
+ * this container, and bot_names there includes entities that are not on the bus. Keep
+ * this list in step with the manifest by hand.
+ */
+const WATCH_BOTS = (process.env.FLEET_BUS_WATCH_BOTS || '')
+  .split(',').map((s) => s.trim()).filter(Boolean)
+const HEARTBEAT_MS = 30_000
+const WATCH_CONFIG = {
+  expected: WATCH_BOTS,
+  silenceMs: Number(process.env.FLEET_BUS_SILENCE_MS ?? HEARTBEAT_MS * 3),
+  graceMs: Number(process.env.FLEET_BUS_GRACE_MS ?? HEARTBEAT_MS * 3),
+  reminderMs: Number(process.env.FLEET_BUS_REMINDER_MS ?? 24 * 60 * 60 * 1000),
+}
+const watch = newState(Date.now())
+
+function announce(text: string) {
+  queue.push({ content: text, username: 'fleet-bus-tap' })
+  drain().catch((e) => process.stderr.write(`[tap] drain error: ${e}\n`))
+}
+
+if (WATCH_BOTS.length > 0) {
+  // The tap's own liveness, on the surface a human reads. Without it, a tap that never
+  // starts is indistinguishable from a quiet fleet -- the same defect it exists to find.
+  announce(`👁️ tap up, watching ${WATCH_BOTS.length} bots: ${WATCH_BOTS.join(', ')}`)
+
+  setInterval(() => {
+    // nc.isClosed() is the tap's own view of the link. While it is down every bot looks
+    // silent, so the detector reports the tap instead of the fleet.
+    watch.connected = !nc.isClosed()
+    for (const ev of tick(watch, WATCH_CONFIG, Date.now())) {
+      announce(render(ev, Date.now()))
+      process.stderr.write(`[tap] watch: ${JSON.stringify(ev)}\n`)
+    }
+  }, HEARTBEAT_MS).unref?.()
+}
+
 const sub = nc.subscribe('fleet.>')
 process.stderr.write(`[tap] subscribed to fleet.>\n`)
 for await (const msg of sub) {
@@ -102,6 +150,12 @@ for await (const msg of sub) {
   } catch {
     parsed = sc.decode(msg.data)
   }
+
+  // Observe BEFORE the dedupe below. A bot whose status is unchanged is still alive, and
+  // the dedupe deliberately drops those -- so recording after it would read a healthy,
+  // steady bot as silent.
+  const statusBot = msg.subject.endsWith('.status') ? msg.subject.split('.')[1] : null
+  if (statusBot) observeStatus(watch, statusBot, Date.now())
 
   const stateHash = statusStateHash(msg.subject, parsed)
   if (stateHash !== null) {
