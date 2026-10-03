@@ -20,14 +20,28 @@ for a directory whose purpose is to hold secrets; the separation above is.
 
 ## Deploying a code change
 
+**WARNING: \`compose up -d\` alone does not pick up new code.** Compose recreates a
+container when the SERVICE DEFINITION changes. The source is a bind mount, so pulling new
+code does not change the definition, compose treats the service as up to date, and the
+running Bun process keeps the code it loaded at start.
+
+**This is the trap worth stating plainly: the checkout is new and the process is old.**
+Checking \`git rev-parse HEAD\` then reports the new revision, so the verification agrees
+with itself and both halves are wrong. (Ohm, PR 69.)
+
+Deploying therefore RECREATES explicitly:
+
 ```
+PULLED_AT=\$(date -u +%FT%TZ)
 sudo -u luna git -C /home/luna/yugo pull
-sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml up -d
+sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \\
+  up -d --force-recreate
 ```
 
-Run these as the owning user. `--env-file` and `env_file` are read by the invoking
-user, not by the daemon, so running as another user fails with a permission error on
-`tap.env`.
+Keep \`\$PULLED_AT\`. Validation check 3 needs it.
+
+Run these as the owning user. \`env_file\` is read by the invoking user, not by the
+daemon, so another user fails with a permission error on \`tap.env\`.
 
 ## The FIRST compose deployment needs the hand-made container removed
 
@@ -62,12 +76,17 @@ Four checks, in order. Each one rejects a failure the one before it cannot see.
 
    Expect `connected to` and `subscribed to fleet.>`.
 
-3. **It is running the intended source.**
+3. **The PROCESS restarted after the pull.** Not "the checkout is at the right
+   revision" — a bind mount makes that true even when the process is old.
 
    ```
-   sudo -u luna docker inspect fleet-bus-tap --format "{{range .Mounts}}{{.Source}}{{end}}"
+   sudo -u luna docker inspect fleet-bus-tap --format "{{.State.StartedAt}}"
    sudo -u luna git -C /home/luna/yugo rev-parse --short HEAD
    ```
+
+   **\`StartedAt\` must be later than \`\$PULLED_AT\`.** Bun reads the source once, at
+   process start, so the start time is what says which code is loaded. Hashing the mounted
+   file proves nothing: the mount is live, so the file always matches the checkout.
 
 4. **It MIRRORS. This is the only check that proves the tap does its job.**
 
@@ -80,20 +99,39 @@ Four checks, in order. Each one rejects a failure the one before it cannot see.
 
 ## Rolling back
 
-Keep the previous container rather than deleting it:
+**WARNING: keeping the old container does NOT roll back the code.** The source is a
+mutable bind mount shared with the checkout, so starting the old container runs whatever
+is in the checkout at that moment — which, after a deployment, is the new code. **A
+retained container preserves its configuration, not its revision.** (Ohm, PR 69.)
+
+So a rollback reverts the SOURCE, and the container is incidental.
+
+Before deploying, record the revision and keep the old container:
 
 ```
-sudo -u luna docker stop fleet-bus-tap
-sudo -u luna docker rename fleet-bus-tap fleet-bus-tap-<old-ref>
+OLD_REF=\$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
+sudo -u luna docker rename fleet-bus-tap fleet-bus-tap-\${OLD_REF:0:7}
 ```
 
-To return to it:
+To roll back, move the source back first, then recreate:
 
 ```
-sudo -u luna docker stop fleet-bus-tap && sudo -u luna docker rm fleet-bus-tap
-sudo -u luna docker rename fleet-bus-tap-<old-ref> fleet-bus-tap
-sudo -u luna docker start fleet-bus-tap
+sudo -u luna git -C /home/luna/yugo checkout "\$OLD_REF"
+# Only if dependencies changed between the two revisions:
+sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \\
+  oven/bun:latest bun install --frozen-lockfile
+sudo -u luna docker rm -f fleet-bus-tap
+sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \\
+  up -d --force-recreate
 ```
+
+Then run the four validation checks again. **A rollback is a deployment and earns the
+same verification**, including check 4.
+
+**Check \`bun.lock\` between the two revisions before skipping the install step.**
+\`node_modules\` is gitignored, so reverting the source does not revert dependencies, and
+a lockfile change in either direction leaves the tree wrong for the revision now checked
+out.
 
 ## The handover gap
 
@@ -104,6 +142,23 @@ because the tap subscribes to a core NATS subject rather than consuming a stream
 That is acceptable for an observer and it is not acceptable silently. Deploy when traffic
 is quiet, and treat a gap during an incident as lost visibility rather than as a clean
 record.
+
+## Why the mount is read-only, and what that does and does not guarantee
+
+Verified with disposable controls, not asserted:
+
+```
+rw mount, uid 0 in container, write    -> SUCCEEDS, host file mutated
+ro mount, uid 0 in container, write    -> "Read-only file system", host file unchanged
+ro mount, uid 0, mount -o remount,rw   -> "permission denied", host file unchanged
+```
+
+The positive control matters as much as the negative one: without it, a refused write
+could mean the test cannot write at all rather than that the mount protects anything.
+
+**The limit:** the remount is refused because the container lacks \`CAP_SYS_ADMIN\`.
+Running the tap with \`--privileged\` or \`--cap-add SYS_ADMIN\` removes this
+protection. Nothing in this file grants either, and nothing should.
 
 ## Dependencies
 
