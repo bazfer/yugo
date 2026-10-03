@@ -1,0 +1,34 @@
+# The tap, as a declarative definition.
+#
+# WHY THIS FILE EXISTS. Until 2026-10-03 the tap container was created by hand. There was
+# no compose file, no systemd unit and no launcher script anywhere on the host, so the only
+# definition of how the tap ran was the running container itself. Redeploying it required
+# reconstructing the configuration from `docker inspect`. This file is that configuration.
+#
+# SECRETS ARE NOT IN THIS REPO AND MUST NOT BE. env_file points OUTSIDE the checkout, at a
+# file readable only by the owning user. The broker config (nats.conf) and its backups live
+# in that same external directory and stay unversioned: nats.conf carries plaintext
+# credentials for every bot.
+#
+# THE DETECTOR IS OFF HERE. FLEET_BUS_WATCH_BOTS is absent on purpose. Enabling it is a
+# separate decision with its own window. An unset value means no watching and no new
+# traffic.
+services:
+  tap:
+    container_name: fleet-bus-tap
+    image: oven/bun:latest
+    command: bun tap.ts
+    working_dir: /app
+    restart: unless-stopped
+    networks: [fleet-bus-net]
+    volumes:
+      # Read-only: the tap never writes to its own source. A writable mount would let a
+      # root process in the container modify the checkout.
+      - ${FLEET_BUS_SRC:-/home/luna/yugo/tools/fleet-bus}:/app:ro
+    env_file:
+      # OUTSIDE the checkout, deliberately. Never move this file into the repo.
+      - ${FLEET_BUS_ENV:-/home/luna/fleet-bus/tap.env}
+
+networks:
+  fleet-bus-net:
+    external: true

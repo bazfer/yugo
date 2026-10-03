@@ -370,3 +370,43 @@ jobs:
         env:
           RELEASE1_CHECKOUT: ${{ github.workspace }}/release1-checkout
         run: python conformance/check-release1-mutations.py
+
+  fleet-bus-docs:
+    # The deploy doc shipped with three double-backslash line continuations, which is
+    # broken shell: the central deploy command would not have run. Two reviewers read it
+    # and approved its content, because rendered markdown hides the shape of the damage.
+    # This is the check that would have caught it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: every shell block in DEPLOY.md must parse
+        run: |
+          python3 - <<'PY'
+          import re, subprocess, sys
+          t = open("tools/fleet-bus/DEPLOY.md").read()
+          bad = 0
+          for i, b in enumerate(re.findall(r"```\n(.*?)```", t, re.S), 1):
+              if "Error response" in b or "->" in b:
+                  continue
+              if not any(k in b for k in ("sudo", "docker", "PULLED_AT", "OLD_REF", "git ")):
+                  continue
+              r = subprocess.run(["bash", "-n"], input=b, text=True, capture_output=True)
+              if r.returncode != 0:
+                  bad += 1
+                  print(f"block {i}: {r.stderr.strip()}")
+          print(f"{bad} invalid shell blocks")
+          sys.exit(1 if bad else 0)
+          PY
+      - name: no stray markdown escapes
+        run: |
+          if grep -nP '\\[`$]' tools/fleet-bus/DEPLOY.md; then
+            echo "literal backslash before a backtick or dollar; it renders as a stray backslash"
+            exit 1
+          fi
+          echo "clean"
+      - name: shellcheck the deploy script
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning tools/fleet-bus/deploy.sh
+      - name: the deploy script rejects a no-op deployment
+        run: ./tools/fleet-bus/deploy.test.sh
