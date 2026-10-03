@@ -68,6 +68,15 @@ afterAll(async () => {
 })
 
 describe('tap.ts end to end', () => {
+  test('the detector stays OFF when FLEET_BUS_WATCH_BOTS is unset', async () => {
+    // The default must add no traffic at all. The tap in this suite is started without
+    // the variable, so a startup announcement here would mean the feature is on by
+    // accident -- which on a live fleet is noise nobody asked for.
+    await sleep(200)
+    const announced = received.some((r) => (r.content || '').includes('tap up, watching'))
+    expect(announced).toBe(false)
+  })
+
   test('a published envelope reaches the Discord endpoint as a POST', async () => {
     // THE test. It fails if the tap does not connect, does not subscribe, does not
     // format, or does not post — every step the absence-based tests could not see.
