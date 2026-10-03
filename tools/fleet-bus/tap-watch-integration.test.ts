@@ -108,9 +108,33 @@ describe('the detector, wired', () => {
 
     expect(sawText('lost its NATS connection')).toBe(true)
 
-    // And it must NOT have blamed the bots for the tap's own outage.
-    const after = posted.slice(before)
-    const blamedABot = after.filter((c) => (c || '').includes('is silent on the bus'))
-    expect(blamedABot).toEqual([])
+    // And it must NOT have blamed the bots for the tap's own outage. Checking only up
+    // to the notice would miss blame that arrives after it, which is the more likely
+    // ordering: the notice fires on the first tick after the disconnect, and any false
+    // silence alert fires on the ticks that follow. (Ohm, PR 68.)
+    const noticeAt = posted.findIndex((c) => (c || '').includes('lost its NATS connection'))
+    await sleep(3000)
+    const afterNotice = posted.slice(Math.max(before, noticeAt))
+    expect(afterNotice.filter((c) => (c || '').includes('is silent on the bus'))).toEqual([])
   }, 30_000)
+
+  test('restarting the broker reconnects and grants a fresh grace', async () => {
+    // The reconnect half. Disabling the reconnect handler left all 89 tests passing,
+    // because nothing ever restarted the broker. (Ohm, PR 68.)
+    natsProc = Bun.spawn(['nats-server', '-p', String(NATS_PORT)], { stdout: 'pipe', stderr: 'pipe' })
+    for (let i = 0; i < 60 && !sawText('back on NATS'); i++) await sleep(250)
+    expect(sawText('back on NATS')).toBe(true)
+
+    // Immediately after a reconnect the fresh grace must hold: no bot may be reported
+    // silent for the gap the tap itself was absent for.
+    //
+    // The window MUST be shorter than FLEET_BUS_GRACE_MS (1500ms here). My first version
+    // waited 2000ms and failed — correctly. Past the grace a bot that genuinely stopped
+    // publishing SHOULD be reported, so a longer window asserts something false and would
+    // have been "fixed" by weakening the grace.
+    const mark = posted.length
+    await sleep(1000)
+    const after = posted.slice(mark)
+    expect(after.filter((c) => (c || '').includes('is silent on the bus'))).toEqual([])
+  }, 40_000)
 })

@@ -6,7 +6,7 @@
  * is the same as no alarm. That is how the Falco channel became unreadable.
  */
 import { expect, test, describe } from 'bun:test'
-import { newState, observeStatus, tick, render, type WatchConfig } from './tap-watch'
+import { newState, observeStatus, tick, render, noteDisconnect, noteReconnect, type WatchConfig } from './tap-watch'
 
 const CFG: WatchConfig = {
   expected: ['vec', 'ohm'],
@@ -88,6 +88,48 @@ describe('while the tap is disconnected, every bot looks silent', () => {
     expect(types(tick(s, CFG, back))).toEqual(['bus-regained'])
     // Immediately after, still inside the fresh grace: silence about the bots.
     expect(tick(s, CFG, back + 1000)).toEqual([])
+  })
+})
+
+describe('an outage entirely between two ticks', () => {
+  test('a reconnect restarts the grace even though no tick observed the loss', () => {
+    // THE case the event handler was supposed to fix and did not. The grace reset lived
+    // in tick() behind busLostNotified, which only a tick sets. A disconnect and
+    // reconnect that both happen between ticks never set it, so the status gap read as
+    // the bots going silent. (Ohm, PR 68, after the first fix.)
+    const s = newState(T0)
+    const t1 = T0 + CFG.graceMs + 1000
+    observeStatus(s, 'vec', t1)
+    observeStatus(s, 'ohm', t1)
+    expect(tick(s, CFG, t1)).toEqual([])  // healthy, and past the original grace
+
+    // The outage. Both events land before the next tick, so no tick ever sees it.
+    noteDisconnect(s)
+    const back = t1 + 10_000
+    noteReconnect(s, back)
+
+    // Chosen so that WITHOUT a fresh grace the bots would be reported silent:
+    // now - lastSeen is 10_000 + graceMs - 1, which exceeds silenceMs.
+    const now = back + CFG.graceMs - 1
+    expect(now - t1).toBeGreaterThanOrEqual(CFG.silenceMs)
+    expect(tick(s, CFG, now)).toEqual([])
+  })
+
+  test('and once the fresh grace passes, a genuinely silent bot is still caught', () => {
+    // The control. Without it the case above passes against a grace that never expires,
+    // which would disable the detector rather than fix it.
+    const s = newState(T0)
+    const t1 = T0 + CFG.graceMs + 1000
+    observeStatus(s, 'vec', t1)
+    observeStatus(s, 'ohm', t1)
+    tick(s, CFG, t1)
+
+    noteDisconnect(s)
+    const back = t1 + 10_000
+    noteReconnect(s, back)
+
+    const now = back + CFG.graceMs + CFG.silenceMs
+    expect(types(tick(s, CFG, now))).toEqual(['silent', 'silent'])
   })
 })
 

@@ -61,6 +61,34 @@ export function newState(now: number): WatchState {
   }
 }
 
+/**
+ * Record that the tap lost its NATS connection.
+ *
+ * Call this from the connection event stream, not from a poll. nc.isClosed() stays
+ * FALSE while the client is reconnecting, so polling it leaves the tap believing it can
+ * see the bus throughout an outage. (Ohm, PR 68.)
+ */
+export function noteDisconnect(state: WatchState): void {
+  state.connected = false
+}
+
+/**
+ * Record that the tap regained its NATS connection, and START THE GRACE AGAIN.
+ *
+ * The reset lives here rather than in tick() because tick() can only reset it when a
+ * previous tick had already announced the loss. An outage that begins AND ENDS between
+ * two ticks never sets that flag, so it got no fresh grace and the gap in status
+ * messages read as the bots going silent — which is the whole failure this guards.
+ * (Ohm, PR 68, found after the first fix.)
+ *
+ * Resetting on EVERY reconnect, independent of whether anything was announced, is the
+ * only version that covers an outage nothing observed.
+ */
+export function noteReconnect(state: WatchState, now: number): void {
+  state.connected = true
+  state.startedAt = now
+}
+
 /** Record that a bot published a status message. */
 export function observeStatus(state: WatchState, bot: string, now: number): void {
   state.lastSeen.set(bot, now)

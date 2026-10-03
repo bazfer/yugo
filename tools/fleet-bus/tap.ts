@@ -19,7 +19,7 @@
 import { connect, StringCodec } from 'nats'
 import { isEnvelope, normalizeUsername, format, dedupeKey, statusStateHash } from './tap-format'
 import { postOne, validateTimeout } from './tap-post'
-import { newState, observeStatus, tick, render } from './tap-watch'
+import { newState, observeStatus, tick, render, noteDisconnect, noteReconnect } from './tap-watch'
 
 const sc = StringCodec()
 const NATS_URL = process.env.FLEET_BUS_URL || 'nats://127.0.0.1:4222'
@@ -156,10 +156,13 @@ if (WATCH_BOTS.length > 0) {
   ;(async () => {
     for await (const s of nc.status()) {
       if (s.type === 'disconnect') {
-        watch.connected = false
+        noteDisconnect(watch)
         process.stderr.write('[tap] watch: nats disconnect\n')
       } else if (s.type === 'reconnect') {
-        watch.connected = true
+        // noteReconnect restarts the grace on EVERY reconnect, including an outage that
+        // began and ended between two ticks. tick() cannot do that: it only resets when
+        // a previous tick had already announced the loss.
+        noteReconnect(watch, Date.now())
         process.stderr.write('[tap] watch: nats reconnect\n')
       }
     }
