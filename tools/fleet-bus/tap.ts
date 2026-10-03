@@ -18,6 +18,7 @@
  */
 import { connect, StringCodec } from 'nats'
 import { isEnvelope, normalizeUsername, format, dedupeKey, statusStateHash } from './tap-format'
+import { postOne, validateTimeout } from './tap-post'
 
 const sc = StringCodec()
 const NATS_URL = process.env.FLEET_BUS_URL || 'nats://127.0.0.1:4222'
