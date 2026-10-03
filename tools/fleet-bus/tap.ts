@@ -112,6 +112,25 @@ const WATCH_CONFIG = {
   graceMs: Number(process.env.FLEET_BUS_GRACE_MS ?? HEARTBEAT_MS * 3),
   reminderMs: Number(process.env.FLEET_BUS_REMINDER_MS ?? 24 * 60 * 60 * 1000),
 }
+// How often the detector evaluates. It was pinned to the heartbeat interval, which made
+// a 1.5s silence window undetectable for 30 seconds -- the evaluation period, not the
+// window, bounds how fast anything is noticed. Keep it at or below the silence window.
+const TICK_MS = Number(process.env.FLEET_BUS_TICK_MS ?? Math.min(HEARTBEAT_MS, WATCH_CONFIG.silenceMs))
+// Validate ONCE, at startup, for the same reason the POST timeout is validated here.
+// A NaN silence window makes `now - seen >= NaN` false forever, which silently DISABLES
+// detection for every bot that has been seen -- a monitor that reports nothing while
+// looking configured. A zero reminder interval spams. (Ohm, PR 68.)
+for (const [name, value] of Object.entries({
+  FLEET_BUS_SILENCE_MS: WATCH_CONFIG.silenceMs,
+  FLEET_BUS_GRACE_MS: WATCH_CONFIG.graceMs,
+  FLEET_BUS_REMINDER_MS: WATCH_CONFIG.reminderMs,
+  FLEET_BUS_TICK_MS: TICK_MS,
+})) {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer number of milliseconds, got ${JSON.stringify(value)}`)
+  }
+}
+
 const watch = newState(Date.now())
 
 function announce(text: string) {
@@ -124,15 +143,34 @@ if (WATCH_BOTS.length > 0) {
   // starts is indistinguishable from a quiet fleet -- the same defect it exists to find.
   announce(`👁️ tap up, watching ${WATCH_BOTS.length} bots: ${WATCH_BOTS.join(', ')}`)
 
+  // TRACK CONNECTION EVENTS, DO NOT POLL isClosed().
+  //
+  // isClosed() stays FALSE while the client is reconnecting, so polling it left
+  // watch.connected true through an outage and the detector reported every bot silent
+  // -- the exact false positive the gate exists to prevent. Reproduced against a real
+  // broker by Ohm (PR 68).
+  //
+  // The event stream also catches an outage that begins AND ends between two ticks. A
+  // poll cannot see that at all, and it is the case that matters: a brief reconnect
+  // leaves a gap in status messages that would otherwise read as silence.
+  ;(async () => {
+    for await (const s of nc.status()) {
+      if (s.type === 'disconnect') {
+        watch.connected = false
+        process.stderr.write('[tap] watch: nats disconnect\n')
+      } else if (s.type === 'reconnect') {
+        watch.connected = true
+        process.stderr.write('[tap] watch: nats reconnect\n')
+      }
+    }
+  })().catch((e) => process.stderr.write(`[tap] status stream error: ${e}\n`))
+
   setInterval(() => {
-    // nc.isClosed() is the tap's own view of the link. While it is down every bot looks
-    // silent, so the detector reports the tap instead of the fleet.
-    watch.connected = !nc.isClosed()
     for (const ev of tick(watch, WATCH_CONFIG, Date.now())) {
       announce(render(ev, Date.now()))
       process.stderr.write(`[tap] watch: ${JSON.stringify(ev)}\n`)
     }
-  }, HEARTBEAT_MS).unref?.()
+  }, TICK_MS).unref?.()
 }
 
 const sub = nc.subscribe('fleet.>')
