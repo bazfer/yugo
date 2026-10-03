@@ -23,18 +23,27 @@ for a directory whose purpose is to hold secrets; the separation above is.
 The container running today was created with `docker run` and carries no compose labels.
 Compose does not adopt it; it fails on the name.
 
-**WARNING: do not `docker rm` the existing container. Rename it.** A remove destroys the
-only fallback you have, and it is the faster thing to type under pressure. (Kat, PR 69.)
+**WARNING: record `OLD_REF` before you start. That ref IS the fallback.** Keeping the
+old container is not a fallback, for two separate reasons, both verified:
+
+- **A retained container preserves its configuration, not its revision.** The source is a
+  shared bind mount, so starting it again runs whatever is in the checkout now. (Ohm.)
+- **Renaming it does not even retain it.** Compose identifies containers by project and
+  service labels rather than by name, so `--force-recreate` removes the renamed container
+  too. Verified: rename to `<name>-keep`, recreate, and `<name>-keep` is gone. (Kat
+  raised the `rm`-versus-rename hazard; testing the rename showed neither one helps.)
 
 ```
-OLD_REF=$(sudo -u luna git -C /home/luna/yugo rev-parse --short HEAD)
-sudo -u luna docker stop fleet-bus-tap
-sudo -u luna docker rename fleet-bus-tap "fleet-bus-tap-$OLD_REF"
+# Check 3 compares against this. Set it HERE: an empty $PULLED_AT makes check 3 pass
+# trivially, which is worse than no check, because it reads as one. (Kat, PR 69.)
+PULLED_AT=$(date -u +%FT%TZ)
+OLD_REF=$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
+echo "fallback ref: $OLD_REF"   # write this down. Nothing else recovers it.
+sudo -u luna docker rm -f fleet-bus-tap
 sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml up -d
 ```
 
-Then run the four validation checks. If they fail, the rollback section applies and the
-renamed container is still there.
+Then run the four validation checks. If they fail, roll the SOURCE back to `$OLD_REF`.
 
 Skipping the rename produces:
 
@@ -141,11 +150,11 @@ retained container preserves its configuration, not its revision.** (Ohm, PR 69.
 
 So a rollback reverts the SOURCE, and the container is incidental.
 
-Before deploying, record the revision and keep the old container:
+Before deploying, record the revision. **That is the whole of the preparation** — there
+is no container to keep, per the two reasons above:
 
 ```
 OLD_REF=$(sudo -u luna git -C /home/luna/yugo rev-parse HEAD)
-sudo -u luna docker rename fleet-bus-tap fleet-bus-tap-${OLD_REF:0:7}
 ```
 
 To roll back, move the source back first, then recreate:
@@ -163,10 +172,19 @@ sudo -u luna docker compose -f /home/luna/yugo/tools/fleet-bus/compose.yml \
 Then run the four validation checks again. **A rollback is a deployment and earns the
 same verification**, including check 4.
 
-**Check `bun.lock` between the two revisions before skipping the install step.**
-`node_modules` is gitignored, so reverting the source does not revert dependencies, and
-a lockfile change in either direction leaves the tree wrong for the revision now checked
-out.
+Use the same lockfile comparison as the deploy path, rather than judging it by eye:
+
+```
+if ! sudo -u luna git -C /home/luna/yugo diff --quiet "$OLD_REF" HEAD \
+     -- tools/fleet-bus/bun.lock; then
+  sudo -u luna docker run --rm -v /home/luna/yugo/tools/fleet-bus:/app -w /app \
+    oven/bun:latest bun install --frozen-lockfile
+fi
+```
+
+`node_modules` is gitignored, so reverting the source does not revert dependencies. **The
+comparison matters in both directions:** a rollback can need OLDER packages than the ones
+installed.
 
 ## The handover gap
 
