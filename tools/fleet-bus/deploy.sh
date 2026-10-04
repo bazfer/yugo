@@ -110,8 +110,23 @@ fi
 # as well (verified). And a retained container would preserve its configuration rather
 # than its revision, because the source is a shared bind mount. The fallback is $BEFORE,
 # printed below, and nothing else.
+# WARNING: removing the container before recreating it means a failure in between leaves
+# NOTHING RUNNING. That happened on deet-01 on 2026-10-04: the tap was removed, the
+# recreate did not complete, and the tap was gone for about 30 minutes with no error
+# anyone saw. The detector cannot catch it, because the detector IS the tap.
+#
+# So remove it ONLY when compose cannot replace it itself. A compose-managed container is
+# recreated by --force-recreate, which never leaves it absent. The removal exists solely
+# for a container created by hand, which has no compose labels for compose to match on.
 if as_owner docker inspect "$NAME" >/dev/null 2>&1; then
-  as_owner docker rm -f "$NAME" >/dev/null
+  COMPOSE_MANAGED=$(as_owner docker inspect "$NAME" \
+    --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)
+  if [ -z "$COMPOSE_MANAGED" ]; then
+    note "existing container was created by hand, removing it so compose can take over"
+    as_owner docker rm -f "$NAME" >/dev/null
+  else
+    note "existing container is compose-managed, letting --force-recreate replace it"
+  fi
 fi
 
 # --force-recreate is REQUIRED. The source is a bind mount, so new code does not change
