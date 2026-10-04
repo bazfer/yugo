@@ -152,5 +152,35 @@ else
   bad "it confirmed a process the operator never checked (rc=$RC)"
 fi
 
+# ---- A FAILED DEPLOY MUST LEAVE THE SERVICE RUNNING ----
+# The outage on 2026-10-04. The script removed the container and then recreated it, so a
+# failure in between left nothing running, with no error anyone saw and no rollback. The
+# detector cannot report it, because the detector IS the tap.
+FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --rollback HEAD --mirror-confirmed >/dev/null 2>&1 || true
+if docker inspect "$CN" >/dev/null 2>&1; then
+  ok "a container is running before the failure case"
+
+  # Break compose so the recreate cannot succeed, leaving only the removal to do damage.
+  cp "$WORK/tools/fleet-bus/compose.yml" "$WORK/compose.good"
+  printf 'services:\n  tap:\n    image: [this is not valid yaml\n' > "$WORK/tools/fleet-bus/compose.yml"
+
+  OUT=$(FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --rollback HEAD 2>&1); RC=$?
+  cp "$WORK/compose.good" "$WORK/tools/fleet-bus/compose.yml"
+
+  if [ "$RC" -ne 0 ]; then
+    ok "a broken compose file makes the deploy FAIL rather than report success"
+  else
+    bad "the deploy reported success with a broken compose file (rc=$RC)"
+  fi
+
+  if docker inspect "$CN" >/dev/null 2>&1; then
+    ok "and the container SURVIVES a failed deploy, rather than being left deleted"
+  else
+    bad "a failed deploy destroyed the running container -- this is the 2026-10-04 outage"
+  fi
+else
+  bad "no container to run the failure case against"
+fi
+
 printf '\n  %d pass, %d fail\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

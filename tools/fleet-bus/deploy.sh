@@ -110,8 +110,36 @@ fi
 # as well (verified). And a retained container would preserve its configuration rather
 # than its revision, because the source is a shared bind mount. The fallback is $BEFORE,
 # printed below, and nothing else.
+# WARNING: removing the container before recreating it means a failure in between leaves
+# NOTHING RUNNING. That happened on deet-01 on 2026-10-04: the tap was removed, the
+# recreate did not complete, and the tap was gone for about 30 minutes with no error
+# anyone saw. The detector cannot catch it, because the detector IS the tap.
+#
+# So remove it ONLY when compose cannot replace it itself.
+#
+# This NARROWS the window. It does not close it. --force-recreate is stop, remove,
+# create, start, so a failure between remove and create -- a bad image, OOM, a port
+# conflict -- still leaves nothing running. What changes is that the window is short and
+# inside compose's own control, rather than spanning two separate commands with
+# arbitrary work in between. Claiming it "never leaves it absent" was wrong. (Kat, PR 71.)
+#
+# The removal exists solely for a container created by hand, which has no compose labels
+# for compose to match on.
+#
+# KNOWN LIMITATION: this treats any non-empty compose project label as managed. A label
+# naming a DIFFERENT project than this compose file declares means compose will not match
+# it either, so the deploy fails on the name conflict while we have chosen not to remove
+# it. The deploy is then stuck, which is the safe direction: the old container survives.
+# Comparing the label against the current project name is a follow-up. (Kat, PR 71.)
 if as_owner docker inspect "$NAME" >/dev/null 2>&1; then
-  as_owner docker rm -f "$NAME" >/dev/null
+  COMPOSE_MANAGED=$(as_owner docker inspect "$NAME" \
+    --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)
+  if [ -z "$COMPOSE_MANAGED" ]; then
+    note "existing container was created by hand, removing it so compose can take over"
+    as_owner docker rm -f "$NAME" >/dev/null
+  else
+    note "existing container is compose-managed, letting --force-recreate replace it"
+  fi
 fi
 
 # --force-recreate is REQUIRED. The source is a bind mount, so new code does not change
