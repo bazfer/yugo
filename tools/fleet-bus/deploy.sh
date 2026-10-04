@@ -115,9 +115,22 @@ fi
 # recreate did not complete, and the tap was gone for about 30 minutes with no error
 # anyone saw. The detector cannot catch it, because the detector IS the tap.
 #
-# So remove it ONLY when compose cannot replace it itself. A compose-managed container is
-# recreated by --force-recreate, which never leaves it absent. The removal exists solely
-# for a container created by hand, which has no compose labels for compose to match on.
+# So remove it ONLY when compose cannot replace it itself.
+#
+# This NARROWS the window. It does not close it. --force-recreate is stop, remove,
+# create, start, so a failure between remove and create -- a bad image, OOM, a port
+# conflict -- still leaves nothing running. What changes is that the window is short and
+# inside compose's own control, rather than spanning two separate commands with
+# arbitrary work in between. Claiming it "never leaves it absent" was wrong. (Kat, PR 71.)
+#
+# The removal exists solely for a container created by hand, which has no compose labels
+# for compose to match on.
+#
+# KNOWN LIMITATION: this treats any non-empty compose project label as managed. A label
+# naming a DIFFERENT project than this compose file declares means compose will not match
+# it either, so the deploy fails on the name conflict while we have chosen not to remove
+# it. The deploy is then stuck, which is the safe direction: the old container survives.
+# Comparing the label against the current project name is a follow-up. (Kat, PR 71.)
 if as_owner docker inspect "$NAME" >/dev/null 2>&1; then
   COMPOSE_MANAGED=$(as_owner docker inspect "$NAME" \
     --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)

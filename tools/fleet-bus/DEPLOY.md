@@ -142,6 +142,20 @@ Four checks, in order. Each one rejects a failure the one before it cannot see.
    prove it either:** the tap logs only on failure, so a quiet log is consistent with a
    tap that posts nothing. Read the channel.
 
+## A failed deployment, and the window that remains
+
+**A failed deploy leaves the old container running.** The script does not remove a
+compose-managed container before recreating it, so a failure during the deploy ends with
+the previous process still serving.
+
+**The window is narrowed, not closed.** `--force-recreate` is stop, remove, create,
+start. A failure between remove and create still leaves nothing running. What changed is
+that the gap is short and inside compose's control rather than spanning two commands.
+
+**So a deploy can still take the tap down**, and nothing in the tap can report that,
+because the tap is what reports. Watching the tap from outside its own process is a
+separate piece of work and it is not here yet.
+
 ## Rolling back
 
 **WARNING: keeping the old container does NOT roll back the code.** The source is a
