@@ -39,6 +39,10 @@ git add -A && git commit -qm one
 echo "// two" >> tools/fleet-bus/app.js && git add -A && git commit -qm two
 
 export FLEET_BUS_SRC="$WORK" FLEET_BUS_CONTAINER="$CN" FLEET_BUS_OWNER="$(id -un)"
+# Must be set for EVERY case, not just the state ones: the default path lives in the
+# owner's home and an unconfirmed deploy writes there, which failed the first case
+# with exit 1 instead of 2.
+export FLEET_BUS_STATE="$WORK/state"
 
 # ---- the good path: checks 1-3 pass, and it still REFUSES to claim success ----
 OUT=$("$HERE/deploy.sh" --rollback HEAD 2>&1); RC=$?
@@ -78,6 +82,74 @@ if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'running old code'; then
 else
   bad "check 3 passed a no-op deploy (rc=$RC) -- the enforcement does nothing"
   printf '%s\n' "$OUT" | tail -4
+fi
+
+# ---- the owner must be able to run it ----
+# It always prefixed "sudo -u $OWNER", so luna running it got "user luna is not allowed
+# to execute ... as luna". The NORMAL case was broken and no test covered it, because
+# every test ran as a user who was not the owner.
+OUT=$(FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --rollback HEAD --mirror-confirmed 2>&1); RC=$?
+if [ "$RC" -eq 0 ] && ! printf '%s' "$OUT" | grep -q 'not allowed to execute'; then
+  ok "the owning user can run it without sudo escalating to itself"
+else
+  bad "the owner cannot run it (rc=$RC)"
+  printf '%s\n' "$OUT" | grep -i 'not allowed' | head -1
+fi
+
+# ---- check 4 must be confirmable WITHOUT deploying again ----
+# Recording one manual check required re-running the whole deploy, which restarted the
+# tap a second time and reset its status dedupe: deploying in order to verify a
+# deployment.
+OUT=$(FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --rollback HEAD 2>&1); RC=$?
+if [ "$RC" -eq 2 ] && [ -f "$FLEET_BUS_STATE" ]; then
+  ok "an unconfirmed deployment records which process was checked"
+else
+  bad "no state recorded (rc=$RC), so check 4 cannot be confirmed later"
+fi
+
+BEFORE_START=$(docker inspect "$CN" --format '{{.State.StartedAt}}' 2>/dev/null)
+OUT=$(FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --mirror-confirmed 2>&1); RC=$?
+AFTER_START=$(docker inspect "$CN" --format '{{.State.StartedAt}}' 2>/dev/null)
+if [ "$RC" -eq 0 ] && [ "$BEFORE_START" = "$AFTER_START" ]; then
+  ok "confirming check 4 deploys NOTHING: the container did not restart"
+else
+  bad "confirming check 4 restarted the container or failed (rc=$RC)"
+fi
+
+# ---- and it must REFUSE when there is nothing pending ----
+# The case my previous test did NOT cover. Test 8 passed only because the test before it
+# always wrote the state file, so the absent-state path never fired. With nothing pending,
+# the flag used to skip the confirm branch, run a FULL DEPLOYMENT, and then report
+# "verified" and exit 0. (Kat, PR 70.)
+rm -f "$FLEET_BUS_STATE"
+START_BEFORE=$(docker inspect "$CN" --format '{{.State.StartedAt}}' 2>/dev/null)
+OUT=$(FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --mirror-confirmed 2>&1); RC=$?
+START_AFTER=$(docker inspect "$CN" --format '{{.State.StartedAt}}' 2>/dev/null)
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'nothing pending\|no pending'; then
+  ok "it REFUSES to confirm when no deployment is pending"
+else
+  bad "it accepted a confirm with nothing pending (rc=$RC)"
+fi
+# WEAKER THAN IT LOOKS, and said so rather than trusted. The fixture repo has no remote,
+# so under the mutated guard the fall-through dies at "git pull" instead of deploying.
+# This assertion therefore passes whether the deploy was REFUSED or merely FAILED. The
+# case above is the one that discriminates: it checks for the refusal message and was
+# verified against the mutation. In production, where the pull succeeds, this one matters.
+if [ "$START_BEFORE" = "$START_AFTER" ]; then
+  ok "and that refusal deployed NOTHING (weak here: see comment)"
+else
+  bad "a confirm with nothing pending triggered a deployment"
+fi
+
+# ---- and it must REFUSE to confirm a different process ----
+FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --rollback HEAD >/dev/null 2>&1 || true
+docker restart "$CN" >/dev/null 2>&1
+sleep 3
+OUT=$(FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --mirror-confirmed 2>&1); RC=$?
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'restarted since'; then
+  ok "it REFUSES to confirm a deployment whose process has since restarted"
+else
+  bad "it confirmed a process the operator never checked (rc=$RC)"
 fi
 
 printf '\n  %d pass, %d fail\n' "$PASS" "$FAIL"
