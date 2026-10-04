@@ -116,6 +116,31 @@ else
   bad "confirming check 4 restarted the container or failed (rc=$RC)"
 fi
 
+# ---- and it must REFUSE when there is nothing pending ----
+# The case my previous test did NOT cover. Test 8 passed only because the test before it
+# always wrote the state file, so the absent-state path never fired. With nothing pending,
+# the flag used to skip the confirm branch, run a FULL DEPLOYMENT, and then report
+# "verified" and exit 0. (Kat, PR 70.)
+rm -f "$FLEET_BUS_STATE"
+START_BEFORE=$(docker inspect "$CN" --format '{{.State.StartedAt}}' 2>/dev/null)
+OUT=$(FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --mirror-confirmed 2>&1); RC=$?
+START_AFTER=$(docker inspect "$CN" --format '{{.State.StartedAt}}' 2>/dev/null)
+if [ "$RC" -ne 0 ] && printf '%s' "$OUT" | grep -q 'nothing pending\|no pending'; then
+  ok "it REFUSES to confirm when no deployment is pending"
+else
+  bad "it accepted a confirm with nothing pending (rc=$RC)"
+fi
+# WEAKER THAN IT LOOKS, and said so rather than trusted. The fixture repo has no remote,
+# so under the mutated guard the fall-through dies at "git pull" instead of deploying.
+# This assertion therefore passes whether the deploy was REFUSED or merely FAILED. The
+# case above is the one that discriminates: it checks for the refusal message and was
+# verified against the mutation. In production, where the pull succeeds, this one matters.
+if [ "$START_BEFORE" = "$START_AFTER" ]; then
+  ok "and that refusal deployed NOTHING (weak here: see comment)"
+else
+  bad "a confirm with nothing pending triggered a deployment"
+fi
+
 # ---- and it must REFUSE to confirm a different process ----
 FLEET_BUS_OWNER="$(id -un)" "$HERE/deploy.sh" --rollback HEAD >/dev/null 2>&1 || true
 docker restart "$CN" >/dev/null 2>&1

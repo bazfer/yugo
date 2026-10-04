@@ -60,7 +60,13 @@ done
 # --mirror-confirmed alone: close out the deployment already made. Re-running the whole
 # deploy to record one manual check meant redeploying to verify a deployment, which also
 # restarted the tap a second time and reset its status dedupe. Found on first real use.
-if [ "$MIRROR_CONFIRMED" -eq 1 ] && [ -z "$ROLLBACK_REF" ] && [ -f "$STATE" ]; then
+if [ "$MIRROR_CONFIRMED" -eq 1 ] && [ -z "$ROLLBACK_REF" ]; then
+  # The absence of the state file must REFUSE, not fall through. Guarding the branch on
+  # [ -f "$STATE" ] meant a confirm with nothing pending skipped this block, ran a full
+  # deployment, and then printed "verified" and exited 0 -- an unrequested deploy AND a
+  # false check-4 pass, from a flag whose whole purpose is to record a manual check.
+  # (Kat, PR 70.)
+  [ -f "$STATE" ] || die "no pending deployment to confirm. This flag records a check; it does not deploy. Run deploy.sh first."
   RECORDED=$(cut -d" " -f1 < "$STATE")
   RECORDED_REF=$(cut -d" " -f2 < "$STATE")
   NOW_STARTED=$(as_owner docker inspect "$NAME" --format "{{.State.StartedAt}}" 2>/dev/null || true)
