@@ -58,9 +58,20 @@ Every later deployment uses the section below.
 ## Deploying a code change
 
 ```
-./tools/fleet-bus/deploy.sh                    # then read #fleet-bus
-./tools/fleet-bus/deploy.sh --mirror-confirmed  # once you have seen traffic there
+./tools/fleet-bus/deploy.sh                     # deploys, runs checks 1-3, exits 2
+./tools/fleet-bus/deploy.sh --mirror-confirmed  # after reading #fleet-bus; deploys NOTHING
 ```
+
+**Run it as the owning user or as yourself; both work.** It escalates only when it has to.
+
+**The second command deploys nothing.** It closes out the deployment the first one made,
+and refuses if the container has restarted since, because then you verified a different
+process. Confirming a check used to require re-running the whole deploy, which restarted
+the tap a second time: deploying in order to verify a deployment.
+
+**Expect a burst of status posts in #fleet-bus after any tap restart.** The status dedupe
+is in memory, so a restart empties it and the first heartbeat from each watched bot reads
+as new. One post per bot, once. It is not the detector firing.
 
 **WARNING: do not substitute `git pull && docker compose up -d`.** Compose recreates a
 container when the SERVICE DEFINITION changes. The source is a bind mount, so new code

@@ -16,10 +16,18 @@ NAME="${FLEET_BUS_CONTAINER:-fleet-bus-tap}"
 OWNER="${FLEET_BUS_OWNER:-luna}"
 MIRROR_CONFIRMED=0
 ROLLBACK_REF=""
+# Records which process the operator verified, so confirming check 4 does not require
+# deploying again. Outside the checkout, and not a secret.
+STATE="${FLEET_BUS_STATE:-/home/luna/fleet-bus/.tap-deploy-state}"
 
 die() { printf '  FAIL: %s\n' "$*" >&2; exit 1; }
 note() { printf '  %s\n' "$*"; }
-as_owner() { sudo -u "$OWNER" "$@"; }
+# Run as the owning user -- but only escalate when we are not already them. Prefixing
+# sudo unconditionally broke the NORMAL case: luna running it got
+# "user luna is not allowed to execute ... as luna". Found on first real use.
+as_owner() {
+  if [ "$(id -un)" = "$OWNER" ]; then "$@"; else sudo -u "$OWNER" "$@"; fi
+}
 
 usage() {
   cat <<USAGE
@@ -31,6 +39,10 @@ usage: deploy.sh [--rollback <ref>] [--mirror-confirmed]
   --mirror-confirmed   you have READ #fleet-bus and seen new traffic. Without this the
                        script exits non-zero: checks 1 to 3 cannot tell whether the tap
                        posts anything.
+
+                       Passed ALONE, it confirms the deployment already made and deploys
+                       nothing. It refuses if the container restarted since, because then
+                       you verified a different process.
 USAGE
 }
 
@@ -44,6 +56,23 @@ while [ $# -gt 0 ]; do
 done
 
 [ -f "$COMPOSE" ] || die "no compose file at $COMPOSE"
+
+# --mirror-confirmed alone: close out the deployment already made. Re-running the whole
+# deploy to record one manual check meant redeploying to verify a deployment, which also
+# restarted the tap a second time and reset its status dedupe. Found on first real use.
+if [ "$MIRROR_CONFIRMED" -eq 1 ] && [ -z "$ROLLBACK_REF" ] && [ -f "$STATE" ]; then
+  RECORDED=$(cut -d" " -f1 < "$STATE")
+  RECORDED_REF=$(cut -d" " -f2 < "$STATE")
+  NOW_STARTED=$(as_owner docker inspect "$NAME" --format "{{.State.StartedAt}}" 2>/dev/null || true)
+  [ -n "$NOW_STARTED" ] || die "no running container to confirm"
+  if [ "$NOW_STARTED" != "$RECORDED" ]; then
+    die "the container restarted since the deployment you are confirming ($NOW_STARTED vs $RECORDED). Deploy again."
+  fi
+  as_owner rm -f "$STATE"
+  note "check 4: mirroring confirmed by the operator"
+  note "deployment of ${RECORDED_REF} verified"
+  exit 0
+fi
 
 # ---------------------------------------------------------------- source and deps
 PULLED_AT_EPOCH=$(date -u +%s)
@@ -112,6 +141,7 @@ note "        started $((STARTED_EPOCH - PULLED_AT_EPOCH))s after the source mov
 # Check 4 cannot be automated from here: it needs reading Discord. So the script refuses
 # to claim success instead of quietly reporting three of four.
 if [ "$MIRROR_CONFIRMED" -eq 0 ]; then
+  printf '%s %s\n' "$STARTED" "${AFTER:0:7}" | as_owner tee "$STATE" >/dev/null
   cat >&2 <<MSG
 
   checks 1 to 3 PASSED. check 4 is NOT done.
@@ -121,7 +151,11 @@ if [ "$MIRROR_CONFIRMED" -eq 0 ]; then
   works whether or not the tap runs. The log does not prove it: the tap logs only on
   failure, so a quiet log is consistent with a tap that posts nothing.
 
-  Send any bus message, READ #fleet-bus, then re-run with --mirror-confirmed.
+  Send any bus message, READ #fleet-bus, then run:
+
+      deploy.sh --mirror-confirmed
+
+  That confirms THIS deployment and deploys nothing.
 
   To roll back: deploy.sh --rollback ${BEFORE:0:7}
 MSG
