@@ -138,7 +138,7 @@ def test_invalid_repo_raises_before_network(bad_repo: str, tmp_path: Path) -> No
     with pytest.raises(gh.GitHubReviewError, match="invalid_repo"):
         gh.submit_review(
             bad_repo, PR, HEAD, "approve", _VALID_VERDICT,
-            credentials_path=creds, _conn_factory=factory,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
         )
     assert calls == [], "no HTTP call must happen before input validation"
 
@@ -163,7 +163,7 @@ def test_invalid_pr_raises_before_network(bad_pr: Any, tmp_path: Path) -> None:
     with pytest.raises(gh.GitHubReviewError, match="invalid_pr"):
         gh.submit_review(
             REPO, bad_pr, HEAD, "approve", _VALID_VERDICT,
-            credentials_path=creds, _conn_factory=factory,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
         )
     assert calls == [], "no HTTP call must happen before input validation"
 
@@ -209,7 +209,10 @@ def test_empty_allowlist_refuses_all(tmp_path: Path) -> None:
 def test_non_dict_verdict_raises(tmp_path: Path) -> None:
     creds = _creds_file(tmp_path)
     with pytest.raises(gh.GitHubReviewError, match="verdict_not_structured"):
-        gh.submit_review(REPO, PR, HEAD, "approve", "not a dict", credentials_path=creds)
+        gh.submit_review(
+            REPO, PR, HEAD, "approve", "not a dict",
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
 
 
 def test_missing_properties_asserted_raises(tmp_path: Path) -> None:
@@ -218,7 +221,7 @@ def test_missing_properties_asserted_raises(tmp_path: Path) -> None:
         gh.submit_review(
             REPO, PR, HEAD, "approve",
             {"properties_asserted": [], "mutations_tried": ["m"]},
-            credentials_path=creds,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
         )
 
 
@@ -228,7 +231,7 @@ def test_missing_mutations_tried_raises(tmp_path: Path) -> None:
         gh.submit_review(
             REPO, PR, HEAD, "approve",
             {"properties_asserted": ["p"], "mutations_tried": []},
-            credentials_path=creds,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
         )
 
 
@@ -236,7 +239,8 @@ def test_bad_decision_raises(tmp_path: Path) -> None:
     creds = _creds_file(tmp_path)
     with pytest.raises(gh.GitHubReviewError, match="verdict_bad_decision"):
         gh.submit_review(
-            REPO, PR, HEAD, "rubber_stamp", _VALID_VERDICT, credentials_path=creds,
+            REPO, PR, HEAD, "rubber_stamp", _VALID_VERDICT,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
         )
 
 
@@ -251,7 +255,7 @@ def test_head_moved_refuses(tmp_path: Path) -> None:
     with pytest.raises(gh.GitHubReviewError, match="head_moved"):
         gh.submit_review(
             REPO, PR, HEAD, "approve", _VALID_VERDICT,
-            credentials_path=creds, _conn_factory=factory,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
         )
     # Exactly one request fired (the GET), no POST attempted
     assert len(factory.conns) == 1
@@ -266,7 +270,10 @@ def test_no_github_credential_raises(tmp_path: Path) -> None:
     empty_creds.write_text("version: 1\ncredentials: []\n")
     empty_creds.chmod(0o600)
     with pytest.raises(gh.GitHubReviewError, match="github_no_credential"):
-        gh.submit_review(REPO, PR, HEAD, "approve", _VALID_VERDICT, credentials_path=empty_creds)
+        gh.submit_review(
+            REPO, PR, HEAD, "approve", _VALID_VERDICT,
+            credentials_path=empty_creds, allowlist=gh.ALLOW_ALL,
+        )
 
 
 # --- positive control ---
@@ -289,7 +296,7 @@ def test_valid_verdict_posts_exactly_once_with_correct_event(
 
     result = gh.submit_review(
         REPO, PR, HEAD, decision, _VALID_VERDICT,
-        credentials_path=creds, _conn_factory=factory,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
     )
 
     assert expected_event in result
@@ -322,7 +329,10 @@ def test_post_body_contains_verdict_evidence(tmp_path: Path) -> None:
     }
     responses = [_pr_response(), _review_response()]
     factory = _conn_factory_for(responses)
-    gh.submit_review(REPO, PR, HEAD, "approve", verdict, credentials_path=creds, _conn_factory=factory)
+    gh.submit_review(
+        REPO, PR, HEAD, "approve", verdict,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
 
     post_body = json.loads(factory.conns[1].calls[0][2])
     assert "guard skips bus frames" in post_body["body"]
@@ -337,19 +347,35 @@ def test_github_get_error_propagates(tmp_path: Path) -> None:
     with pytest.raises(gh.GitHubReviewError, match="github_get_error"):
         gh.submit_review(
             REPO, PR, HEAD, "approve", _VALID_VERDICT,
-            credentials_path=creds, _conn_factory=factory,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
         )
 
 
 def test_submit_review_in_tools_registry() -> None:
-    """submit_review must be declared in the tool registry with the right schema."""
+    """submit_review is in the registry with the allowlist config key."""
     import tools
     tool = tools.REGISTRY["submit_review"]
     assert tool.name == "submit_review"
     required = set(tool.parameters["required"])
     assert required == {"repo", "pr", "head_sha", "decision", "verdict"}
-    # No configurable bounds — no operator-tunable parameters
-    assert tool.config == {}
+
+    # Allowlist config must be declared — it is the access-scope control.
+    assert "allowlist" in tool.config
+    assert isinstance(tool.config["allowlist"], tools.ToolListConfig)
+
+    # The fail-safe: empty allowlist must refuse every repo.
+    # This asserts the property that matters — not just presence of the key.
+    # An allow-all default would silently pass `"allowlist" in tool.config`
+    # but fail here, which is exactly the gap we are preventing.
+    with pytest.raises(gh.GitHubReviewError, match="repo_not_allowlisted"):
+        gh.submit_review(
+            "bazfer/yugo", 1,
+            "abc1234def5678901234567890123456789012ab",
+            "approve",
+            {"properties_asserted": ["p"], "mutations_tried": ["m"]},
+            credentials_path=None,  # allowlist check fires before credential load
+            allowlist=frozenset(),
+        )
 
 
 def test_submit_review_granted_via_tools_yaml(tmp_path: Path) -> None:

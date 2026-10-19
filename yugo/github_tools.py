@@ -29,6 +29,26 @@ import http_tools
 # was made.
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$")
 
+
+class _AllowAllType:
+    """Sentinel allowlist that permits any repo.
+
+    Used in tests and for any caller that deliberately wants no restriction.
+    Making this a named, explicit sentinel (rather than None) means omitting
+    the allowlist argument is a hard error, not a silent allow-all.
+
+    `repo not in ALLOW_ALL` is always False so the guard never fires.
+    """
+
+    def __contains__(self, item: object) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return "ALLOW_ALL"
+
+
+ALLOW_ALL: _AllowAllType = _AllowAllType()
+
 GITHUB_HOST = "api.github.com"
 GITHUB_API_ORIGIN = http_tools.parse_authority(GITHUB_HOST)
 DEFAULT_CREDENTIALS_FILE = http_tools.DEFAULT_CREDENTIALS_FILE
@@ -161,7 +181,7 @@ def submit_review(
     verdict: Any,
     *,
     credentials_path: Path | None = None,
-    allowlist: frozenset[str] | None = None,
+    allowlist: frozenset[str] | _AllowAllType,
     _conn_factory: Callable[[], Any] | None = None,
 ) -> str:
     """Submit a formal GitHub PR review.
@@ -169,10 +189,9 @@ def submit_review(
     Never accepts a URL or HTTP method from the model — these are hardcoded.
     Input validation fires before any network call (see _validate_inputs).
 
-    `allowlist`: when not None, only repos in the set are permitted. An empty
-    frozenset refuses all repos (fail-safe default when the grant omits the
-    allowlist). None disables the check (test convenience only — the binding
-    in resolve_declared always passes an explicit frozenset).
+    `allowlist` is required and explicit — no default. Pass `ALLOW_ALL` to
+    bypass the check deliberately (tests, or tools without an allowlist grant).
+    An empty frozenset refuses all repos (fail-safe: missing grant → deny all).
 
     Three guards (all required):
 
@@ -192,7 +211,7 @@ def submit_review(
     pr = _validate_inputs(repo, pr)
 
     # Allowlist check: scope is set in the grant file, not here
-    if allowlist is not None and repo not in allowlist:
+    if repo not in allowlist:
         raise GitHubReviewError(
             "repo_not_allowlisted",
             f"repo {repo!r} not in the configured allowlist",
