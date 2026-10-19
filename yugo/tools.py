@@ -40,6 +40,7 @@ from typing import Any, Awaitable, Callable, Mapping
 # grepping both while debugging a sick bot.
 import fleet_bus
 import filesystem_tools
+import github_tools
 import http_tools
 import yaml
 
@@ -121,6 +122,23 @@ class Tool:
 async def _filesystem_unbound(args: dict[str, Any]) -> str:
     """A registry entry reaching this handler skipped startup confinement."""
     raise RuntimeError("filesystem tool was not bound to a workspace")
+
+
+async def _submit_review_unbound(args: dict[str, Any]) -> str:
+    """A registry entry reaching this handler skipped startup credential binding."""
+    raise RuntimeError("submit_review was not bound to credentials")
+
+
+async def _submit_review(args: dict[str, Any], *, credentials_path: Path) -> str:
+    return await asyncio.to_thread(
+        github_tools.submit_review,
+        args.get("repo"),
+        args.get("pr"),
+        args.get("head_sha"),
+        args.get("decision"),
+        args.get("verdict"),
+        credentials_path=credentials_path,
+    )
 
 
 async def _read_file(
@@ -265,6 +283,56 @@ REGISTRY: Mapping[str, Tool] = {
             "timeout_ms": ToolConfig(30000, 120000),
             "max_redirects": ToolConfig(5, 10, minimum=0),
         },
+    ),
+    "submit_review": Tool(
+        name="submit_review",
+        description=(
+            "Submit a formal GitHub PR review. "
+            "`decision` must be approve, request_changes, or insufficient_evidence. "
+            "`verdict` must have non-empty `properties_asserted` and `mutations_tried` "
+            "lists. The PR head is re-fetched and must match `head_sha`."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "owner/repo, e.g. 'bazfer/casa-xhen'",
+                },
+                "pr": {
+                    "type": "integer",
+                    "description": "PR number",
+                },
+                "head_sha": {
+                    "type": "string",
+                    "description": "SHA of the commit you reviewed",
+                },
+                "decision": {
+                    "type": "string",
+                    "enum": ["approve", "request_changes", "insufficient_evidence"],
+                },
+                "verdict": {
+                    "type": "object",
+                    "properties": {
+                        "properties_asserted": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Properties verified to hold",
+                        },
+                        "mutations_tried": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Mutations considered or tested",
+                        },
+                    },
+                    "required": ["properties_asserted", "mutations_tried"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["repo", "pr", "head_sha", "decision", "verdict"],
+            "additionalProperties": False,
+        },
+        handler=_submit_review_unbound,
     ),
 }
 
@@ -482,6 +550,15 @@ def resolve_declared(
             }
             selected["http_get"] = replace(
                 tool, handler=partial(_http_get, credentials=credentials, **values)
+            )
+        if "submit_review" in selected:
+            github_creds_path = Path(
+                os.environ.get("YUGO_GITHUB_CREDENTIALS_FILE", "").strip()
+                or github_tools.DEFAULT_CREDENTIALS_FILE
+            ).expanduser().resolve(strict=False)
+            selected["submit_review"] = replace(
+                selected["submit_review"],
+                handler=partial(_submit_review, credentials_path=github_creds_path),
             )
         return selected
     finally:

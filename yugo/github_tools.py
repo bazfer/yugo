@@ -1,0 +1,199 @@
+"""submit_review — formal GitHub PR review with injection-proof verdict guards.
+
+Does NOT generalize http_tools. That transport is GET-only by deliberate design
+and stays that way. This module owns GitHub review POST. It reads the token from
+the credentials file, builds its own fixed request, and never accepts a URL or
+HTTP method from the model.
+
+The three guards are documented on submit_review().
+"""
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import ssl
+from pathlib import Path
+from typing import Any, Callable
+
+import http_tools
+
+GITHUB_HOST = "api.github.com"
+GITHUB_API_ORIGIN = http_tools.parse_authority(GITHUB_HOST)
+DEFAULT_CREDENTIALS_FILE = http_tools.DEFAULT_CREDENTIALS_FILE
+
+_DECISION_EVENT: dict[str, str] = {
+    "approve": "APPROVE",
+    "request_changes": "REQUEST_CHANGES",
+    "insufficient_evidence": "COMMENT",
+}
+
+
+class GitHubReviewError(Exception):
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def _load_token(credentials_path: Path | None) -> str:
+    creds = http_tools.load_credentials(credentials_path)
+    cred = creds.get(GITHUB_API_ORIGIN)
+    if cred is None:
+        raise GitHubReviewError(
+            "github_no_credential",
+            f"no credential found for {GITHUB_API_ORIGIN.rendered()!r} in credentials file",
+        )
+    return cred.value
+
+
+def _make_ssl() -> ssl.SSLContext:
+    return ssl.create_default_context()
+
+
+def _default_conn_factory() -> http.client.HTTPSConnection:
+    return http.client.HTTPSConnection(GITHUB_HOST, context=_make_ssl())
+
+
+def _github_get(
+    path: str,
+    token: str,
+    *,
+    _conn_factory: Callable[[], Any] | None = None,
+) -> dict[str, Any]:
+    factory = _conn_factory or _default_conn_factory
+    conn = factory()
+    try:
+        conn.request(
+            "GET",
+            path,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "yugo-submit-review/1",
+            },
+        )
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", errors="replace")
+        if resp.status != 200:
+            raise GitHubReviewError(
+                "github_get_error",
+                f"GET {path} returned HTTP {resp.status}",
+            )
+        return json.loads(body)
+    finally:
+        conn.close()
+
+
+def _github_post(
+    path: str,
+    payload: dict[str, Any],
+    token: str,
+    *,
+    _conn_factory: Callable[[], Any] | None = None,
+) -> None:
+    factory = _conn_factory or _default_conn_factory
+    raw = json.dumps(payload).encode("utf-8")
+    conn = factory()
+    try:
+        conn.request(
+            "POST",
+            path,
+            body=raw,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(raw)),
+                "User-Agent": "yugo-submit-review/1",
+            },
+        )
+        resp = conn.getresponse()
+        resp.read()
+        if resp.status not in (200, 201):
+            raise GitHubReviewError(
+                "github_post_error",
+                f"POST {path} returned HTTP {resp.status}",
+            )
+    finally:
+        conn.close()
+
+
+def submit_review(
+    repo: str,
+    pr: int,
+    head_sha: str,
+    decision: str,
+    verdict: Any,
+    *,
+    credentials_path: Path | None = None,
+    _conn_factory: Callable[[], Any] | None = None,
+) -> str:
+    """Submit a formal GitHub PR review.
+
+    Never accepts a URL or HTTP method from the model — these are hardcoded.
+
+    Three guards (all required):
+
+    1. Verdict must be a mapping with non-empty `properties_asserted` and
+       `mutations_tried` lists. Forcing real evidence fields means an injection
+       must fabricate them, which is auditable afterwards.
+
+    2. PR head is re-fetched and must match `head_sha`. GitHub's
+       dismiss_stale_reviews_on_push and require_last_push_approval are both OFF
+       on the current fleet repos, so without this guard an approval survives a
+       later push and covers code the reviewer never saw.
+
+    3. The reviewed SHA is written into the review body so the record is
+       self-describing even if the guard is later disabled.
+    """
+    # Guard 1: structured, non-empty verdict
+    if not isinstance(verdict, dict):
+        raise GitHubReviewError("verdict_not_structured", "verdict must be a mapping")
+    props = verdict.get("properties_asserted")
+    muts = verdict.get("mutations_tried")
+    if not isinstance(props, list) or len(props) == 0:
+        raise GitHubReviewError(
+            "verdict_no_properties",
+            "verdict.properties_asserted must be a non-empty list",
+        )
+    if not isinstance(muts, list) or len(muts) == 0:
+        raise GitHubReviewError(
+            "verdict_no_mutations",
+            "verdict.mutations_tried must be a non-empty list",
+        )
+    if decision not in _DECISION_EVENT:
+        raise GitHubReviewError(
+            "verdict_bad_decision",
+            f"decision must be one of {sorted(_DECISION_EVENT)}; got {decision!r}",
+        )
+
+    token = _load_token(credentials_path)
+
+    # Guard 2: re-fetch PR head and refuse if it has moved
+    pr_data = _github_get(f"/repos/{repo}/pulls/{pr}", token, _conn_factory=_conn_factory)
+    current_head = pr_data.get("head", {}).get("sha", "")
+    if current_head != head_sha:
+        raise GitHubReviewError(
+            "head_moved",
+            f"PR head is now {current_head!r}; reviewed {head_sha!r} — re-review required",
+        )
+
+    event = _DECISION_EVENT[decision]
+
+    # Guard 3: write reviewed SHA into body so the record is self-describing
+    lines = [f"Reviewed at {head_sha}.", ""]
+    lines.extend(f"- {p}" for p in props)
+    lines.append("")
+    lines.extend(f"- {m} [mutation]" for m in muts)
+    body_text = "\n".join(lines).strip()
+
+    _github_post(
+        f"/repos/{repo}/pulls/{pr}/reviews",
+        {"commit_id": head_sha, "event": event, "body": body_text},
+        token,
+        _conn_factory=_conn_factory,
+    )
+    return f"submit_review ok: {event} on {repo}#{pr} at {head_sha}"
