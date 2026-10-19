@@ -482,10 +482,10 @@ def test_an_explicit_audit_path_wins():
     assert tools.audit_path_from_env({"YUGO_TOOL_AUDIT_PATH": "/x/y.jsonl"}) == "/x/y.jsonl"
 
 
-# ---------- tripwire for v0.4b/v0.4c ----------
+# ---------- tripwire for v0.4b/v0.4c/v0.4e ----------
 
 
-def test_registry_contains_only_the_shipped_v04c_set():
+def test_registry_contains_only_the_shipped_v04e_set():
     """A side-effecting tool added without its sandbox suite changes reach."""
     assert set(tools.REGISTRY) == {
         "loop_probe",
@@ -493,6 +493,7 @@ def test_registry_contains_only_the_shipped_v04c_set():
         "write_file",
         "list_dir",
         "http_get",
+        "submit_review",
     }
 
 

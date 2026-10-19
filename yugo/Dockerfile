@@ -28,6 +28,7 @@ COPY yugo/dedup_admin.py .
 COPY yugo/tools.py .
 COPY yugo/filesystem_tools.py .
 COPY yugo/http_tools.py .
+COPY yugo/github_tools.py .
 COPY yugo/IDENTITY.md .
 COPY yugo/.env.example .
 

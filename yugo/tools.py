@@ -83,11 +83,23 @@ class ToolDeclarationError(Exception):
 
 @dataclass(frozen=True)
 class ToolConfig:
-    """One operator-set bound; a wrong ceiling is a startup security fault."""
+    """One operator-set integer bound; a wrong ceiling is a startup security fault."""
 
     default: int
     ceiling: int
     minimum: int = 1
+
+
+@dataclass(frozen=True)
+class ToolListConfig:
+    """An operator-set string-list config key.
+
+    Each item must match `item_re`. An absent or null YAML value is treated as
+    an empty list, which the bound handler interprets as fail-safe (refuse all).
+    """
+
+    item_re: re.Pattern[str]
+    max_items: int = 100
 
 
 @dataclass(frozen=True)
@@ -105,7 +117,7 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     handler: Callable[[dict[str, Any]], Awaitable[str]]
-    config: Mapping[str, ToolConfig] = field(default_factory=dict)
+    config: Mapping[str, ToolConfig | ToolListConfig] = field(default_factory=dict)
 
     def schema(self) -> dict[str, Any]:
         """The `tools=[...]` entry LiteLLM forwards to the provider."""
@@ -129,7 +141,9 @@ async def _submit_review_unbound(args: dict[str, Any]) -> str:
     raise RuntimeError("submit_review was not bound to credentials")
 
 
-async def _submit_review(args: dict[str, Any], *, credentials_path: Path) -> str:
+async def _submit_review(
+    args: dict[str, Any], *, credentials_path: Path, allowlist: frozenset[str]
+) -> str:
     return await asyncio.to_thread(
         github_tools.submit_review,
         args.get("repo"),
@@ -138,6 +152,7 @@ async def _submit_review(args: dict[str, Any], *, credentials_path: Path) -> str
         args.get("decision"),
         args.get("verdict"),
         credentials_path=credentials_path,
+        allowlist=allowlist,
     )
 
 
@@ -333,6 +348,12 @@ REGISTRY: Mapping[str, Tool] = {
             "additionalProperties": False,
         },
         handler=_submit_review_unbound,
+        config={
+            "allowlist": ToolListConfig(
+                item_re=re.compile(r"[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}"),
+                max_items=50,
+            ),
+        },
     ),
 }
 
@@ -428,7 +449,7 @@ def resolve_declared(
     path = Path(configured).expanduser().resolve(strict=False)
     found = path.exists()
     selected: dict[str, Tool] = {}
-    configured_values: dict[str, dict[str, int]] = {}
+    configured_values: dict[str, dict[str, int | list[str]]] = {}
     try:
         if not found:
             return selected
@@ -467,26 +488,42 @@ def resolve_declared(
                 raise ToolDeclarationError(
                     f"tool key {name!r} config must be a mapping or null"
                 )
-            values = {}
+            values: dict[str, int | list[str]] = {}
             for key, value in (config or {}).items():
                 if key not in registry[name].config:
                     raise ToolDeclarationError(
                         f"unknown config key {key!r} for tool {name!r}"
                     )
                 bound = registry[name].config[key]
-                if type(value) is not int:
-                    raise ToolDeclarationError(
-                        f"config key {key!r} for tool {name!r} must be an integer, got {value!r}"
-                    )
-                if value < bound.minimum:
-                    raise ToolDeclarationError(
-                        f"config key {key!r} for tool {name!r} must be at least {bound.minimum}, got {value}"
-                    )
-                if value > bound.ceiling:
-                    raise ToolDeclarationError(
-                        f"config key {key!r} for tool {name!r} ceiling {bound.ceiling} exceeded by {value}"
-                    )
-                values[key] = value
+                if isinstance(bound, ToolListConfig):
+                    if not isinstance(value, list):
+                        raise ToolDeclarationError(
+                            f"config key {key!r} for tool {name!r} must be a list"
+                        )
+                    if len(value) > bound.max_items:
+                        raise ToolDeclarationError(
+                            f"config key {key!r} for tool {name!r} must have at most {bound.max_items} items"
+                        )
+                    for idx, item in enumerate(value):
+                        if not isinstance(item, str) or not bound.item_re.fullmatch(item):
+                            raise ToolDeclarationError(
+                                f"config key {key!r} for tool {name!r} item {idx} invalid: {item!r}"
+                            )
+                    values[key] = value
+                else:
+                    if type(value) is not int:
+                        raise ToolDeclarationError(
+                            f"config key {key!r} for tool {name!r} must be an integer, got {value!r}"
+                        )
+                    if value < bound.minimum:
+                        raise ToolDeclarationError(
+                            f"config key {key!r} for tool {name!r} must be at least {bound.minimum}, got {value}"
+                        )
+                    if value > bound.ceiling:
+                        raise ToolDeclarationError(
+                            f"config key {key!r} for tool {name!r} ceiling {bound.ceiling} exceeded by {value}"
+                        )
+                    values[key] = value
             selected[name] = registry[name]
             configured_values[name] = values
         filesystem_names = {"read_file", "write_file", "list_dir"}.intersection(selected)
@@ -556,9 +593,15 @@ def resolve_declared(
                 os.environ.get("YUGO_GITHUB_CREDENTIALS_FILE", "").strip()
                 or github_tools.DEFAULT_CREDENTIALS_FILE
             ).expanduser().resolve(strict=False)
+            raw_allowlist = configured_values["submit_review"].get("allowlist", [])
+            allowlist = frozenset(raw_allowlist)  # type: ignore[arg-type]
             selected["submit_review"] = replace(
                 selected["submit_review"],
-                handler=partial(_submit_review, credentials_path=github_creds_path),
+                handler=partial(
+                    _submit_review,
+                    credentials_path=github_creds_path,
+                    allowlist=allowlist,
+                ),
             )
         return selected
     finally:

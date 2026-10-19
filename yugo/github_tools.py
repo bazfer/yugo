@@ -5,18 +5,29 @@ and stays that way. This module owns GitHub review POST. It reads the token from
 the credentials file, builds its own fixed request, and never accepts a URL or
 HTTP method from the model.
 
-The three guards are documented on submit_review().
+The three guards are documented on submit_review(). Input validation fires
+before any network call — see _validate_inputs().
 """
 from __future__ import annotations
 
 import http.client
 import json
 import os
+import re
 import ssl
 from pathlib import Path
 from typing import Any, Callable
 
 import http_tools
+
+# Allowlist and path-segment safety. Repo path segments go directly into the
+# URL path: "/repos/{owner}/{repo}/pulls/{pr}". The model supplies them, so
+# unvalidated values can carry separators ("/"), traversal (".."), query ("?"),
+# or fragment ("#") — turning path control into partial URL control. Type hints
+# are not runtime checks and the schema enum for pr=integer is advisory.
+# Validation happens before any network call so the stub can assert no request
+# was made.
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$")
 
 GITHUB_HOST = "api.github.com"
 GITHUB_API_ORIGIN = http_tools.parse_authority(GITHUB_HOST)
@@ -34,6 +45,27 @@ class GitHubReviewError(Exception):
         self.code = code
         self.detail = detail
         super().__init__(f"{code}: {detail}" if detail else code)
+
+
+def _validate_inputs(repo: Any, pr: Any) -> int:
+    """Validate repo and pr before they touch a URL path.
+
+    Returns the validated pr as int. Raises GitHubReviewError so the refusal
+    is testable and the stub can assert no HTTP call was attempted.
+    """
+    if not isinstance(repo, str) or not _REPO_RE.fullmatch(repo):
+        raise GitHubReviewError(
+            "invalid_repo",
+            f"repo must be owner/name with alphanumeric, dot, hyphen, underscore "
+            f"(1-100 chars each); got {repo!r}",
+        )
+    try:
+        pr_int = int(pr)
+    except (TypeError, ValueError) as exc:
+        raise GitHubReviewError("invalid_pr", f"pr must be an integer; got {pr!r}") from exc
+    if pr_int <= 0:
+        raise GitHubReviewError("invalid_pr", f"pr must be positive; got {pr_int}")
+    return pr_int
 
 
 def _load_token(credentials_path: Path | None) -> str:
@@ -129,11 +161,18 @@ def submit_review(
     verdict: Any,
     *,
     credentials_path: Path | None = None,
+    allowlist: frozenset[str] | None = None,
     _conn_factory: Callable[[], Any] | None = None,
 ) -> str:
     """Submit a formal GitHub PR review.
 
     Never accepts a URL or HTTP method from the model — these are hardcoded.
+    Input validation fires before any network call (see _validate_inputs).
+
+    `allowlist`: when not None, only repos in the set are permitted. An empty
+    frozenset refuses all repos (fail-safe default when the grant omits the
+    allowlist). None disables the check (test convenience only — the binding
+    in resolve_declared always passes an explicit frozenset).
 
     Three guards (all required):
 
@@ -149,6 +188,16 @@ def submit_review(
     3. The reviewed SHA is written into the review body so the record is
        self-describing even if the guard is later disabled.
     """
+    # Input validation: reject malformed repo/pr before any network call
+    pr = _validate_inputs(repo, pr)
+
+    # Allowlist check: scope is set in the grant file, not here
+    if allowlist is not None and repo not in allowlist:
+        raise GitHubReviewError(
+            "repo_not_allowlisted",
+            f"repo {repo!r} not in the configured allowlist",
+        )
+
     # Guard 1: structured, non-empty verdict
     if not isinstance(verdict, dict):
         raise GitHubReviewError("verdict_not_structured", "verdict must be a mapping")

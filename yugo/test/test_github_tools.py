@@ -110,6 +110,99 @@ def _creds_file(tmp_path: Path, *, token: str = "ghp_test_token_x") -> Path:
     return p
 
 
+# --- P1: input validation fires before any network call ---
+# repo and pr go directly into the URL path. Path separators, traversal
+# components, query markers, and non-integer pr values are rejected here,
+# before either HTTP call, so the stub can assert no request was made.
+
+
+@pytest.mark.parametrize(
+    "bad_repo",
+    [
+        "o/r/../../x",     # path traversal via extra slash
+        "o/r?x=1",         # query string injection
+        "o/r#frag",        # fragment injection
+        "../etc/passwd",   # no slash in right place
+        "",                # empty
+        "o/" + "a" * 101,  # name too long
+    ],
+)
+def test_invalid_repo_raises_before_network(bad_repo: str, tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    calls: list = []
+
+    def factory():
+        calls.append("CALLED")
+        return _FakeConn([])
+
+    with pytest.raises(gh.GitHubReviewError, match="invalid_repo"):
+        gh.submit_review(
+            bad_repo, PR, HEAD, "approve", _VALID_VERDICT,
+            credentials_path=creds, _conn_factory=factory,
+        )
+    assert calls == [], "no HTTP call must happen before input validation"
+
+
+@pytest.mark.parametrize(
+    "bad_pr",
+    [
+        "1/merge",   # path segment injection
+        "abc",       # non-integer string
+        0,           # non-positive
+        -5,          # negative
+    ],
+)
+def test_invalid_pr_raises_before_network(bad_pr: Any, tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    calls: list = []
+
+    def factory():
+        calls.append("CALLED")
+        return _FakeConn([])
+
+    with pytest.raises(gh.GitHubReviewError, match="invalid_pr"):
+        gh.submit_review(
+            REPO, bad_pr, HEAD, "approve", _VALID_VERDICT,
+            credentials_path=creds, _conn_factory=factory,
+        )
+    assert calls == [], "no HTTP call must happen before input validation"
+
+
+# --- P2: allowlist — scope is set in the grant file ---
+
+
+def test_repo_not_in_allowlist_raises(tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    allowlist = frozenset({"bazfer/other-repo"})
+    with pytest.raises(gh.GitHubReviewError, match="repo_not_allowlisted"):
+        gh.submit_review(
+            REPO, PR, HEAD, "approve", _VALID_VERDICT,
+            credentials_path=creds, allowlist=allowlist,
+        )
+
+
+def test_repo_in_allowlist_proceeds(tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    allowlist = frozenset({REPO})
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    result = gh.submit_review(
+        REPO, PR, HEAD, "approve", _VALID_VERDICT,
+        credentials_path=creds, allowlist=allowlist, _conn_factory=factory,
+    )
+    assert "APPROVE" in result
+    assert len(factory.conns) == 2
+
+
+def test_empty_allowlist_refuses_all(tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="repo_not_allowlisted"):
+        gh.submit_review(
+            REPO, PR, HEAD, "approve", _VALID_VERDICT,
+            credentials_path=creds, allowlist=frozenset(),
+        )
+
+
 # --- guard 1: structured verdict ---
 
 
