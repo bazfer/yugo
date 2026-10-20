@@ -6,9 +6,9 @@ import {
   type Msg,
   type Subscription,
 } from 'nats'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { accessSync, appendFileSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { Database } from 'bun:sqlite'
 import { readMonotonicMs, checkedDeadline } from './monotonic-clock.ts'
 import { openVerifiedStore, readBootId, validBootId, VerificationError } from './dedup-verification.ts'
@@ -501,8 +501,8 @@ export function normalizeAllowlist(values: Iterable<unknown>): Set<string> {
   return result
 }
 
-export function loadFleetManifestAllowlist(path: string): Set<string> {
-  const manifest = parseYaml(readFileSync(path, 'utf8')) as unknown
+export function parseFleetManifestAllowlist(content: string): Set<string> {
+  const manifest = parseYaml(content) as unknown
   if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
     throw new TypeError('Fleet manifest must be a YAML mapping')
   }
@@ -511,6 +511,105 @@ export function loadFleetManifestAllowlist(path: string): Set<string> {
     throw new TypeError('Fleet manifest bot_names must be a non-empty list')
   }
   return normalizeAllowlist(botNames)
+}
+
+export function loadFleetManifestAllowlist(path: string): Set<string> {
+  return parseFleetManifestAllowlist(readFileSync(path, 'utf8'))
+}
+
+/** Minimum ms between manifest re-reads on the admission path.
+ * Bounds syscalls when a peer hammers the rejection path; not a correctness gate. */
+const CHECK_INTERVAL_MS = 1000
+
+/** Mutable snapshot with audited, last-good reloads. On every admission, a time
+ * throttle caps how often the file is read. When the interval has elapsed, the file
+ * is read and its SHA-256 digest compared against the loaded digest. The digest is
+ * the sole reload gate — any content change triggers a reload regardless of mtime.
+ *
+ * WIDENING (adding a bot): takes effect within one CHECK_INTERVAL_MS of the change.
+ *
+ * NARROWING NOT GUARANTEED: removing a bot is NOT guaranteed to take effect without
+ * a restart. A read or parse failure retains the last-good (wider) allowlist, so a
+ * broken manifest keeps the wider list until the file is repaired AND the interval
+ * elapses. To revoke trust reliably, restart the session — revocation is a deployment
+ * action, not a file edit. */
+export class FleetManifestAllowlist extends Set<string> {
+  readonly manifestPath: string
+  loadedMtimeMs: number | null = null
+  loadedDigest: string | null = null
+  private lastCheckMs = 0
+  private lastFailureSignature: string | null = null
+
+  constructor(
+    path: string,
+    private readonly auditLogPath: string,
+    private readonly logger?: (message: string) => void,
+    private readonly checkIntervalMs = CHECK_INTERVAL_MS,
+  ) {
+    super()
+    this.manifestPath = resolve(path)
+    try {
+      const bytes = readFileSync(this.manifestPath)
+      this.reload(bytes)
+    } catch (error) {
+      this.audit({ reason: 'fleet_manifest_load_failed', error: String(error), manifest_names: [] })
+      throw error
+    }
+  }
+
+  private audit(entry: Record<string, unknown>): void {
+    mkdirSync(dirname(this.auditLogPath), { recursive: true, mode: 0o700 })
+    appendFileSync(this.auditLogPath, JSON.stringify({
+      ts: new Date().toISOString(), manifest_path: this.manifestPath,
+      manifest_mtime_ms: this.loadedMtimeMs, ...entry,
+    }) + '\n', { encoding: 'utf8', mode: 0o600 })
+  }
+
+  private reload(bytes: Buffer): void {
+    const digest = createHash('sha256').update(bytes).digest('hex')
+    const names = parseFleetManifestAllowlist(bytes.toString('utf8'))
+    let mtimeMs: number | null = null
+    try { mtimeMs = statSync(this.manifestPath).mtimeMs } catch {}
+    this.audit({ reason: 'fleet_manifest_loaded', manifest_digest: digest, manifest_mtime_ms: mtimeMs, manifest_names: [...names].sort() })
+    this.clear()
+    for (const name of names) this.add(name)
+    this.loadedMtimeMs = mtimeMs
+    this.loadedDigest = digest
+    this.lastFailureSignature = null  // clear so first failure after recovery is audited
+  }
+
+  refresh(): void {
+    const now = Date.now()
+    // Time throttle: bounds syscalls on the admission path. Not a correctness gate.
+    if (now - this.lastCheckMs < this.checkIntervalMs) return
+    this.lastCheckMs = now
+    try {
+      const bytes = readFileSync(this.manifestPath)
+      const digest = createHash('sha256').update(bytes).digest('hex')
+      // Digest is the only gate. Same bytes = no reload, regardless of mtime.
+      if (digest === this.loadedDigest) {
+        // Content unchanged: genuine no-op recovery. The file is reachable and valid —
+        // clear stale failure signature so a subsequent failure is treated as new.
+        // Also update loadedMtimeMs for diagnostic accuracy (file may have been
+        // restored with a different mtime). Not a gate — diagnostics only.
+        this.lastFailureSignature = null
+        try { this.loadedMtimeMs = statSync(this.manifestPath).mtimeMs } catch {}
+        return
+      }
+      this.reload(bytes)  // also clears lastFailureSignature on success
+    } catch (error) {
+      // Failed snapshots never replace the last good names or loaded mtime.
+      // Audit only when the failure state changes — repeated identical errors are noise.
+      const sig = error instanceof Error ? `${error.constructor.name}:${error.message}` : String(error)
+      if (sig !== this.lastFailureSignature) {
+        this.lastFailureSignature = sig
+        try {
+          this.audit({ reason: 'fleet_manifest_reload_failed',
+            manifest_names: [...this].sort(), error: String(error) })
+        } catch (auditError) { this.logger?.('Manifest audit failed: ' + String(auditError)) }
+      }
+    }
+  }
 }
 
 export function createHeartbeatEnvelope(
@@ -1356,9 +1455,9 @@ export class FleetBus {
       payload: options.payload,
       ...baton,
     }
-    const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+    const validation = this.validateWithManifest(envelope)
     if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason: validation.error, envelope_id: envelopeId })
+      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId })
       return { ok: false, error: validation.error, envelope }
     }
     const subject = `fleet.${canonicalTo}.request`
@@ -1509,12 +1608,12 @@ export class FleetBus {
       payload,
       ...baton,
     }
-    const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+    const validation = this.validateWithManifest(envelope)
     if (!validation.ok) {
       // `subject` from main's reply-lane migration (#20): replies now go on
       // the REQUEST lane, so the audit subject is computed rather than
       // hardcoded to `.result`.
-      this.recordAudit({ dir: 'drop', subject, reason: validation.error, envelope_id: envelopeId })
+      this.recordAudit({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId })
       abandonOwn(validation.error)
       return { ok: false, error: validation.error, req_id: reqId, envelope }
     }
@@ -1709,13 +1808,9 @@ export class FleetBus {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
       return
     }
-    const validation = validateEnvelope(
-      decoded,
-      this.allowedFromClaims,
-      this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
-    )
+    const validation = this.validateWithManifest(decoded)
     if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject, reason: validation.error })
+      this.recordAudit({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, decoded) })
       return
     }
     const envelope = validation.envelope
@@ -2192,6 +2287,19 @@ export class FleetBus {
       return
     }
     await this.config.injectIntoSession(event)
+  }
+
+  private validateWithManifest(value: unknown): ReturnType<typeof validateEnvelope> {
+    if (this.allowedFromClaims instanceof FleetManifestAllowlist) this.allowedFromClaims.refresh()
+    return validateEnvelope(value, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+  }
+
+  private rejectedClaimDetails(reason: string, value: unknown): Record<string, unknown> {
+    if (reason !== 'from_claim_rejected') return {}
+    const claim = typeof value === 'object' && value !== null ? (value as Record<string, unknown>).from : undefined
+    const manifest = this.allowedFromClaims instanceof FleetManifestAllowlist ? this.allowedFromClaims : undefined
+    return { rejected_claim: normalizeBotName(claim), manifest_path: manifest?.manifestPath ?? null,
+      manifest_mtime_ms: manifest?.loadedMtimeMs ?? null, manifest_digest: manifest?.loadedDigest ?? null }
   }
 
   private recordAudit(entry: Record<string, unknown>): void {

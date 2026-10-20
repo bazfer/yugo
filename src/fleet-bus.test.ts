@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -15,6 +15,7 @@ import {
   DurableEnvelopeDedupStore as VerifiedDedupStore,
   FixedWindowBucket,
   FleetBus,
+  FleetManifestAllowlist,
   RESERVED_BOT_NAMES,
   buildFleetBusFrame,
   buildFleetBusFrameMeta,
@@ -3406,4 +3407,211 @@ describe('NATS authorization boundary', () => {
       await Promise.all([consoleClient.close(), luna.close()])
     }
   })
+})
+
+
+describe('audited manifest reload (#76)', () => {
+  test('same bus rejects, adds and removes a sender, with loaded snapshot diagnostics', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'manifest-reload-'))
+    const path = join(dir, 'manifest.yaml')
+    const auditLogPath = join(dir, 'audit.jsonl')
+    let tick = 1000
+    const write = (names: string[]) => {
+      writeFileSync(path, 'bot_names: ' + JSON.stringify(names))
+      utimesSync(path, ++tick, tick)
+    }
+    write(['vec'])
+    const allowed = new FleetManifestAllowlist(path, auditLogPath, undefined, 0)
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({ botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      auditLogPath, injectIntoSession: async event => { events.push(event) } }, allowed)
+    const reply = { envelope_version: 1, id: 'reload-reply', from: 'ION', to: 'vec',
+      kind: 'result', in_reply_to: 'unknown', ts: '2026-10-20T00:00:00Z', payload: {} }
+    await bus.handleRequest(reply)
+    expect(events).toHaveLength(0)
+    expect(readAudit(auditLogPath).find(e => e.reason === 'from_claim_rejected')).toMatchObject({
+      rejected_claim: 'ion', manifest_path: path, manifest_mtime_ms: tick * 1000,
+    })
+    write(['vec', 'ion'])
+    await bus.handleRequest(reply)
+    expect(events).toHaveLength(1)
+    write(['vec'])
+    await bus.handleResult({ ...reply, id: 'removed-reply' })
+    expect(events).toHaveLength(1)
+    const lines = readAudit(auditLogPath)
+    expect(lines.filter(e => e.reason === 'from_claim_rejected')).toHaveLength(2)
+    expect(lines.filter(e => e.reason === 'fleet_manifest_loaded').map(e => e.manifest_names))
+      .toEqual([['vec'], ['ion', 'vec'], ['vec']])
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('changed digest reloads on any mtime; malformed and missing files retain last good trust', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'manifest-failure-'))
+    const path = join(dir, 'manifest.yaml')
+    const log = join(dir, 'audit.jsonl')
+    writeFileSync(path, 'bot_names: [vec]')
+    utimesSync(path, 1000, 1000)
+    // checkIntervalMs=0: disable throttle so rapid refresh() calls proceed immediately.
+    const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+    // Different content with same mtime → digest changed → reloads (mtime irrelevant).
+    writeFileSync(path, 'bot_names: [vec, ion]')
+    utimesSync(path, 1000, 1000)
+    allowed.refresh()
+    expect([...allowed].sort()).toEqual(['ion', 'vec'])
+    expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_loaded')).toHaveLength(2)
+    writeFileSync(path, 'bot_names: [')
+    utimesSync(path, 1001, 1001)
+    allowed.refresh()
+    expect([...allowed].sort()).toEqual(['ion', 'vec'])
+    const mtimeAfterLoad = allowed.loadedMtimeMs
+    expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+    rmSync(path)
+    allowed.refresh()
+    expect([...allowed].sort()).toEqual(['ion', 'vec'])
+    expect(allowed.loadedMtimeMs).toBe(mtimeAfterLoad)
+    expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(2)
+    expect(allowed.has('ion')).toBe(true)
+    rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+
+// Repeated failures with the same error must audit once, not once per refresh.
+// A deleted manifest at the default 1-second throttle would produce ~86,000 audit
+// lines per day — unbounded growth from a condition nobody is watching. The fix:
+// track lastFailureSignature and write a new audit line only when the error changes.
+// A different error (e.g. ENOENT → YAML parse error) IS new information and IS audited.
+// Recovery audits via the existing fleet_manifest_loaded line, which clears the signature.
+test('persistent failure audits once; state change re-audits; recovery audits (P2 fix)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-dedup-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  writeFileSync(path, 'bot_names: [vec]')
+  utimesSync(path, 1000, 1000)
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+
+  // Same error repeated: only the first refresh audits.
+  rmSync(path)
+  allowed.refresh()
+  allowed.refresh()
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+  expect([...allowed]).toEqual(['vec'])
+
+  // Different error: new information — audited again.
+  writeFileSync(path, 'not_a_mapping')  // valid YAML scalar, not a mapping → TypeError
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(2)
+
+  // Recovery: reload succeeds → fleet_manifest_loaded emitted; next failure would re-audit.
+  writeFileSync(path, 'bot_names: [vec, ion]')
+  utimesSync(path, 1002, 1002)
+  allowed.refresh()
+  expect([...allowed].sort()).toEqual(['ion', 'vec'])
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_loaded')).toHaveLength(2)  // initial + recovery
+
+  rmSync(dir, { recursive: true, force: true })
+})
+
+// REGRESSION: clearing lastFailureSignature on any successful READ (not only on a
+// digest-match) reintroduces the P2 spam for the malformed-but-readable case.
+// A readable-but-malformed file succeeds the readFileSync but fails the parse. If the
+// clear runs before the parse, each interval: read → clear → parse fails → sig != null
+// → audit. Repeat forever. The clear must live inside the digest-match branch only.
+test('malformed-but-readable manifest: repeated refresh audits once, not once per call', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-malformed-repeat-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  writeFileSync(path, 'bot_names: [vec]')
+  utimesSync(path, 1000, 1000)
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+  writeFileSync(path, 'bot_names: [')     // readable, not parseable
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  allowed.refresh()
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+  expect([...allowed]).toEqual(['vec'])
+  rmSync(dir, { recursive: true, force: true })
+})
+
+// A successful read (even a no-op digest match) clears lastFailureSignature.
+// Without this, a file that: fails, is "repaired" to byte-identical content (digest match,
+// no reload), then fails again with the same error, would silently skip the third audit.
+// This test proves that the no-op path clears the signature so the re-failure is audited.
+test('successful read after failure clears signature; re-failure after no-op read audits again', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-sig-clear-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  const content = 'bot_names: [vec]'
+  writeFileSync(path, content)
+  utimesSync(path, 1000, 1000)
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+
+  // Fail: file removed → lastFailureSignature = ENOENT sig.
+  rmSync(path)
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+
+  // "Repair" to byte-identical content → digest match → no reload, but signature cleared.
+  writeFileSync(path, content)
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect([...allowed]).toEqual(['vec'])  // no reload, allowlist unchanged
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_loaded')).toHaveLength(1)  // still only initial
+
+  // Same failure again → signature was cleared by the successful read → re-audited.
+  rmSync(path)
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(2)
+
+  rmSync(dir, { recursive: true, force: true })
+})
+
+// DOCUMENTED LIMIT: byte-identical content does not reload even when mtime advances.
+// This is a no-op by definition — the allowlist has not changed. The digest gate is
+// what stops the reload; mtime plays no role in this decision.
+//
+// COROLLARY: narrowing is NOT guaranteed in a single file-edit operation. To revoke
+// trust reliably, restart the session. This test exists so nobody reads the absence of
+// a reload as a bug, and nobody removes the digest check thinking it is dead code.
+test('byte-identical content with updated mtime: digest gate, no reload (same-content is a no-op)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-digest-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  const content = 'bot_names: [vec, ion]'
+  writeFileSync(path, content)
+  utimesSync(path, 1000, 1000)
+  // checkIntervalMs=0: disable throttle so refresh() proceeds immediately.
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+  // Mtime advances — file is read. Digest is identical → digest gate stops the reload.
+  writeFileSync(path, content)
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect([...allowed].sort()).toEqual(['ion', 'vec'])
+  // Only the initial load — no reload event.
+  const audit = readAudit(log)
+  expect(audit).toHaveLength(1)
+  expect(audit[0].reason).toBe('fleet_manifest_loaded')
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test('an unauditable widening is not installed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-audit-fail-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  writeFileSync(path, 'bot_names: [vec]')
+  utimesSync(path, 1000, 1000)
+  const errors: string[] = []
+  const allowed = new FleetManifestAllowlist(path, log, error => errors.push(error), 0)
+  rmSync(log)
+  mkdirSync(log) // deterministic audit failure even as root
+  writeFileSync(path, 'bot_names: [vec, ion]')
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect([...allowed]).toEqual(['vec'])
+  expect(allowed.loadedMtimeMs).toBe(1000000)
+  expect(errors).toHaveLength(1)
+  rmSync(dir, { recursive: true, force: true })
 })
