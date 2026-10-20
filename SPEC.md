@@ -169,7 +169,13 @@ cannot resolve.** Yugo answers on `.request`, the caller listens on `.result`,
 and the exchange ends in a timeout indistinguishable from an unresponsive bot.
 Replies sent *to* yugo on `.result` are subscribed but deliberately not injected.
 
-Nothing is broken in production only because yugo is not deployed to a fleet bot.
+The hazard is live: Ion and Chis are deployed yugo bots on the fleet bus.
+At 2026-10-20T14:38:55Z, Ion received Deet's envelope
+`fde33e38-0611-44d1-b6bb-8ff0ac522c96` on `fleet.ion.request` and replied on
+`fleet.deet.request` with that id in `in_reply_to`. Deet's
+`bus_request(wait: true)` listened on `fleet.deet.result` and timed out after
+90 seconds, indistinguishably from a dead bot. Phase 1 below makes the
+TypeScript adapter receive and correlate on both lanes; publication stays unchanged.
 
 ### 6.2.1 — The migration cannot be "one adapter per PR, in any order"
 
