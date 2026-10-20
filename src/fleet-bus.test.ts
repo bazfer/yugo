@@ -2206,12 +2206,14 @@ describe('onResult inject path', () => {
   // null for: not-a-canonical string, empty string, and the reserved
   // `broadcast` name. Each one MUST audit misrouted_reply and MUST NOT resolve
   // the outstanding waiter, even though there is a matching ledger entry.
+  for (const lane of ['handleRequest', 'handleResult'] as const) {
   for (const [label, badTo] of [
+    ['different bot', 'ohm'],
     ['dotted non-canonical string', 'not.a.bot'],
     ['empty string', ''],
     ['reserved broadcast name', 'broadcast'],
   ] as const) {
-    test(`invalid recipient (${label}) with ledger match audits misrouted_reply and does NOT resolve waiter`, async () => {
+    test(`${lane}: invalid recipient (${label}) with ledger match audits misrouted_reply and does NOT resolve waiter`, async () => {
       const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
       const auditLogPath = join(dir, 'fleet-bus.jsonl')
       const nc = new FakeNatsConnection()
@@ -2237,7 +2239,7 @@ describe('onResult inject path', () => {
         kind: 'result', in_reply_to: publishedEnv.id,
         ts: '2026-08-27T00:00:00.000Z', payload: {},
       }
-      await bus.handleResult(reply)
+      await bus[lane](reply)
       // Waiter MUST NOT resolve.
       await Promise.resolve()
       expect(resolved).toBe(false)
@@ -2245,6 +2247,9 @@ describe('onResult inject path', () => {
       expect(events).toHaveLength(0)
       // Audit MUST tag misrouted_reply.
       expect(readAudit(auditLogPath).some(e => e.reason === 'claude_discord_adapter_misrouted_reply')).toBe(true)
+      await bus[lane]({ ...reply, to: 'vec' })
+      expect((await promise).reply?.id).toBe(reply.id)
+      expect(events).toHaveLength(0)
     })
   }
 
@@ -2253,7 +2258,7 @@ describe('onResult inject path', () => {
   // recipient" into the same drop branch (e.g. by dropping any `to != self`),
   // this test fails — a legitimate broadcast reply MUST still resolve a
   // matching ledger waiter.
-  test('broadcast reply (to: null) with ledger match resolves the waiter', async () => {
+  test(`${lane}: broadcast reply (to: null) with ledger match resolves the waiter`, async () => {
     const nc = new FakeNatsConnection()
     const bus = new TestFleetBus({
       botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
@@ -2270,11 +2275,13 @@ describe('onResult inject path', () => {
       kind: 'result', in_reply_to: publishedEnv.id,
       ts: '2026-08-27T00:00:00.000Z', payload: {},
     }
-    await bus.handleResult(reply)
+    await bus[lane](reply)
     const outcome = await promise
     expect(outcome.ok).toBe(true)
     if (outcome.ok) expect(outcome.reply?.id).toBe('r-p1-broadcast')
   })
+
+  }
 
   test('from mismatch audits reply_from_mismatch, injects as unsolicited, does not resolve waiter', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))

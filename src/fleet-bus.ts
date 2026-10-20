@@ -1687,6 +1687,16 @@ export class FleetBus {
   }
 
   protected async onRequest(message: Msg): Promise<void> {
+    await this.onInbound(message, false)
+  }
+
+  protected async onResult(message: Msg): Promise<void> {
+    await this.onInbound(message, true)
+  }
+
+  // Expand only: both lanes share validation, budgets and reply correlation.
+  // Publication and the result subscription remain unchanged until later phases.
+  private async onInbound(message: Msg, resultLane: boolean): Promise<void> {
     const subject = message.subject
     if (!this.rateLimiters.perSubject.allow(subject)) {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_rate_limited_per_subject' })
@@ -1699,146 +1709,54 @@ export class FleetBus {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
       return
     }
-    const result = validateEnvelope(
+    const validation = validateEnvelope(
       decoded,
       this.allowedFromClaims,
       this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
     )
-    if (!result.ok) {
-      this.recordAudit({ dir: 'drop', subject, reason: result.error })
+    if (!validation.ok) {
+      this.recordAudit({ dir: 'drop', subject, reason: validation.error })
       return
     }
-    if (normalizeBotName(result.envelope.to) !== normalizeBotName(this.config.botName)) {
-      this.recordAudit({
-        dir: 'drop',
-        subject,
-        reason: 'recipient_mismatch',
-        envelope_id: result.envelope.id,
-      })
+    const envelope = validation.envelope
+    const canonicalBot = normalizeBotName(this.config.botName)
+    // Preserve the raw-null distinction (Ohm round-7 P1). A legitimate
+    // broadcast reply has `to == null` (loose equality: null or undefined) and
+    // is allowed through. Any *present* non-null recipient MUST canonicalize to
+    // this bot; otherwise it is either misrouted or an invalid recipient
+    // string, both of which drop as misrouted_reply. Do NOT collapse null and
+    // an invalid `normalizeBotName()` return into the same "recipient absent"
+    // branch — that lets `.result` frames with `to: "not.a.bot"` slip past the
+    // gate and resolve waiters in the outbound ledger.
+    const isReply = resultLane || envelope.in_reply_to !== undefined
+    if (!isReply && normalizeBotName(envelope.to) !== canonicalBot) {
+      this.recordAudit({ dir: 'drop', subject, reason: 'recipient_mismatch', envelope_id: envelope.id })
       return
     }
-    if (!this.rateLimiters.perFrom.allow(result.envelope.from)) {
+    if (isReply && envelope.to != null) {
+      const canonicalTo = normalizeBotName(envelope.to)
+      if (canonicalTo !== canonicalBot) {
+        this.recordAudit({
+          dir: 'drop',
+          subject,
+          reason: 'claude_discord_adapter_misrouted_reply',
+          envelope_id: envelope.id,
+        })
+        return
+      }
+    }
+    if (!this.rateLimiters.perFrom.allow(envelope.from)) {
       this.recordAudit({
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_rate_limited_per_from',
-        envelope_id: result.envelope.id,
+        envelope_id: envelope.id,
       })
       return
     }
 
-    // Expand-phase correlation: migrated peers may send a reply on the
-    // request lane before publication flips away from `.result`. Correlation
-    // is subject-independent, so consult the existing outbound waiter ledger.
-    // Use the result-envelope dedup ledger as well: the same reply can arrive
-    // on both lanes during migration and must resolve exactly once.
-    const inReplyTo = result.envelope.in_reply_to
-    if (inReplyTo !== undefined) {
-      const seenResult = this.freshSeen(this.seenResultEnvelopes, result.envelope.id)
-      if (seenResult !== undefined) {
-        this.recordAudit({
-          dir: 'drop',
-          subject,
-          reason: 'claude_discord_adapter_duplicate_result_envelope',
-          envelope_id: result.envelope.id,
-          req_id: seenResult.reqId,
-        })
-        return
-      }
-
-      const match = this.outboundLedger.get(inReplyTo)
-      if (match !== undefined) {
-        if (result.envelope.from === match.expectedFrom) {
-          const claim = this.claimDedup(subject, result.envelope.id, match.reqId)
-          if (claim === undefined) return
-          if (claim.duplicate) {
-            this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
-            return
-          }
-          const owner = claim.owner!
-          clearTimeout(match.timerId)
-          this.outboundLedger.delete(inReplyTo)
-          this.seenResultEnvelopes.set(result.envelope.id, { reqId: match.reqId, ts: Date.now() })
-          this.recordAudit({
-            dir: 'in', subject, envelope_id: result.envelope.id,
-            req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
-          })
-          match.resolve({
-            ok: true,
-            envelope: match.envelope,
-            delivered_to_subscriber: true,
-            reply: result.envelope,
-          })
-          this.completeClaim(subject, result.envelope.id, claim.reqId, owner)
-          return
-        }
-        // A matching id is not sufficient: only the addressed bot may answer
-        // the waiter. Do NOT resolve it — audit, then fall through to the
-        // unsolicited routing below.
-        //
-        // `onResult` calls `injectUnsolicited` explicitly here. This lane does
-        // not need to: falling through reaches the same call one block down.
-        // An explicit call here was written first and removed after mutation
-        // testing could not kill it.
-        //
-        // Note the fall-through's `evictedLedger` lookup is a NO-OP on this
-        // branch, and the first version of this comment wrongly claimed it as a
-        // benefit. An id cannot be in `outboundLedger` and `evictedLedger` at
-        // once — both writers remove it from the former first — and we only
-        // reach here with `match !== undefined`. So `lateReplyEnvId` is always
-        // `undefined` here, which is correct: an anti-hijack frame is not a
-        // late reply to anything.
-        this.recordAudit({
-          dir: 'drop',
-          subject,
-          reason: 'claude_discord_adapter_reply_from_mismatch',
-          envelope_id: result.envelope.id,
-          req_id: match.reqId,
-          expected_from: match.expectedFrom,
-        })
-      }
-
-      // NO LEDGER MATCH, BUT THIS IS A REPLY (issue #39).
-      //
-      // Until now this fell through to the fresh-turn path below, which claims
-      // the envelope and holds that claim open waiting for an answer THAT IS
-      // NEVER OWED — the frame is itself an answer. `onResult` has always done
-      // the opposite with the identical case, so the two lanes disagreed about
-      // what an unmatched reply is.
-      //
-      // The claim leak that produced is not theoretical. Measured 2026-09-25 on
-      // this bot: of 51 pending claims that never settled, 37 carried
-      // `origin=deet` at hops 1 or 3 — replies to our own requests — and 6 more
-      // predated baton fields with reply-shaped payloads. Roughly 84%. Only 8
-      // were genuine unanswered requests.
-      //
-      // It reaches here whenever no waiter is registered: a `wait:false`
-      // request (the common case — the whole audit log holds 7
-      // `request_timeout` drops, so almost every request is fire-and-forget),
-      // or a reply arriving after its waiter timed out.
-      //
-      // `injectUnsolicited` settles at inject time, which is correct precisely
-      // because no reply is owed. The model still sees the frame, and can even
-      // answer it — `publishReply` permits a null-token reply against a reqId
-      // with no pending claim.
-      //
-      // BUT NOTE WHAT THIS DOES TO THE SETTLE-POINT ARGUMENT BELOW. The long
-      // comment at the SETTLE POINT explains why `onRequest` defers its settle
-      // to `publishReply`: an inject-time settle stamps a durable tombstone for
-      // a turn whose answer might never ship, and that tombstone outlives a
-      // restart. This block routes ~84% of request-lane traffic to the
-      // inject-time settle instead, so that trade now applies to the majority
-      // of this lane, not a corner of it.
-      //
-      // The trade is accepted here and it is the same one `.result` already
-      // made (yugo#27): a crash between inject and consumption loses the frame
-      // for the full TTL, because a completed row deduplicates a retry. What it
-      // buys is the end of a claim — and a renewal timer — that otherwise lived
-      // for the life of the process, since nothing on the leaked path ever
-      // called `stopRenewing`.
-      const lateReplyEnvId = this.evictedLedger.has(inReplyTo) ? inReplyTo : undefined
-      if (lateReplyEnvId !== undefined) this.evictedLedger.delete(lateReplyEnvId)
-      await this.injectUnsolicited(subject, result.envelope, lateReplyEnvId)
+    if (isReply) {
+      await this.correlateReply(subject, envelope)
       return
     }
     // Envelope-id dedup (round-8 P2, class-widened from onResult). Peers can
@@ -1848,13 +1766,13 @@ export class FleetBus {
     // turn. Separate ledger from seenResultEnvelopes so a peer with the same
     // wire id on both subjects (protocol violation, but possible) can't
     // silently swallow one side.
-    const seenRequest = this.freshSeen(this.seenRequestEnvelopes, result.envelope.id)
+    const seenRequest = this.freshSeen(this.seenRequestEnvelopes, envelope.id)
     if (seenRequest !== undefined) {
       this.recordAudit({
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_duplicate_request_envelope',
-        envelope_id: result.envelope.id,
+        envelope_id: envelope.id,
         req_id: seenRequest.reqId,
       })
       return
@@ -1864,13 +1782,13 @@ export class FleetBus {
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_rate_limited_per_session_inject',
-        envelope_id: result.envelope.id,
+        envelope_id: envelope.id,
       })
       return
     }
 
     let reqId = randomBytes(16).toString('hex')
-    const claim = this.claimDedup(subject, result.envelope.id, reqId)
+    const claim = this.claimDedup(subject, envelope.id, reqId)
     if (claim === undefined) return
     if (claim.duplicate) {
       // The REQUEST-specific code, matching the in-memory gate above. Now that
@@ -1878,19 +1796,19 @@ export class FleetBus {
       // reaches the durable store instead of that ledger — the suppression is
       // strictly stronger, and the audit line must not change meaning just
       // because the layer that caught it did.
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_request_envelope', envelope_id: result.envelope.id, req_id: claim.reqId })
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_request_envelope', envelope_id: envelope.id, req_id: claim.reqId })
       return
     }
     reqId = claim.reqId
-    this.receiveLedger.set(reqId, result.envelope)
+    this.receiveLedger.set(reqId, envelope)
     // Single dir:in audit per received envelope (dedup fix, round-3 P2).
-    this.recordAudit({ dir: 'in', subject, envelope_id: result.envelope.id, req_id: reqId })
+    this.recordAudit({ dir: 'in', subject, envelope_id: envelope.id, req_id: reqId })
     // Hold the lease for as long as the turn actually runs. Without this a
     // turn longer than the lease is handed to a second consumer WHILE THE
     // FIRST IS STILL EXECUTING — the one duplication window that is closable
     // at this boundary. The post-effect/pre-commit window is not closable
     // here; it is documented as at-least-once (SPEC, and yugo#24).
-    const stopRenewing = this.renewWhileRunning(subject, result.envelope.id, claim.reqId, claim.owner!)
+    const stopRenewing = this.renewWhileRunning(subject, envelope.id, claim.reqId, claim.owner!)
     try {
       // REGISTER BEFORE AWAITING. `injectIntoSession` is an unbounded
       // `Promise<void>` and nothing stops the session replying, or a
@@ -1908,7 +1826,7 @@ export class FleetBus {
       // the eviction hook and the failure path below all stop it.
       const replyToken = randomUUID()
       const pendingClaim: PendingReplyClaim = {
-        envelopeId: result.envelope.id,
+        envelopeId: envelope.id,
         owner: claim.owner!,
         subject,
         stopRenewing,
@@ -1921,7 +1839,7 @@ export class FleetBus {
       // milliseconds; the turn, and the hang worth bounding, happen after it.
       this.armClaimDeadline(reqId, pendingClaim)
       try {
-        await this.injectIntoSession({ envelope: result.envelope, reqId, replyToken })
+        await this.injectIntoSession({ envelope: envelope, reqId, replyToken })
       } catch (error) {
         // Record the failure ON THE CAPTURED OBJECT, not by reqId. After a
         // takeover the key may belong to a REPLACEMENT owner, and a stale
@@ -1966,7 +1884,7 @@ export class FleetBus {
       // takeover is someone else's. `stopRenewing` is this turn's own closure
       // and is idempotent.
       stopRenewing()
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: result.envelope.id, req_id: reqId, error: String(error) })
+      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
       return
     }
   }
@@ -2026,60 +1944,7 @@ export class FleetBus {
     return () => clearInterval(timer)
   }
 
-  protected async onResult(message: Msg): Promise<void> {
-    const subject = message.subject
-    if (!this.rateLimiters.perSubject.allow(subject)) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_rate_limited_per_subject' })
-      return
-    }
-    let decoded: unknown
-    try {
-      decoded = this.codec.decode(message.data)
-    } catch {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
-      return
-    }
-    const validation = validateEnvelope(
-      decoded,
-      this.allowedFromClaims,
-      this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
-    )
-    if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject, reason: validation.error })
-      return
-    }
-    const envelope = validation.envelope
-    const canonicalBot = normalizeBotName(this.config.botName)
-    // Preserve the raw-null distinction (Ohm round-7 P1). A legitimate
-    // broadcast reply has `to == null` (loose equality: null or undefined) and
-    // is allowed through. Any *present* non-null recipient MUST canonicalize to
-    // this bot; otherwise it is either misrouted or an invalid recipient
-    // string, both of which drop as misrouted_reply. Do NOT collapse null and
-    // an invalid `normalizeBotName()` return into the same "recipient absent"
-    // branch — that lets `.result` frames with `to: "not.a.bot"` slip past the
-    // gate and resolve waiters in the outbound ledger.
-    if (envelope.to != null) {
-      const canonicalTo = normalizeBotName(envelope.to)
-      if (canonicalTo !== canonicalBot) {
-        this.recordAudit({
-          dir: 'drop',
-          subject,
-          reason: 'claude_discord_adapter_misrouted_reply',
-          envelope_id: envelope.id,
-        })
-        return
-      }
-    }
-    if (!this.rateLimiters.perFrom.allow(envelope.from)) {
-      this.recordAudit({
-        dir: 'drop',
-        subject,
-        reason: 'claude_discord_adapter_rate_limited_per_from',
-        envelope_id: envelope.id,
-      })
-      return
-    }
-
+  private async correlateReply(subject: string, envelope: Envelope): Promise<void> {
     // Envelope-id dedup (round-8 P2): peers can retry a `.result` for many
     // reasons (transport re-send, publisher restart). Without this gate, the
     // first copy resolves the waiter + drops out of the inflight ledger, then
