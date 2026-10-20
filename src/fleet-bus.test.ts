@@ -3421,7 +3421,7 @@ describe('audited manifest reload (#76)', () => {
       utimesSync(path, ++tick, tick)
     }
     write(['vec'])
-    const allowed = new FleetManifestAllowlist(path, auditLogPath)
+    const allowed = new FleetManifestAllowlist(path, auditLogPath, undefined, 0)
     const events: FleetBusSessionEvent[] = []
     const bus = new TestFleetBus({ botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
       auditLogPath, injectIntoSession: async event => { events.push(event) } }, allowed)
@@ -3445,40 +3445,40 @@ describe('audited manifest reload (#76)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  test('mtime pre-check skips same-mtime reads; malformed and missing files retain last good trust', () => {
+  test('changed digest reloads on any mtime; malformed and missing files retain last good trust', () => {
     const dir = mkdtempSync(join(tmpdir(), 'manifest-failure-'))
     const path = join(dir, 'manifest.yaml')
     const log = join(dir, 'audit.jsonl')
     writeFileSync(path, 'bot_names: [vec]')
     utimesSync(path, 1000, 1000)
-    const allowed = new FleetManifestAllowlist(path, log)
-    // Same mtime → stat pre-check returns early; file is never read; digest not consulted.
+    // checkIntervalMs=0: disable throttle so rapid refresh() calls proceed immediately.
+    const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+    // Different content with same mtime → digest changed → reloads (mtime irrelevant).
     writeFileSync(path, 'bot_names: [vec, ion]')
     utimesSync(path, 1000, 1000)
     allowed.refresh()
-    expect([...allowed]).toEqual(['vec'])
-    expect(readAudit(log)).toHaveLength(1)
+    expect([...allowed].sort()).toEqual(['ion', 'vec'])
+    expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_loaded')).toHaveLength(2)
     writeFileSync(path, 'bot_names: [')
     utimesSync(path, 1001, 1001)
     allowed.refresh()
-    expect([...allowed]).toEqual(['vec'])
-    expect(allowed.loadedMtimeMs).toBe(1000000)
-    allowed.refresh()
+    expect([...allowed].sort()).toEqual(['ion', 'vec'])
+    const mtimeAfterLoad = allowed.loadedMtimeMs
     expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
     rmSync(path)
     allowed.refresh()
-    expect([...allowed]).toEqual(['vec'])
+    expect([...allowed].sort()).toEqual(['ion', 'vec'])
+    expect(allowed.loadedMtimeMs).toBe(mtimeAfterLoad)
     expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(2)
-    expect(allowed.has('ion')).toBe(false)
+    expect(allowed.has('ion')).toBe(true)
     rmSync(dir, { recursive: true, force: true })
   })
 })
 
 
 // DOCUMENTED LIMIT: byte-identical content does not reload even when mtime advances.
-// This is a no-op by definition — the allowlist has not changed. The mtime pre-check
-// skips the read for same-mtime files (fast path); this test covers the case where
-// mtime DID change but content is identical. The digest gate is what stops the reload.
+// This is a no-op by definition — the allowlist has not changed. The digest gate is
+// what stops the reload; mtime plays no role in this decision.
 //
 // COROLLARY: narrowing is NOT guaranteed in a single file-edit operation. To revoke
 // trust reliably, restart the session. This test exists so nobody reads the absence of
@@ -3490,9 +3490,9 @@ test('byte-identical content with updated mtime: digest gate, no reload (same-co
   const content = 'bot_names: [vec, ion]'
   writeFileSync(path, content)
   utimesSync(path, 1000, 1000)
-  const allowed = new FleetManifestAllowlist(path, log)
-  // Mtime advances — the stat pre-check passes and the file is read.
-  // Digest is identical → digest gate stops the reload.
+  // checkIntervalMs=0: disable throttle so refresh() proceeds immediately.
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+  // Mtime advances — file is read. Digest is identical → digest gate stops the reload.
   writeFileSync(path, content)
   utimesSync(path, 1001, 1001)
   allowed.refresh()
@@ -3511,7 +3511,7 @@ test('an unauditable widening is not installed', () => {
   writeFileSync(path, 'bot_names: [vec]')
   utimesSync(path, 1000, 1000)
   const errors: string[] = []
-  const allowed = new FleetManifestAllowlist(path, log, error => errors.push(error))
+  const allowed = new FleetManifestAllowlist(path, log, error => errors.push(error), 0)
   rmSync(log)
   mkdirSync(log) // deterministic audit failure even as root
   writeFileSync(path, 'bot_names: [vec, ion]')

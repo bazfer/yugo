@@ -517,30 +517,39 @@ export function loadFleetManifestAllowlist(path: string): Set<string> {
   return parseFleetManifestAllowlist(readFileSync(path, 'utf8'))
 }
 
-/** Mutable snapshot with audited, last-good reloads. Stat on admission as a cheap
- * pre-filter; when mtime has advanced, the file is read and its SHA-256 digest
- * compared against the loaded digest. A reload happens only when the digest differs.
+/** Minimum ms between manifest re-reads on the admission path.
+ * Bounds syscalls when a peer hammers the rejection path; not a correctness gate. */
+const CHECK_INTERVAL_MS = 1000
+
+/** Mutable snapshot with audited, last-good reloads. On every admission, a time
+ * throttle caps how often the file is read. When the interval has elapsed, the file
+ * is read and its SHA-256 digest compared against the loaded digest. The digest is
+ * the sole reload gate — any content change triggers a reload regardless of mtime.
  *
- * WIDENING (adding a bot): takes effect on the next admission that observes a changed
- * mtime. Usually immediate in practice.
+ * WIDENING (adding a bot): takes effect within one CHECK_INTERVAL_MS of the change.
  *
- * NARROWING NOT GUARANTEED: removing a bot is NOT guaranteed to take effect without a
- * restart. A read or parse failure retains the last-good (wider) allowlist. A
- * same-mtime replacement is skipped by the stat pre-check before the digest is
- * consulted. To revoke trust reliably, restart the session — revocation is a
- * deployment action, not a file edit. */
+ * NARROWING NOT GUARANTEED: removing a bot is NOT guaranteed to take effect without
+ * a restart. A read or parse failure retains the last-good (wider) allowlist, so a
+ * broken manifest keeps the wider list until the file is repaired AND the interval
+ * elapses. To revoke trust reliably, restart the session — revocation is a deployment
+ * action, not a file edit. */
 export class FleetManifestAllowlist extends Set<string> {
   readonly manifestPath: string
   loadedMtimeMs: number | null = null
   loadedDigest: string | null = null
-  private attemptedMtimeMs: number | null = null
+  private lastCheckMs = 0
 
-  constructor(path: string, private readonly auditLogPath: string, private readonly logger?: (message: string) => void) {
+  constructor(
+    path: string,
+    private readonly auditLogPath: string,
+    private readonly logger?: (message: string) => void,
+    private readonly checkIntervalMs = CHECK_INTERVAL_MS,
+  ) {
     super()
     this.manifestPath = resolve(path)
     try {
       const bytes = readFileSync(this.manifestPath)
-      this.reload(bytes, statSync(this.manifestPath).mtimeMs)
+      this.reload(bytes)
     } catch (error) {
       this.audit({ reason: 'fleet_manifest_load_failed', error: String(error), manifest_names: [] })
       throw error
@@ -555,34 +564,33 @@ export class FleetManifestAllowlist extends Set<string> {
     }) + '\n', { encoding: 'utf8', mode: 0o600 })
   }
 
-  private reload(bytes: Buffer, mtimeMs: number): void {
+  private reload(bytes: Buffer): void {
     const digest = createHash('sha256').update(bytes).digest('hex')
     const names = parseFleetManifestAllowlist(bytes.toString('utf8'))
+    let mtimeMs: number | null = null
+    try { mtimeMs = statSync(this.manifestPath).mtimeMs } catch {}
     this.audit({ reason: 'fleet_manifest_loaded', manifest_digest: digest, manifest_mtime_ms: mtimeMs, manifest_names: [...names].sort() })
     this.clear()
     for (const name of names) this.add(name)
     this.loadedMtimeMs = mtimeMs
     this.loadedDigest = digest
-    this.attemptedMtimeMs = mtimeMs
   }
 
   refresh(): void {
-    let mtimeMs: number | null = null
+    const now = Date.now()
+    // Time throttle: bounds syscalls on the admission path. Not a correctness gate.
+    if (now - this.lastCheckMs < this.checkIntervalMs) return
+    this.lastCheckMs = now
     try {
-      mtimeMs = statSync(this.manifestPath).mtimeMs
-      // Mtime pre-check: skip the read when mtime is unchanged (fast path).
-      // This is an optimisation only — the digest below is the reload gate.
-      if (mtimeMs === this.attemptedMtimeMs) return
-      this.attemptedMtimeMs = mtimeMs
       const bytes = readFileSync(this.manifestPath)
       const digest = createHash('sha256').update(bytes).digest('hex')
-      // Digest gate: byte-identical content never triggers a reload.
+      // Digest is the only gate. Same bytes = no reload, regardless of mtime.
       if (digest === this.loadedDigest) return
-      this.reload(bytes, mtimeMs)
+      this.reload(bytes)
     } catch (error) {
       // Failed snapshots never replace the last good names or loaded mtime.
       try {
-        this.audit({ reason: 'fleet_manifest_reload_failed', attempted_mtime_ms: mtimeMs,
+        this.audit({ reason: 'fleet_manifest_reload_failed',
           manifest_names: [...this].sort(), error: String(error) })
       } catch (auditError) { this.logger?.('Manifest audit failed: ' + String(auditError)) }
     }
