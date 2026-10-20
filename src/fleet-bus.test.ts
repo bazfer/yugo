@@ -3514,6 +3514,28 @@ test('persistent failure audits once; state change re-audits; recovery audits (P
   rmSync(dir, { recursive: true, force: true })
 })
 
+// REGRESSION: clearing lastFailureSignature on any successful READ (not only on a
+// digest-match) reintroduces the P2 spam for the malformed-but-readable case.
+// A readable-but-malformed file succeeds the readFileSync but fails the parse. If the
+// clear runs before the parse, each interval: read → clear → parse fails → sig != null
+// → audit. Repeat forever. The clear must live inside the digest-match branch only.
+test('malformed-but-readable manifest: repeated refresh audits once, not once per call', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-malformed-repeat-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  writeFileSync(path, 'bot_names: [vec]')
+  utimesSync(path, 1000, 1000)
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+  writeFileSync(path, 'bot_names: [')     // readable, not parseable
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  allowed.refresh()
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+  expect([...allowed]).toEqual(['vec'])
+  rmSync(dir, { recursive: true, force: true })
+})
+
 // A successful read (even a no-op digest match) clears lastFailureSignature.
 // Without this, a file that: fails, is "repaired" to byte-identical content (digest match,
 // no reload), then fails again with the same error, would silently skip the third audit.
