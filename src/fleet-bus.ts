@@ -538,6 +538,7 @@ export class FleetManifestAllowlist extends Set<string> {
   loadedMtimeMs: number | null = null
   loadedDigest: string | null = null
   private lastCheckMs = 0
+  private lastFailureSignature: string | null = null
 
   constructor(
     path: string,
@@ -574,6 +575,7 @@ export class FleetManifestAllowlist extends Set<string> {
     for (const name of names) this.add(name)
     this.loadedMtimeMs = mtimeMs
     this.loadedDigest = digest
+    this.lastFailureSignature = null  // clear so first failure after recovery is audited
   }
 
   refresh(): void {
@@ -589,10 +591,15 @@ export class FleetManifestAllowlist extends Set<string> {
       this.reload(bytes)
     } catch (error) {
       // Failed snapshots never replace the last good names or loaded mtime.
-      try {
-        this.audit({ reason: 'fleet_manifest_reload_failed',
-          manifest_names: [...this].sort(), error: String(error) })
-      } catch (auditError) { this.logger?.('Manifest audit failed: ' + String(auditError)) }
+      // Audit only when the failure state changes — repeated identical errors are noise.
+      const sig = error instanceof Error ? `${error.constructor.name}:${error.message}` : String(error)
+      if (sig !== this.lastFailureSignature) {
+        this.lastFailureSignature = sig
+        try {
+          this.audit({ reason: 'fleet_manifest_reload_failed',
+            manifest_names: [...this].sort(), error: String(error) })
+        } catch (auditError) { this.logger?.('Manifest audit failed: ' + String(auditError)) }
+      }
     }
   }
 }

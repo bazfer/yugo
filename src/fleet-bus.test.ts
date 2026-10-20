@@ -3476,6 +3476,44 @@ describe('audited manifest reload (#76)', () => {
 })
 
 
+// Repeated failures with the same error must audit once, not once per refresh.
+// A deleted manifest at the default 1-second throttle would produce ~86,000 audit
+// lines per day — unbounded growth from a condition nobody is watching. The fix:
+// track lastFailureSignature and write a new audit line only when the error changes.
+// A different error (e.g. ENOENT → YAML parse error) IS new information and IS audited.
+// Recovery audits via the existing fleet_manifest_loaded line, which clears the signature.
+test('persistent failure audits once; state change re-audits; recovery audits (P2 fix)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-dedup-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  writeFileSync(path, 'bot_names: [vec]')
+  utimesSync(path, 1000, 1000)
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+
+  // Same error repeated: only the first refresh audits.
+  rmSync(path)
+  allowed.refresh()
+  allowed.refresh()
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+  expect([...allowed]).toEqual(['vec'])
+
+  // Different error: new information — audited again.
+  writeFileSync(path, 'not_a_mapping')  // valid YAML scalar, not a mapping → TypeError
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(2)
+
+  // Recovery: reload succeeds → fleet_manifest_loaded emitted; next failure would re-audit.
+  writeFileSync(path, 'bot_names: [vec, ion]')
+  utimesSync(path, 1002, 1002)
+  allowed.refresh()
+  expect([...allowed].sort()).toEqual(['ion', 'vec'])
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_loaded')).toHaveLength(2)  // initial + recovery
+
+  rmSync(dir, { recursive: true, force: true })
+})
+
 // DOCUMENTED LIMIT: byte-identical content does not reload even when mtime advances.
 // This is a no-op by definition — the allowlist has not changed. The digest gate is
 // what stops the reload; mtime plays no role in this decision.
