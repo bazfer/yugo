@@ -3514,6 +3514,39 @@ test('persistent failure audits once; state change re-audits; recovery audits (P
   rmSync(dir, { recursive: true, force: true })
 })
 
+// A successful read (even a no-op digest match) clears lastFailureSignature.
+// Without this, a file that: fails, is "repaired" to byte-identical content (digest match,
+// no reload), then fails again with the same error, would silently skip the third audit.
+// This test proves that the no-op path clears the signature so the re-failure is audited.
+test('successful read after failure clears signature; re-failure after no-op read audits again', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-sig-clear-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  const content = 'bot_names: [vec]'
+  writeFileSync(path, content)
+  utimesSync(path, 1000, 1000)
+  const allowed = new FleetManifestAllowlist(path, log, undefined, 0)
+
+  // Fail: file removed → lastFailureSignature = ENOENT sig.
+  rmSync(path)
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+
+  // "Repair" to byte-identical content → digest match → no reload, but signature cleared.
+  writeFileSync(path, content)
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect([...allowed]).toEqual(['vec'])  // no reload, allowlist unchanged
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_loaded')).toHaveLength(1)  // still only initial
+
+  // Same failure again → signature was cleared by the successful read → re-audited.
+  rmSync(path)
+  allowed.refresh()
+  expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(2)
+
+  rmSync(dir, { recursive: true, force: true })
+})
+
 // DOCUMENTED LIMIT: byte-identical content does not reload even when mtime advances.
 // This is a no-op by definition — the allowlist has not changed. The digest gate is
 // what stops the reload; mtime plays no role in this decision.

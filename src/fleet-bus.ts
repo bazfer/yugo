@@ -586,8 +586,18 @@ export class FleetManifestAllowlist extends Set<string> {
     try {
       const bytes = readFileSync(this.manifestPath)
       const digest = createHash('sha256').update(bytes).digest('hex')
+      // Successful read: file is accessible. Clear any stale failure signature so a
+      // subsequent failure — even with the same error — is treated as new information.
+      // This must happen before the early return: a restore-with-identical-bytes is a
+      // recovery the code must recognise even though no reload occurs.
+      this.lastFailureSignature = null
       // Digest is the only gate. Same bytes = no reload, regardless of mtime.
-      if (digest === this.loadedDigest) return
+      if (digest === this.loadedDigest) {
+        // Content unchanged. Update loadedMtimeMs for diagnostic accuracy (the file
+        // may have been restored with a different mtime). Not a gate — diagnostics only.
+        try { this.loadedMtimeMs = statSync(this.manifestPath).mtimeMs } catch {}
+        return
+      }
       this.reload(bytes)
     } catch (error) {
       // Failed snapshots never replace the last good names or loaded mtime.
