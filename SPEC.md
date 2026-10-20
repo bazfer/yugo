@@ -122,9 +122,10 @@ Client inboxes:
 - `_INBOX_<bot>.>` — the NATS request/reply inbox, per the `inboxPrefix` rule
   below. **Not an application subject**; nothing addresses a bot there.
 
-### 6.1 — The reply lane TODAY is `.result`. Removal happens in FB-3.
+### 6.1 — Legacy reply publication stays on `.result`; expanded receivers accept both lanes.
 
-**A publisher selects the subject from `in_reply_to`, not from the kind:**
+**Legacy publishers (`bus.py` and `fleet-bus.ts`) select the subject from
+`in_reply_to`, not from the kind. Expand does not change publication:**
 
 ```
 to == null                 → fleet.broadcast.<kind>
@@ -132,18 +133,26 @@ to != null, no in_reply_to → fleet.<to>.request
 to != null, in_reply_to    → fleet.<to>.result
 ```
 
-That rule is implemented identically in `pick_publish_subject` (`bus.py`) and in
-the reply path of `fleet-bus.ts`, and the TypeScript client's correlated
-`request(wait: true)` **resolves only on a matching `.result`** — a reply
-delivered anywhere else leaves the caller waiting until timeout.
+That publication rule is implemented identically in `pick_publish_subject`
+(`bus.py`) and the reply path of `fleet-bus.ts`.
 
-**This clause describes the live wire, not the end state.** `.result` is used by
-both deployed implementations, is granted in every bot's subscribe and publish
-permissions, and as of FB-1 has a JetStream stream (`FLEET_RESULT`) capturing
-it. **The subject class stays until FB-3 removes it** — §6.2 has the target and
-the migration. Everything in §6 is live-state documentation: it says what a
-publisher must do to be understood today, and it stops being true at the
-cutover, not before.
+**Pre-Expand receive behavior (historical):** the TypeScript client's correlated
+`request(wait: true)` resolved only on a matching `.result`; a reply delivered
+on `.request` left the waiter pending until timeout.
+
+**Post-Expand receive behavior (current):** `fleet-bus.ts` receives and correlates
+on **both** `.request` and `.result`, subject to validation, recipient, sender,
+rate-limit and dedup gates. The commit claude-discord pins, `8a7dcfe`, already
+contains Expand-phase correlation in `onRequest`; this capability preceded the
+SPEC update. PR #75 shares the admission/correlation path rather than introducing
+the first request-lane waiter support. See §6.2 for a production confirmation.
+
+**Publication and reception are separate migration steps.** `.result` remains
+in use by legacy publishers and is granted in every bot's subscribe and publish
+permissions; as of FB-1, `FLEET_RESULT` captures it. Yugo publishes replies on
+`.request` already (§6.2). **The `.result` subject class stays until Contract
+removes it** (§6.2.1); expanded reception is not permission to start Migrate
+before its fleet-wide gate.
 
 ### 6.2 — The reply lane is mid-migration, and yugo is ahead of it
 
@@ -163,19 +172,26 @@ replaced, because the reasoning that produced it will recur: two implementations
 agreeing is not evidence when the third is the one implementing the approved
 change, and a majority is not an argument about direction.
 
-**What does hold is the interop consequence.** Until the migration completes,
-**a correlated `request(wait: true)` from a `fleet-bus.ts` peer to a yugo bot
-cannot resolve.** Yugo answers on `.request`, the caller listens on `.result`,
-and the exchange ends in a timeout indistinguishable from an unresponsive bot.
-Replies sent *to* yugo on `.result` are subscribed but deliberately not injected.
+**Pre-Expand interop consequence (historical):** a correlated
+`request(wait: true)` from a result-only TypeScript receiver to a yugo bot could
+not resolve: yugo answered on `.request`, while the waiter only correlated on
+`.result`, producing a timeout indistinguishable from an unresponsive bot.
+**After Expand, that limitation no longer applies to `fleet-bus.ts`:** matching
+replies correlate on either lane, without waiting for Migrate or Contract.
+Replies sent *to* yugo on `.result` are subscribed but deliberately not injected;
+the TypeScript adapter's expansion alone does not establish fleet-wide Gate 1.
 
-The hazard is live: Ion and Chis are deployed yugo bots on the fleet bus.
-At 2026-10-20T14:38:55Z, Ion received Deet's envelope
-`fde33e38-0611-44d1-b6bb-8ff0ac522c96` on `fleet.ion.request` and replied on
-`fleet.deet.request` with that id in `in_reply_to`. Deet's
-`bus_request(wait: true)` listened on `fleet.deet.result` and timed out after
-90 seconds, indistinguishably from a dead bot. Phase 1 below makes the
-TypeScript adapter receive and correlate on both lanes; publication stays unchanged.
+**Production confirmation, reported by Deet on 2026-10-20:** Ion and Chis are
+live yugo bots. At **15:01Z**, `bus_request(to: ion, wait: true)` resolved in
+**15 seconds**, with Ion's reply on `fleet.deet.request` carrying `in_reply_to`.
+Request-lane correlation is proven in production, not merely a target behavior.
+
+**Correction of the earlier reproduction:** the 90-second timeout following
+Ion's receipt of envelope `fde33e38-0611-44d1-b6bb-8ff0ac522c96` at
+2026-10-20T14:38:55Z was **not a reply-lane failure**. Deet verified that his
+adapter dropped the reply as `from_claim_rejected`: `ion` was missing from the
+from-claim allowlist loaded by his session. That timeout is not evidence for a
+lane change; Expand does not bypass sender admission.
 
 ### 6.2.1 — The migration cannot be "one adapter per PR, in any order"
 
@@ -183,14 +199,16 @@ Yugo §15 defines FB-3 as separate per-adapter PRs that land in any order. **For
 the reply lane specifically, that ordering strands peers**, and the section
 above would otherwise warn about a hazard its own plan creates:
 
-- a migrated adapter replies on `.request`, where an unmigrated receiver injects
+- a publisher that has begun Migrate replies on `.request`, where a receiver
+  that has not completed Expand injects
   it as a new request instead of resolving the waiter that is still listening
   on `.result`;
-- an unmigrated adapter replies on `.result`, which a migrated receiver has
-  deleted and had revoked.
+- a publisher that has not completed Migrate replies on `.result`, which a
+  receiver that began Contract prematurely has deleted and had revoked.
 
-Either direction breaks a correlated call, and both are live the moment the
-first adapter flips.
+Either ordering can break a correlated call if the phase gates are ignored.
+These are compatibility hazards for receivers in the stated phases, not a claim
+that the already-expanded TypeScript receiver cannot correlate `.request`.
 
 **The resolution is a compatibility phase — expand, migrate, contract.** Within
 each phase adapters proceed in any order; **between phases there is a global
