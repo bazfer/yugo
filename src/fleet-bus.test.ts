@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -15,6 +15,7 @@ import {
   DurableEnvelopeDedupStore as VerifiedDedupStore,
   FixedWindowBucket,
   FleetBus,
+  FleetManifestAllowlist,
   RESERVED_BOT_NAMES,
   buildFleetBusFrame,
   buildFleetBusFrameMeta,
@@ -3405,5 +3406,70 @@ describe('NATS authorization boundary', () => {
     } finally {
       await Promise.all([consoleClient.close(), luna.close()])
     }
+  })
+})
+
+
+describe('audited manifest reload (#76)', () => {
+  test('same bus rejects, adds and removes a sender, with loaded snapshot diagnostics', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'manifest-reload-'))
+    const path = join(dir, 'manifest.yaml')
+    const auditLogPath = join(dir, 'audit.jsonl')
+    let tick = 1000
+    const write = (names: string[]) => {
+      writeFileSync(path, 'bot_names: ' + JSON.stringify(names))
+      utimesSync(path, ++tick, tick)
+    }
+    write(['vec'])
+    const allowed = new FleetManifestAllowlist(path, auditLogPath)
+    const events: FleetBusSessionEvent[] = []
+    const bus = new TestFleetBus({ botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused',
+      auditLogPath, injectIntoSession: async event => { events.push(event) } }, allowed)
+    const reply = { envelope_version: 1, id: 'reload-reply', from: 'ION', to: 'vec',
+      kind: 'result', in_reply_to: 'unknown', ts: '2026-10-20T00:00:00Z', payload: {} }
+    await bus.handleRequest(reply)
+    expect(events).toHaveLength(0)
+    expect(readAudit(auditLogPath).find(e => e.reason === 'from_claim_rejected')).toMatchObject({
+      rejected_claim: 'ion', manifest_path: path, manifest_mtime_ms: tick * 1000,
+    })
+    write(['vec', 'ion'])
+    await bus.handleRequest(reply)
+    expect(events).toHaveLength(1)
+    write(['vec'])
+    await bus.handleResult({ ...reply, id: 'removed-reply' })
+    expect(events).toHaveLength(1)
+    const lines = readAudit(auditLogPath)
+    expect(lines.filter(e => e.reason === 'from_claim_rejected')).toHaveLength(2)
+    expect(lines.filter(e => e.reason === 'fleet_manifest_loaded').map(e => e.manifest_names))
+      .toEqual([['vec'], ['ion', 'vec'], ['vec']])
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('unchanged mtime never reloads; malformed and missing files retain last good trust', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'manifest-failure-'))
+    const path = join(dir, 'manifest.yaml')
+    const log = join(dir, 'audit.jsonl')
+    writeFileSync(path, 'bot_names: [vec]')
+    utimesSync(path, 1000, 1000)
+    const allowed = new FleetManifestAllowlist(path, log)
+    // Valid widening with identical mtime must not be read or installed.
+    writeFileSync(path, 'bot_names: [vec, ion]')
+    utimesSync(path, 1000, 1000)
+    allowed.refresh()
+    expect([...allowed]).toEqual(['vec'])
+    expect(readAudit(log)).toHaveLength(1)
+    writeFileSync(path, 'bot_names: [')
+    utimesSync(path, 1001, 1001)
+    allowed.refresh()
+    expect([...allowed]).toEqual(['vec'])
+    expect(allowed.loadedMtimeMs).toBe(1000000)
+    allowed.refresh()
+    expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(1)
+    rmSync(path)
+    allowed.refresh()
+    expect([...allowed]).toEqual(['vec'])
+    expect(readAudit(log).filter(e => e.reason === 'fleet_manifest_reload_failed')).toHaveLength(2)
+    expect(allowed.has('ion')).toBe(false)
+    rmSync(dir, { recursive: true, force: true })
   })
 })

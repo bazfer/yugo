@@ -8,7 +8,7 @@ import {
 } from 'nats'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { accessSync, appendFileSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { Database } from 'bun:sqlite'
 import { readMonotonicMs, checkedDeadline } from './monotonic-clock.ts'
 import { openVerifiedStore, readBootId, validBootId, VerificationError } from './dedup-verification.ts'
@@ -511,6 +511,59 @@ export function loadFleetManifestAllowlist(path: string): Set<string> {
     throw new TypeError('Fleet manifest bot_names must be a non-empty list')
   }
   return normalizeAllowlist(botNames)
+}
+
+/** Mutable snapshot with audited, last-good reloads. Stat on admission (not only
+ * rejection): otherwise removing a previously allowed sender never takes effect.
+ * Content is read only when mtime changes. No unaudited widening is installed. */
+export class FleetManifestAllowlist extends Set<string> {
+  readonly manifestPath: string
+  loadedMtimeMs: number | null = null
+  private attemptedMtimeMs: number | null = null
+
+  constructor(path: string, private readonly auditLogPath: string, private readonly logger?: (message: string) => void) {
+    super()
+    this.manifestPath = resolve(path)
+    try { this.reload(statSync(this.manifestPath).mtimeMs) } catch (error) {
+      this.audit({ reason: 'fleet_manifest_load_failed', error: String(error), manifest_names: [] })
+      throw error
+    }
+  }
+
+  private audit(entry: Record<string, unknown>): void {
+    mkdirSync(dirname(this.auditLogPath), { recursive: true, mode: 0o700 })
+    appendFileSync(this.auditLogPath, JSON.stringify({
+      ts: new Date().toISOString(), manifest_path: this.manifestPath,
+      manifest_mtime_ms: this.loadedMtimeMs, ...entry,
+    }) + '\n', { encoding: 'utf8', mode: 0o600 })
+  }
+
+  private reload(mtimeMs: number): void {
+    const names = loadFleetManifestAllowlist(this.manifestPath)
+    // Reject a moving snapshot rather than attaching the wrong mtime to names.
+    if (statSync(this.manifestPath).mtimeMs !== mtimeMs) throw new Error('Manifest changed during load')
+    this.audit({ reason: 'fleet_manifest_loaded', manifest_mtime_ms: mtimeMs, manifest_names: [...names].sort() })
+    this.clear()
+    for (const name of names) this.add(name)
+    this.loadedMtimeMs = mtimeMs
+    this.attemptedMtimeMs = mtimeMs
+  }
+
+  refresh(): void {
+    let mtimeMs: number | null = null
+    try {
+      mtimeMs = statSync(this.manifestPath).mtimeMs
+      if (mtimeMs === this.attemptedMtimeMs) return
+      this.attemptedMtimeMs = mtimeMs
+      this.reload(mtimeMs)
+    } catch (error) {
+      // Failed snapshots never replace the last good names or loaded mtime.
+      try {
+        this.audit({ reason: 'fleet_manifest_reload_failed', attempted_mtime_ms: mtimeMs,
+          manifest_names: [...this].sort(), error: String(error) })
+      } catch (auditError) { this.logger?.('Manifest audit failed: ' + String(auditError)) }
+    }
+  }
 }
 
 export function createHeartbeatEnvelope(
@@ -1356,9 +1409,9 @@ export class FleetBus {
       payload: options.payload,
       ...baton,
     }
-    const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+    const validation = this.validateWithManifest(envelope)
     if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason: validation.error, envelope_id: envelopeId })
+      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId })
       return { ok: false, error: validation.error, envelope }
     }
     const subject = `fleet.${canonicalTo}.request`
@@ -1509,12 +1562,12 @@ export class FleetBus {
       payload,
       ...baton,
     }
-    const validation = validateEnvelope(envelope, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+    const validation = this.validateWithManifest(envelope)
     if (!validation.ok) {
       // `subject` from main's reply-lane migration (#20): replies now go on
       // the REQUEST lane, so the audit subject is computed rather than
       // hardcoded to `.result`.
-      this.recordAudit({ dir: 'drop', subject, reason: validation.error, envelope_id: envelopeId })
+      this.recordAudit({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId })
       abandonOwn(validation.error)
       return { ok: false, error: validation.error, req_id: reqId, envelope }
     }
@@ -1709,13 +1762,9 @@ export class FleetBus {
       this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
       return
     }
-    const validation = validateEnvelope(
-      decoded,
-      this.allowedFromClaims,
-      this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
-    )
+    const validation = this.validateWithManifest(decoded)
     if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject, reason: validation.error })
+      this.recordAudit({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, decoded) })
       return
     }
     const envelope = validation.envelope
@@ -2192,6 +2241,19 @@ export class FleetBus {
       return
     }
     await this.config.injectIntoSession(event)
+  }
+
+  private validateWithManifest(value: unknown): ReturnType<typeof validateEnvelope> {
+    if (this.allowedFromClaims instanceof FleetManifestAllowlist) this.allowedFromClaims.refresh()
+    return validateEnvelope(value, this.allowedFromClaims, this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES)
+  }
+
+  private rejectedClaimDetails(reason: string, value: unknown): Record<string, unknown> {
+    if (reason !== 'from_claim_rejected') return {}
+    const claim = typeof value === 'object' && value !== null ? (value as Record<string, unknown>).from : undefined
+    const manifest = this.allowedFromClaims instanceof FleetManifestAllowlist ? this.allowedFromClaims : undefined
+    return { rejected_claim: normalizeBotName(claim), manifest_path: manifest?.manifestPath ?? null,
+      manifest_mtime_ms: manifest?.loadedMtimeMs ?? null }
   }
 
   private recordAudit(entry: Record<string, unknown>): void {
