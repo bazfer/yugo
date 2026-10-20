@@ -6,7 +6,7 @@ import {
   type Msg,
   type Subscription,
 } from 'nats'
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { accessSync, appendFileSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { Database } from 'bun:sqlite'
@@ -501,8 +501,8 @@ export function normalizeAllowlist(values: Iterable<unknown>): Set<string> {
   return result
 }
 
-export function loadFleetManifestAllowlist(path: string): Set<string> {
-  const manifest = parseYaml(readFileSync(path, 'utf8')) as unknown
+export function parseFleetManifestAllowlist(content: string): Set<string> {
+  const manifest = parseYaml(content) as unknown
   if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
     throw new TypeError('Fleet manifest must be a YAML mapping')
   }
@@ -513,18 +513,35 @@ export function loadFleetManifestAllowlist(path: string): Set<string> {
   return normalizeAllowlist(botNames)
 }
 
-/** Mutable snapshot with audited, last-good reloads. Stat on admission (not only
- * rejection): otherwise removing a previously allowed sender never takes effect.
- * Content is read only when mtime changes. No unaudited widening is installed. */
+export function loadFleetManifestAllowlist(path: string): Set<string> {
+  return parseFleetManifestAllowlist(readFileSync(path, 'utf8'))
+}
+
+/** Mutable snapshot with audited, last-good reloads. Stat on admission as a cheap
+ * pre-filter; when mtime has advanced, the file is read and its SHA-256 digest
+ * compared against the loaded digest. A reload happens only when the digest differs.
+ *
+ * WIDENING (adding a bot): takes effect on the next admission that observes a changed
+ * mtime. Usually immediate in practice.
+ *
+ * NARROWING NOT GUARANTEED: removing a bot is NOT guaranteed to take effect without a
+ * restart. A read or parse failure retains the last-good (wider) allowlist. A
+ * same-mtime replacement is skipped by the stat pre-check before the digest is
+ * consulted. To revoke trust reliably, restart the session — revocation is a
+ * deployment action, not a file edit. */
 export class FleetManifestAllowlist extends Set<string> {
   readonly manifestPath: string
   loadedMtimeMs: number | null = null
+  loadedDigest: string | null = null
   private attemptedMtimeMs: number | null = null
 
   constructor(path: string, private readonly auditLogPath: string, private readonly logger?: (message: string) => void) {
     super()
     this.manifestPath = resolve(path)
-    try { this.reload(statSync(this.manifestPath).mtimeMs) } catch (error) {
+    try {
+      const bytes = readFileSync(this.manifestPath)
+      this.reload(bytes, statSync(this.manifestPath).mtimeMs)
+    } catch (error) {
       this.audit({ reason: 'fleet_manifest_load_failed', error: String(error), manifest_names: [] })
       throw error
     }
@@ -538,14 +555,14 @@ export class FleetManifestAllowlist extends Set<string> {
     }) + '\n', { encoding: 'utf8', mode: 0o600 })
   }
 
-  private reload(mtimeMs: number): void {
-    const names = loadFleetManifestAllowlist(this.manifestPath)
-    // Reject a moving snapshot rather than attaching the wrong mtime to names.
-    if (statSync(this.manifestPath).mtimeMs !== mtimeMs) throw new Error('Manifest changed during load')
-    this.audit({ reason: 'fleet_manifest_loaded', manifest_mtime_ms: mtimeMs, manifest_names: [...names].sort() })
+  private reload(bytes: Buffer, mtimeMs: number): void {
+    const digest = createHash('sha256').update(bytes).digest('hex')
+    const names = parseFleetManifestAllowlist(bytes.toString('utf8'))
+    this.audit({ reason: 'fleet_manifest_loaded', manifest_digest: digest, manifest_mtime_ms: mtimeMs, manifest_names: [...names].sort() })
     this.clear()
     for (const name of names) this.add(name)
     this.loadedMtimeMs = mtimeMs
+    this.loadedDigest = digest
     this.attemptedMtimeMs = mtimeMs
   }
 
@@ -553,9 +570,15 @@ export class FleetManifestAllowlist extends Set<string> {
     let mtimeMs: number | null = null
     try {
       mtimeMs = statSync(this.manifestPath).mtimeMs
+      // Mtime pre-check: skip the read when mtime is unchanged (fast path).
+      // This is an optimisation only — the digest below is the reload gate.
       if (mtimeMs === this.attemptedMtimeMs) return
       this.attemptedMtimeMs = mtimeMs
-      this.reload(mtimeMs)
+      const bytes = readFileSync(this.manifestPath)
+      const digest = createHash('sha256').update(bytes).digest('hex')
+      // Digest gate: byte-identical content never triggers a reload.
+      if (digest === this.loadedDigest) return
+      this.reload(bytes, mtimeMs)
     } catch (error) {
       // Failed snapshots never replace the last good names or loaded mtime.
       try {
@@ -2253,7 +2276,7 @@ export class FleetBus {
     const claim = typeof value === 'object' && value !== null ? (value as Record<string, unknown>).from : undefined
     const manifest = this.allowedFromClaims instanceof FleetManifestAllowlist ? this.allowedFromClaims : undefined
     return { rejected_claim: normalizeBotName(claim), manifest_path: manifest?.manifestPath ?? null,
-      manifest_mtime_ms: manifest?.loadedMtimeMs ?? null }
+      manifest_mtime_ms: manifest?.loadedMtimeMs ?? null, manifest_digest: manifest?.loadedDigest ?? null }
   }
 
   private recordAudit(entry: Record<string, unknown>): void {

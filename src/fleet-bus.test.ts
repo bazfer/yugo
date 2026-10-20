@@ -3445,14 +3445,14 @@ describe('audited manifest reload (#76)', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  test('unchanged mtime never reloads; malformed and missing files retain last good trust', () => {
+  test('mtime pre-check skips same-mtime reads; malformed and missing files retain last good trust', () => {
     const dir = mkdtempSync(join(tmpdir(), 'manifest-failure-'))
     const path = join(dir, 'manifest.yaml')
     const log = join(dir, 'audit.jsonl')
     writeFileSync(path, 'bot_names: [vec]')
     utimesSync(path, 1000, 1000)
     const allowed = new FleetManifestAllowlist(path, log)
-    // Valid widening with identical mtime must not be read or installed.
+    // Same mtime → stat pre-check returns early; file is never read; digest not consulted.
     writeFileSync(path, 'bot_names: [vec, ion]')
     utimesSync(path, 1000, 1000)
     allowed.refresh()
@@ -3474,6 +3474,35 @@ describe('audited manifest reload (#76)', () => {
   })
 })
 
+
+// DOCUMENTED LIMIT: byte-identical content does not reload even when mtime advances.
+// This is a no-op by definition — the allowlist has not changed. The mtime pre-check
+// skips the read for same-mtime files (fast path); this test covers the case where
+// mtime DID change but content is identical. The digest gate is what stops the reload.
+//
+// COROLLARY: narrowing is NOT guaranteed in a single file-edit operation. To revoke
+// trust reliably, restart the session. This test exists so nobody reads the absence of
+// a reload as a bug, and nobody removes the digest check thinking it is dead code.
+test('byte-identical content with updated mtime: digest gate, no reload (same-content is a no-op)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-digest-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  const content = 'bot_names: [vec, ion]'
+  writeFileSync(path, content)
+  utimesSync(path, 1000, 1000)
+  const allowed = new FleetManifestAllowlist(path, log)
+  // Mtime advances — the stat pre-check passes and the file is read.
+  // Digest is identical → digest gate stops the reload.
+  writeFileSync(path, content)
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect([...allowed].sort()).toEqual(['ion', 'vec'])
+  // Only the initial load — no reload event.
+  const audit = readAudit(log)
+  expect(audit).toHaveLength(1)
+  expect(audit[0].reason).toBe('fleet_manifest_loaded')
+  rmSync(dir, { recursive: true, force: true })
+})
 
 test('an unauditable widening is not installed', () => {
   const dir = mkdtempSync(join(tmpdir(), 'manifest-audit-fail-'))
