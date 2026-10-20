@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { connect, JSONCodec, type Msg, type NatsConnection } from 'nats'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -3472,4 +3472,24 @@ describe('audited manifest reload (#76)', () => {
     expect(allowed.has('ion')).toBe(false)
     rmSync(dir, { recursive: true, force: true })
   })
+})
+
+
+test('an unauditable widening is not installed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'manifest-audit-fail-'))
+  const path = join(dir, 'manifest.yaml')
+  const log = join(dir, 'audit.jsonl')
+  writeFileSync(path, 'bot_names: [vec]')
+  utimesSync(path, 1000, 1000)
+  const errors: string[] = []
+  const allowed = new FleetManifestAllowlist(path, log, error => errors.push(error))
+  rmSync(log)
+  mkdirSync(log) // deterministic audit failure even as root
+  writeFileSync(path, 'bot_names: [vec, ion]')
+  utimesSync(path, 1001, 1001)
+  allowed.refresh()
+  expect([...allowed]).toEqual(['vec'])
+  expect(allowed.loadedMtimeMs).toBe(1000000)
+  expect(errors).toHaveLength(1)
+  rmSync(dir, { recursive: true, force: true })
 })
