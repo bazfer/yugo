@@ -352,6 +352,42 @@ def test_unhashable_key_does_not_leak_key_repr(tmp_path):
     assert exc_info.value.__suppress_context__ is True
 
 
+def test_invalid_utf8_does_not_leak_file_contents(tmp_path):
+    """Invalid UTF-8 raises UnicodeDecodeError BEFORE _parse_yaml is entered.
+
+    UnicodeDecodeError.object contains the full file bytes — including every
+    credential value in the file. The old `except OSError` boundary never saw
+    this; UnicodeDecodeError is a ValueError subclass, not an OSError.
+
+    Fix: explicit `except UnicodeDecodeError` at the read site converts it to
+    CredentialConfigError("malformed_yaml") from None before .object can reach
+    a caller.
+
+    Canary: removing the except UnicodeDecodeError clause (leaving only OSError)
+    makes this test fail — the wrong exception type escapes and pytest.raises
+    re-raises it.
+    """
+    import traceback
+    canary = "CANARY_SECRET_UTF8_DO_NOT_LEAK"
+    # Valid ASCII payload with the canary embedded, then an invalid UTF-8 byte.
+    # When read_text() tries to decode this, UnicodeDecodeError.object will be
+    # the entire byte string including the canary.
+    raw = (
+        f"version: 1\ncredentials:\n  - id: {canary}\n"
+        f"    host: api.github.com\n    header: Authorization\n    value: v\n"
+    ).encode("ascii") + b"\x80invalid"
+    p = tmp_path / "c.yaml"
+    p.write_bytes(raw)
+    p.chmod(0o600)
+    with pytest.raises(h.CredentialConfigError) as exc_info:
+        h.load_credentials(p)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
 def test_int_type_tag_does_not_leak_secret(tmp_path):
     """!!int with a non-integer value raises ValueError — not yaml.YAMLError.
 

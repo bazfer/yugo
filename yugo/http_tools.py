@@ -86,6 +86,15 @@ class CredentialConfigError(HttpStartupError):
         "unhashable_key":         "YAML mapping key is not hashable",
     }
 
+    @staticmethod
+    def _safe_int(v: object) -> int | None:
+        if v is None:
+            return None
+        try:
+            return int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
     def __init__(
         self,
         code: str,
@@ -94,14 +103,19 @@ class CredentialConfigError(HttpStartupError):
         col: int | None = None,
         index: int | None = None,
     ) -> None:
-        # Normalize code: unknown codes become "unknown" — never echo arbitrary strings.
+        # Normalize code: unknown codes become "unknown" — arbitrary strings cannot
+        # be stored via the code parameter.
         self.code = code if code in self._MSG else "unknown"
-        # Coerce positions to int — rejects any attempt to carry text via a position
-        # argument (e.g. CredentialConfigError("malformed_yaml", line="CANARYSECRET")
-        # raises ValueError here rather than rendering the string downstream).
-        self.line = int(line) if line is not None else None
-        self.col = int(col) if col is not None else None
-        self.index = int(index) if index is not None else None
+        # Pass the normalized code to super().__init__ so Exception.args holds only
+        # the safe code. Without this, BaseException.__new__ sets args from the
+        # original arguments, so repr(exc) would expose any un-normalized code.
+        super().__init__(self.code)
+        # Defensive int coercion: on failure drop the position rather than raising.
+        # A constructor that throws on the error path is the wrong shape — it turns
+        # a credential-loading exception into a cascading constructor error.
+        self.line = self._safe_int(line)
+        self.col = self._safe_int(col)
+        self.index = self._safe_int(index)
 
     def __str__(self) -> str:
         msg = self._MSG.get(self.code, "credential error")
@@ -285,8 +299,15 @@ def load_credentials(path_value: str | os.PathLike | None = None) -> dict[Origin
     if not path.exists(): return {}
     mode = path.stat().st_mode
     if mode & 0o077: raise CredentialConfigError("bad_perms") from None
-    try: text = path.read_text()
-    except OSError: raise CredentialConfigError("unreadable") from None
+    try:
+        text = path.read_text()
+    except OSError:
+        raise CredentialConfigError("unreadable") from None
+    except UnicodeDecodeError:
+        # UnicodeDecodeError.object carries the full file bytes — the entire
+        # credential file. It is NOT an OSError, so the original except clause
+        # never saw it. Convert here, from None, before any of that reaches a caller.
+        raise CredentialConfigError("malformed_yaml") from None
     doc = _parse_yaml(text, path)
     if not isinstance(doc, dict): raise CredentialConfigError("not_mapping") from None
     unknown = set(doc) - {"version", "credentials"}
