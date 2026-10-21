@@ -279,12 +279,17 @@ def test_request_changes_empty_findings_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("bad_finding", [
-    {"evidence": "e"},                                   # missing summary
-    {"summary": "", "evidence": "e"},                   # empty summary
-    {"summary": "s"},                                    # missing evidence
-    {"summary": "s", "evidence": ""},                   # empty evidence
-    {"summary": "s", "evidence": "e", "location": 42},  # location not a string
-    "not a dict",                                        # wrong type entirely
+    {"evidence": "e"},                                     # missing summary
+    {"summary": "", "evidence": "e"},                     # empty summary
+    {"summary": "   ", "evidence": "e"},                  # whitespace-only summary
+    {"summary": "s"},                                      # missing evidence
+    {"summary": "s", "evidence": ""},                     # empty evidence
+    {"summary": "s", "evidence": "   "},                  # whitespace-only evidence
+    {"summary": "s", "evidence": "e", "location": 42},    # location not a string
+    {"summary": "s", "evidence": "e", "location": ""},    # empty location
+    {"summary": "s", "evidence": "e", "location": "   "}, # whitespace-only location
+    "not a dict",                                          # wrong type entirely
+    None,                                                  # null item
 ])
 def test_request_changes_malformed_finding_raises(tmp_path: Path, bad_finding: Any) -> None:
     creds = _creds_file(tmp_path)
@@ -322,6 +327,22 @@ def test_insufficient_evidence_empty_unverified_raises(tmp_path: Path) -> None:
     with pytest.raises(gh.GitHubReviewError, match="verdict_no_unverified"):
         gh.submit_review(
             REPO, PR, HEAD, "insufficient_evidence", {**_VALID_VERDICT, "unverified": []},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+@pytest.mark.parametrize("bad_item", [
+    "",         # empty string
+    "   ",      # whitespace-only string
+    None,       # null
+    42,         # wrong type
+])
+def test_insufficient_evidence_malformed_unverified_item_raises(tmp_path: Path, bad_item: Any) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_unverified_malformed"):
+        gh.submit_review(
+            REPO, PR, HEAD, "insufficient_evidence",
+            {**_VALID_VERDICT, "unverified": [bad_item]},
             credentials_path=creds, allowlist=gh.ALLOW_ALL,
         )
 

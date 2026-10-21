@@ -254,18 +254,20 @@ def submit_review(
                 "verdict.findings must be a non-empty list for request_changes",
             )
         for i, f in enumerate(findings):
+            summary = f.get("summary") if isinstance(f, dict) else None
+            evidence = f.get("evidence") if isinstance(f, dict) else None
             if (not isinstance(f, dict)
-                    or not isinstance(f.get("summary"), str) or not f.get("summary")
-                    or not isinstance(f.get("evidence"), str) or not f.get("evidence")):
+                    or not isinstance(summary, str) or not summary.strip()
+                    or not isinstance(evidence, str) or not evidence.strip()):
                 raise GitHubReviewError(
                     "verdict_finding_malformed",
-                    f"verdict.findings[{i}] must have non-empty string 'summary' and 'evidence'",
+                    f"verdict.findings[{i}] must have non-blank string 'summary' and 'evidence'",
                 )
             loc = f.get("location")
-            if loc is not None and not isinstance(loc, str):
+            if loc is not None and (not isinstance(loc, str) or not loc.strip()):
                 raise GitHubReviewError(
                     "verdict_finding_malformed",
-                    f"verdict.findings[{i}].location must be a string if present",
+                    f"verdict.findings[{i}].location must be a non-blank string if present",
                 )
     elif decision == "insufficient_evidence":
         unverified = verdict.get("unverified")
@@ -275,10 +277,10 @@ def submit_review(
                 "verdict.unverified must be a non-empty list for insufficient_evidence",
             )
         for i, u in enumerate(unverified):
-            if not isinstance(u, str) or not u:
+            if not isinstance(u, str) or not u.strip():
                 raise GitHubReviewError(
                     "verdict_unverified_malformed",
-                    f"verdict.unverified[{i}] must be a non-empty string",
+                    f"verdict.unverified[{i}] must be a non-blank string",
                 )
 
     token = _load_token(credentials_path)
