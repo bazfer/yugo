@@ -94,7 +94,7 @@ BUS_HISTORY_MAX_TURNS = _env_int("BUS_HISTORY_MAX_TURNS", 10, positive=True)
 # re-requesting the same tool would otherwise spend provider budget until
 # RESPONSE_TIMEOUT expires, and — on the bus lane — hold a NATS subscription
 # callback for the whole of it.
-TOOL_MAX_ROUNDS = _env_int("TOOL_MAX_ROUNDS", 5, positive=True)
+TOOL_MAX_ROUNDS = _env_int("TOOL_MAX_ROUNDS", 18, positive=True)
 # --- sandbox mode (v0.4e) ---
 # The flag is a STUB in the sense that no full-mode guard is implemented; it is
 # NOT a stub in the sense of being inert. Its whole job is to keep the toggle

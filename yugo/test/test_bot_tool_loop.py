@@ -20,6 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 import time
 from unittest.mock import MagicMock
 
@@ -359,6 +363,47 @@ async def test_the_rebuilt_assistant_message_carries_no_litellm_extras(
 
 
 # ---------- what stops the loop ----------
+
+
+@pytest.mark.asyncio
+async def test_shipped_default_runs_eighteen_tool_rounds_and_still_has_a_ceiling(
+    monkeypatch, probe_declared, tmp_path
+):
+    """Read the actual import-time default with the operator override absent.
+
+    A default of five fails before the eighteenth tool call; removing the
+    ceiling fails the second assertion. No submit_review handler is changed
+    or invoked: the probe exercises the shared loop budget only.
+    """
+    env = dict(os.environ)
+    env.pop("TOOL_MAX_ROUNDS", None)
+    env["PYTHONPATH"] = str(Path(bot.__file__).parent)
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", "import bot; print(bot.TOOL_MAX_ROUNDS)"],
+        env=env, cwd=tmp_path, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    default = int(result.stdout.strip())
+    assert default == 18
+    monkeypatch.setattr(bot, "TOOL_MAX_ROUNDS", default)
+    provider = _ScriptedProvider(
+        *[_calls(_tool_call("loop_probe", "{}", f"round_{i}")) for i in range(18)],
+        _text("done"),
+    )
+    monkeypatch.setattr(litellm, "acompletion", provider)
+    await bot.ask_llm([{"role": "user", "content": "hi"}], 1)
+    assert provider.call_count == 19
+    # The eighteenth dispatch actually ran, rather than receiving a refusal.
+    messages = provider.kwargs[-1]["messages"]
+    results = [m["content"] for m in messages if m["role"] == "tool"]
+    assert results == [tools.PROBE_RESULT_PREFIX] * 18
+
+    endless = _AlwaysCalls()
+    monkeypatch.setattr(litellm, "acompletion", endless)
+    with pytest.raises(bot.ToolLoopLimitError, match="ceiling of 18"):
+        await bot.ask_llm([{"role": "user", "content": "hi"}], 1)
+    assert endless.call_count == 19
 
 
 @pytest.mark.asyncio
