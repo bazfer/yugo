@@ -1,4 +1,6 @@
+import ast
 import os
+import pathlib
 import pytest
 import yaml
 import http_tools as h
@@ -92,6 +94,61 @@ def test_duplicate_credential_id_is_refused_across_distinct_origins(tmp_path):
     with pytest.raises(h.HttpStartupError,match='duplicate credential id'): load(tmp_path,text)
     ok=GOOD+'  - id: second\n    host: other.example.com\n    header: X-Token\n    value: other_secret\n'
     assert len(load(tmp_path,ok))==2
+
+
+def test_credential_raise_sites_use_only_safe_diagnostics():
+    """All raise sites in credential-loading functions must use CredentialConfigError
+    with a string literal as the first argument — no f-strings, no !r, no parsed values.
+
+    This is the class-level structural guard. The canary tests below prove specific
+    known paths. This test makes it impossible to add a new leak silently:
+    any raise that does NOT use CredentialConfigError('literal_code', ...) fails here
+    before CI even runs the canaries.
+
+    Acceptance criterion (Myc's mutation): add `entries!r` to any raise inside a
+    credential-loading function and this test goes red.
+    """
+    src = pathlib.Path(__file__).parent.parent / "http_tools.py"
+    tree = ast.parse(src.read_text())
+
+    CRED_FUNCS = {"load_credentials", "_mapping", "_reject_graph", "_parse_yaml"}
+    violations: list[str] = []
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in CRED_FUNCS):
+            continue
+        for child in ast.walk(node):
+            if not (isinstance(child, ast.Raise) and child.exc is not None):
+                continue
+            exc = child.exc
+            # Only CredentialConfigError(...) is permitted.
+            if not (
+                isinstance(exc, ast.Call)
+                and isinstance(exc.func, ast.Name)
+                and exc.func.id == "CredentialConfigError"
+            ):
+                violations.append(
+                    f"  line {child.lineno}: raise does not use CredentialConfigError — {ast.dump(exc)[:80]}"
+                )
+                continue
+            # First argument must be a string literal (no f-string, no variable).
+            if not exc.args:
+                violations.append(f"  line {child.lineno}: CredentialConfigError called with no code argument")
+            elif not (isinstance(exc.args[0], ast.Constant) and isinstance(exc.args[0].value, str)):
+                violations.append(
+                    f"  line {child.lineno}: CredentialConfigError code is not a string literal — {ast.dump(exc.args[0])[:80]}"
+                )
+            # Keyword arguments must be named line/col/index only.
+            for kw in exc.keywords:
+                if kw.arg not in ("line", "col", "index"):
+                    violations.append(
+                        f"  line {child.lineno}: unexpected keyword {kw.arg!r} in CredentialConfigError"
+                    )
+
+    assert not violations, (
+        "Credential-loading raise sites must use CredentialConfigError('literal_code', ...)\n"
+        "with no f-strings, !r, or parsed values. Violations:\n" + "\n".join(violations)
+    )
 
 
 def test_malformed_yaml_alias_does_not_leak_secret_value(tmp_path):

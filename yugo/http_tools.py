@@ -47,6 +47,70 @@ _AT_MOST_ONCE = (
 class HttpStartupError(Exception):
     """A credential file ambiguity could silently spend the wrong secret."""
 
+
+class CredentialConfigError(HttpStartupError):
+    """Credential file rejected. No free-text — renders only from a fixed code table.
+
+    This is the ONLY exception type raised in credential-loading functions.
+    __str__ is built entirely from code-defined strings and integer positions;
+    no parsed key names, values, or paths from the credential file ever appear
+    in the message. The AST test in test_http_credentials.py enforces this by
+    construction: any raise in a credential-loading function that passes an
+    f-string or !r fails that test immediately, before CI runs the canaries.
+    """
+
+    _MSG: dict[str, str] = {
+        "bad_perms":              "credentials file has unsafe permissions",
+        "unreadable":             "credentials file cannot be read",
+        "not_mapping":            "credentials root must be a mapping",
+        "unknown_top_key":        "credentials file has an extra top-level key",
+        "version_invalid":        "credentials version key must be integer 1",
+        "not_list":               "credentials key must be a list",
+        "entry_not_mapping":      "credential entry must be a mapping",
+        "entry_wrong_keys":       "credential entry keys must be exactly id, host, header, value",
+        "entry_id_not_string":    "credential id key must be a non-empty string",
+        "entry_host_not_string":  "credential host key must be a non-empty string",
+        "entry_header_not_string":"credential header key must be a non-empty string",
+        "entry_value_not_string": "credential value key must be a non-empty string",
+        "id_bad_repertoire":      "credential id key is outside the ASCII HTTP field-value repertoire",
+        "id_contains_value":      "credential id key contains its value",
+        "id_duplicate":           "duplicate credential id",
+        "header_not_token":       "credential header key is not an HTTP token",
+        "value_bad_repertoire":   "credential value key is outside the ASCII HTTP field-value repertoire",
+        "origin_duplicate":       "duplicate normalized origin",
+        "host_invalid":           "credential host key is invalid",
+        "malformed_yaml":         "credentials file contains malformed YAML",
+        "merge_key":              "YAML merge key is forbidden",
+        "alias_forbidden":        "YAML alias is forbidden",
+        "duplicate_yaml_key":     "YAML mapping has a duplicate key",
+        "unhashable_key":         "YAML mapping key is not hashable",
+    }
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        line: int | None = None,
+        col: int | None = None,
+        index: int | None = None,
+    ) -> None:
+        self.code = code
+        self.line = line
+        self.col = col
+        self.index = index
+
+    def __str__(self) -> str:
+        msg = self._MSG.get(self.code, f"credential error [{self.code}]")
+        parts: list[str] = []
+        if self.index is not None:
+            parts.append(f"entry {self.index}")
+        if self.line is not None:
+            loc = f"line {self.line}"
+            if self.col is not None:
+                loc += f", column {self.col}"
+            parts.append(loc)
+        return f"{msg} ({', '.join(parts)})" if parts else msg
+
 class HttpGetError(Exception):
     """A named refusal that must remain distinguishable to the model."""
     def __init__(self, code: str, detail: str, *, audit_fields: Mapping[str, Any] | None = None):
@@ -98,35 +162,45 @@ class Credential:
 class _SafeUniqueLoader(yaml.SafeLoader):
     """Secret-bearing YAML cannot survive last-key-wins or graph aliases."""
 
-def _node_loc(node) -> str:
+def _node_pos(node) -> tuple[int | None, int | None]:
+    """Return (1-indexed line, 1-indexed column) from a YAML node's start_mark.
+
+    Only accesses integer counters maintained by the PyYAML reader — never
+    the source buffer, name, or pointer fields of the mark object.
+    """
     mark = getattr(node, "start_mark", None)
-    return f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+    if mark is None:
+        return None, None
+    return mark.line + 1, mark.column + 1
 
 def _mapping(loader, node, deep=False):
-    # SAFETY: never interpolate constructed keys or values into error messages.
-    # Parsed key objects are user-controlled data; only numeric node positions are safe.
+    # SAFETY: CredentialConfigError only — no f-strings, no key!r, no parsed values.
     out = {}
     for kn, vn in node.value:
-        if kn.tag == "tag:yaml.org,2002:merge": raise HttpStartupError("merge key '<<' is forbidden")
+        if kn.tag == "tag:yaml.org,2002:merge":
+            raise CredentialConfigError("merge_key") from None
         key = loader.construct_object(kn, deep=True)
-        loc = _node_loc(kn)
+        line, col = _node_pos(kn)
         try: dup = key in out
-        except TypeError: raise HttpStartupError(f"unhashable mapping key{loc}") from None
-        if dup: raise HttpStartupError(f"duplicate mapping key{loc}")
+        except TypeError: raise CredentialConfigError("unhashable_key", line=line, col=col) from None
+        if dup: raise CredentialConfigError("duplicate_yaml_key", line=line, col=col) from None
         out[key] = loader.construct_object(vn, deep=deep)
     return out
 _SafeUniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
 
 def _reject_graph(node, seen=None):
-    # SAFETY: never build a path from parsed key values — those are user data.
-    # Report only the numeric position of the offending node.
+    # SAFETY: CredentialConfigError only — path accumulator removed, position only.
     if node is None: return
     seen = set() if seen is None else seen
-    if id(node) in seen: raise HttpStartupError(f"alias{_node_loc(node)} is forbidden")
+    if id(node) in seen:
+        line, col = _node_pos(node)
+        raise CredentialConfigError("alias_forbidden", line=line, col=col) from None
     seen.add(id(node))
     if isinstance(node, yaml.MappingNode):
         for k, v in node.value:
-            if k.tag == "tag:yaml.org,2002:merge": raise HttpStartupError("merge key '<<' is forbidden")
+            if k.tag == "tag:yaml.org,2002:merge":
+                line, col = _node_pos(k)
+                raise CredentialConfigError("merge_key", line=line, col=col) from None
             _reject_graph(k, seen); _reject_graph(v, seen)
     elif isinstance(node, yaml.SequenceNode):
         for i, v in enumerate(node.value): _reject_graph(v, seen)
@@ -135,20 +209,16 @@ def _parse_yaml(text: str, path: Path):
     try:
         node = yaml.compose(text, Loader=yaml.SafeLoader); _reject_graph(node)
         return yaml.load(text, Loader=_SafeUniqueLoader)  # custom SafeLoader, never default
-    except HttpStartupError: raise
+    except CredentialConfigError: raise
     except yaml.YAMLError as e:
-        # NEVER render any PyYAML-generated string in the error message.
-        # PyYAML embeds user-controlled text in both str(e) AND e.problem:
-        #   - unterminated quote: source line quoted verbatim in str(e)
-        #   - undefined alias *SECRET: "found undefined alias 'SECRET'" in e.problem
-        #   - anchor &SECRET, tag !!SECRET: similarly in e.problem
-        # Additionally, `raise ... from e` retains the raw parser exception in
-        # __cause__, exposing secrets through traceback.format_exception().
-        # Fix: fixed category + numeric position only; suppress the chain.
-        mark = getattr(e, 'problem_mark', None)
-        loc = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
-        category = type(e).__name__  # class name: code-defined, not user data
-        raise HttpStartupError(f"credentials file {path} malformed YAML{loc} ({category})") from None
+        # NEVER render any PyYAML-generated string. e.problem embeds user-controlled
+        # alias/anchor/tag names; str(e) quotes source lines verbatim; from e exposes
+        # the raw parser exception in __cause__ via traceback.format_exception().
+        # Fix: CredentialConfigError with numeric position only, from None.
+        mark = getattr(e, "problem_mark", None)
+        line = mark.line + 1 if mark else None
+        col = mark.column + 1 if mark else None
+        raise CredentialConfigError("malformed_yaml", line=line, col=col) from None
 
 def _blocked_name(host: str) -> str | None:
     """Name the blocked entry `host` sits under, matching WHOLE trailing labels.
@@ -203,39 +273,60 @@ def _field_value_fault(text: str) -> str | None:
     return None
 
 def load_credentials(path_value: str | os.PathLike | None = None) -> dict[Origin, Credential]:
+    # SAFETY: only CredentialConfigError may be raised from this function.
+    # No f-strings, no !r, no parsed keys/values in any raise argument.
+    # The AST test in test_http_credentials.py enforces this structurally.
     path = Path(path_value or os.getenv("YUGO_HTTP_CREDENTIALS_FILE", "").strip() or DEFAULT_CREDENTIALS_FILE).expanduser().resolve(strict=False)
     if not path.exists(): return {}
     mode = path.stat().st_mode
-    if mode & 0o077: raise HttpStartupError(f"credentials file {path} has group/world permission bits (mode {mode & 0o777:04o})")
+    if mode & 0o077: raise CredentialConfigError("bad_perms") from None
     try: text = path.read_text()
-    except OSError as e: raise HttpStartupError(f"cannot read credentials file {path}: {e}") from e
+    except OSError: raise CredentialConfigError("unreadable") from None
     doc = _parse_yaml(text, path)
-    if not isinstance(doc, dict): raise HttpStartupError("credentials root key must be a mapping")
+    if not isinstance(doc, dict): raise CredentialConfigError("not_mapping") from None
     unknown = set(doc) - {"version", "credentials"}
-    if unknown: raise HttpStartupError(f"unknown credentials top-level key {sorted(unknown)[0]!r}")
-    if type(doc.get("version")) is not int or doc["version"] != 1: raise HttpStartupError(f"credentials version key must be integer 1; got {doc.get('version')!r}")
+    if unknown: raise CredentialConfigError("unknown_top_key") from None
+    if type(doc.get("version")) is not int or doc["version"] != 1:
+        raise CredentialConfigError("version_invalid") from None
     entries = doc.get("credentials", [])
-    if not isinstance(entries, list): raise HttpStartupError("credentials key must be a list")
-    result = {}; ids = set()
+    if not isinstance(entries, list): raise CredentialConfigError("not_list") from None
+    result: dict[Origin, Credential] = {}
+    ids: set[str] = set()
     for i, item in enumerate(entries):
-        if not isinstance(item, dict): raise HttpStartupError(f"credential entry {i} must be a mapping")
+        if not isinstance(item, dict):
+            raise CredentialConfigError("entry_not_mapping", index=i) from None
         expected = {"id", "host", "header", "value"}
-        if set(item) != expected: raise HttpStartupError(f"credential entry {i} keys must be exactly {sorted(expected)}; got {sorted(item)}")
-        for key in expected:
-            if type(item[key]) is not str or not item[key]: raise HttpStartupError(f"credential entry {i} key {key!r} must be a non-empty string")
+        if set(item) != expected:
+            raise CredentialConfigError("entry_wrong_keys", index=i) from None
+        # Check each field individually with a literal code — no variables in raise args.
+        if type(item["id"]) is not str or not item["id"]:
+            raise CredentialConfigError("entry_id_not_string", index=i) from None
+        if type(item["host"]) is not str or not item["host"]:
+            raise CredentialConfigError("entry_host_not_string", index=i) from None
+        if type(item["header"]) is not str or not item["header"]:
+            raise CredentialConfigError("entry_header_not_string", index=i) from None
+        if type(item["value"]) is not str or not item["value"]:
+            raise CredentialConfigError("entry_value_not_string", index=i) from None
         cid, header, secret = item["id"], item["header"], item["value"]
         # `id` never reaches the wire, but it IS returned as `credential_id`,
         # so an id outside the field-value repertoire trips the result encoder
         # at call time instead of here, where an operator can fix it.
-        fault = _field_value_fault(cid)
-        if fault: raise HttpStartupError(f"credential id key {cid!r} has {fault}")
-        if cid == secret or secret in cid: raise HttpStartupError(f"credential id key {cid!r} contains its value")
-        if cid in ids: raise HttpStartupError(f"duplicate credential id key {cid!r}")
-        if not _HEADER_TOKEN.fullmatch(header): raise HttpStartupError(f"credential header key {header!r} is not an HTTP token")
-        fault = _field_value_fault(secret)
-        if fault: raise HttpStartupError(f"credential value key for id {cid!r} has {fault}")
-        origin = parse_authority(item["host"])
-        if origin in result: raise HttpStartupError(f"duplicate normalized origin key {origin.rendered()!r}")
+        if _field_value_fault(cid):
+            raise CredentialConfigError("id_bad_repertoire", index=i) from None
+        if cid == secret or secret in cid:
+            raise CredentialConfigError("id_contains_value", index=i) from None
+        if cid in ids:
+            raise CredentialConfigError("id_duplicate", index=i) from None
+        if not _HEADER_TOKEN.fullmatch(header):
+            raise CredentialConfigError("header_not_token", index=i) from None
+        if _field_value_fault(secret):
+            raise CredentialConfigError("value_bad_repertoire", index=i) from None
+        try:
+            origin = parse_authority(item["host"])
+        except HttpStartupError:
+            raise CredentialConfigError("host_invalid", index=i) from None
+        if origin in result:
+            raise CredentialConfigError("origin_duplicate", index=i) from None
         ids.add(cid); result[origin] = Credential(cid, origin, header, secret)
     return result
 
