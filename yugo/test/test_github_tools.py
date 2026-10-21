@@ -536,46 +536,116 @@ def test_schema_declares_findings_and_unverified() -> None:
     assert verdict_schema.get("additionalProperties") is False
 
 
-def test_schema_consistent_with_handler_request_changes(tmp_path: Path) -> None:
-    """A verdict that satisfies the schema for request_changes must also satisfy the handler.
+def _submit_review_args(decision: str, verdict: dict) -> dict:
+    """Build a full submit_review args dict suitable for jsonschema.validate."""
+    return {"repo": REPO, "pr": PR, "head_sha": HEAD, "decision": decision, "verdict": verdict}
 
-    This is the key drift check: if the schema and handler disagree on what a valid
-    request_changes verdict looks like, a schema-conforming caller gets rejected at runtime.
+
+def test_schema_rejects_request_changes_without_findings() -> None:
+    """Schema must reject request_changes when findings is absent.
+
+    This test is a canary: if findings is removed from the exported schema or the
+    if/then conditional is dropped, jsonschema.validate will no longer raise, and
+    this test will FAIL — proving the contract is enforced at the schema level.
     """
     import tools
-    creds = _creds_file(tmp_path)
-    responses = [_pr_response(), _review_response()]
-    factory = _conn_factory_for(responses)
-    # Construct a verdict that passes strict schema validation (declared fields only)
-    schema_valid_verdict = {
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    # Missing findings entirely
+    args = _submit_review_args("request_changes", {"properties_asserted": ["p"], "mutations_tried": ["m"]})
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args, schema)
+    # Empty findings list
+    args2 = _submit_review_args("request_changes", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"], "findings": [],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args2, schema)
+
+
+def test_schema_rejects_insufficient_evidence_without_unverified() -> None:
+    """Schema must reject insufficient_evidence when unverified is absent.
+
+    Same canary property: removing unverified from the exported schema or dropping
+    the if/then conditional causes this test to FAIL.
+    """
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    args = _submit_review_args("insufficient_evidence", {"properties_asserted": ["p"], "mutations_tried": ["m"]})
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args, schema)
+    args2 = _submit_review_args("insufficient_evidence", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"], "unverified": [],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args2, schema)
+
+
+def test_schema_rejects_blank_strings_in_findings_and_unverified() -> None:
+    """Schema must reject blank summary/evidence strings and blank unverified entries."""
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    blank_summary = _submit_review_args("request_changes", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"],
+        "findings": [{"summary": "", "evidence": "e"}],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(blank_summary, schema)
+    blank_unverified = _submit_review_args("insufficient_evidence", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"],
+        "unverified": [""],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(blank_unverified, schema)
+
+
+def test_schema_and_handler_agree_request_changes(tmp_path: Path) -> None:
+    """A verdict that passes jsonschema.validate for request_changes must also pass the handler.
+
+    Both validations run on the same args dict. Failure on either leg means drift:
+    - schema accepts but handler rejects: callers that read the schema get runtime errors
+    - schema rejects but handler accepts: schema is over-restrictive (less dangerous but wrong)
+    """
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    verdict = {
         "properties_asserted": ["p"],
         "mutations_tried": ["m"],
         "findings": [{"summary": "null ptr on empty reload", "evidence": "line 42 clears before parse"}],
     }
-    # Must succeed end-to-end — no validation error from handler OR schema
+    args = _submit_review_args("request_changes", verdict)
+    jsonschema.validate(args, schema)  # schema leg: must not raise
+    creds = _creds_file(tmp_path)
+    factory = _conn_factory_for([_pr_response(), _review_response()])
     result = gh.submit_review(
-        REPO, PR, HEAD, "request_changes", schema_valid_verdict,
+        REPO, PR, HEAD, "request_changes", verdict,
         credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
     )
-    assert "REQUEST_CHANGES" in result
+    assert "REQUEST_CHANGES" in result  # handler leg: must not raise
 
 
-def test_schema_consistent_with_handler_insufficient_evidence(tmp_path: Path) -> None:
-    """A verdict satisfying the schema for insufficient_evidence must also satisfy the handler."""
+def test_schema_and_handler_agree_insufficient_evidence(tmp_path: Path) -> None:
+    """A verdict that passes jsonschema.validate for insufficient_evidence must pass the handler."""
     import tools
-    creds = _creds_file(tmp_path)
-    responses = [_pr_response(), _review_response()]
-    factory = _conn_factory_for(responses)
-    schema_valid_verdict = {
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    verdict = {
         "properties_asserted": ["p"],
         "mutations_tried": ["m"],
         "unverified": ["could not reproduce race condition in test environment"],
     }
+    args = _submit_review_args("insufficient_evidence", verdict)
+    jsonschema.validate(args, schema)  # schema leg
+    creds = _creds_file(tmp_path)
+    factory = _conn_factory_for([_pr_response(), _review_response()])
     result = gh.submit_review(
-        REPO, PR, HEAD, "insufficient_evidence", schema_valid_verdict,
+        REPO, PR, HEAD, "insufficient_evidence", verdict,
         credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
     )
-    assert "COMMENT" in result
+    assert "COMMENT" in result  # handler leg
 
 
 def test_schema_location_null_treated_as_absent(tmp_path: Path) -> None:
