@@ -98,29 +98,38 @@ class Credential:
 class _SafeUniqueLoader(yaml.SafeLoader):
     """Secret-bearing YAML cannot survive last-key-wins or graph aliases."""
 
+def _node_loc(node) -> str:
+    mark = getattr(node, "start_mark", None)
+    return f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+
 def _mapping(loader, node, deep=False):
+    # SAFETY: never interpolate constructed keys or values into error messages.
+    # Parsed key objects are user-controlled data; only numeric node positions are safe.
     out = {}
     for kn, vn in node.value:
         if kn.tag == "tag:yaml.org,2002:merge": raise HttpStartupError("merge key '<<' is forbidden")
         key = loader.construct_object(kn, deep=True)
+        loc = _node_loc(kn)
         try: dup = key in out
-        except TypeError as e: raise HttpStartupError(f"unhashable mapping key {key!r}") from e
-        if dup: raise HttpStartupError(f"duplicate mapping key {key!r}")
+        except TypeError: raise HttpStartupError(f"unhashable mapping key{loc}") from None
+        if dup: raise HttpStartupError(f"duplicate mapping key{loc}")
         out[key] = loader.construct_object(vn, deep=deep)
     return out
 _SafeUniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
 
-def _reject_graph(node, seen=None, path="root"):
+def _reject_graph(node, seen=None):
+    # SAFETY: never build a path from parsed key values — those are user data.
+    # Report only the numeric position of the offending node.
     if node is None: return
     seen = set() if seen is None else seen
-    if id(node) in seen: raise HttpStartupError(f"alias at {path!r} is forbidden")
+    if id(node) in seen: raise HttpStartupError(f"alias{_node_loc(node)} is forbidden")
     seen.add(id(node))
     if isinstance(node, yaml.MappingNode):
         for k, v in node.value:
             if k.tag == "tag:yaml.org,2002:merge": raise HttpStartupError("merge key '<<' is forbidden")
-            _reject_graph(k, seen, path); _reject_graph(v, seen, f"{path}.{getattr(k, 'value', '?')}")
+            _reject_graph(k, seen); _reject_graph(v, seen)
     elif isinstance(node, yaml.SequenceNode):
-        for i, v in enumerate(node.value): _reject_graph(v, seen, f"{path}[{i}]")
+        for i, v in enumerate(node.value): _reject_graph(v, seen)
 
 def _parse_yaml(text: str, path: Path):
     try:

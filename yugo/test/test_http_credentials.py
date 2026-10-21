@@ -166,6 +166,79 @@ def test_malformed_yaml_does_not_leak_secret_value(tmp_path):
     )
 
 
+def test_duplicate_mapping_key_does_not_leak_secret(tmp_path):
+    """_mapping interpolated the duplicate key verbatim: 'duplicate mapping key CANARY'.
+
+    Parsed keys are user-controlled data. The fix uses only numeric node position.
+    This canary independently fails when key!r is restored.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: one\n'
+        f'    {canary}: extra\n'
+        f'    {canary}: extra2\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    # Direct raise inside _mapping (not in an except block) — no chain to suppress.
+    assert exc_info.value.__context__ is None
+
+
+def test_alias_in_value_does_not_leak_key_path(tmp_path):
+    """_reject_graph built a path from parsed key values: 'alias at root.value.CANARY'.
+
+    Parsed key names are user-controlled data. The fix uses only numeric node position.
+    This canary independently fails when the path-building is restored.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    # Anchor on a valid key, alias it as the value of a field named after the canary.
+    # _reject_graph walks the composed node tree and previously embedded key.value in path.
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - &anchor id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: v\n'
+        f'    {canary}: *anchor\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    # Direct raise inside _reject_graph (not in an except block) — no chain to suppress.
+    assert exc_info.value.__context__ is None
+
+
+def test_unhashable_key_does_not_leak_key_repr(tmp_path):
+    """_mapping interpolated the unhashable key repr: 'unhashable mapping key [CANARY]'.
+
+    The TypeError from `key in out` previously propagated the key repr via `from e`.
+    The fix uses only numeric node position and suppresses the chain.
+    This canary independently fails when key!r and from e are restored.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    # A list key is unhashable. YAML allows it; Python dicts do not.
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: v\n'
+        f'    ? [{canary}]\n    : extra\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__suppress_context__ is True
+
+
 @pytest.mark.parametrize("cid",['id: Bearer_secret','id: gh-Bearer_secret'],ids=["equal","contains"])
 def test_credential_id_may_not_carry_its_own_value(tmp_path,cid):
     """`id` is returned to the model as `credential_id` and is written to the
