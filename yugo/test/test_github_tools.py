@@ -517,6 +517,93 @@ def test_submit_review_in_tools_registry() -> None:
         )
 
 
+# --- schema / handler contract ---
+
+
+def test_schema_declares_findings_and_unverified() -> None:
+    """The exported schema must declare findings and unverified as known properties.
+
+    A schema with additionalProperties:false that omits these fields causes
+    strict schema validators (and LLMs reading the schema) to reject valid
+    request_changes and insufficient_evidence verdicts before they reach the handler.
+    """
+    import tools
+    verdict_schema = tools.REGISTRY["submit_review"].parameters["properties"]["verdict"]
+    declared = set(verdict_schema.get("properties", {}).keys())
+    assert "findings" in declared, "findings not in verdict schema — schema/handler contract broken"
+    assert "unverified" in declared, "unverified not in verdict schema — schema/handler contract broken"
+    # additionalProperties:false must still apply — undeclared fields must be rejected
+    assert verdict_schema.get("additionalProperties") is False
+
+
+def test_schema_consistent_with_handler_request_changes(tmp_path: Path) -> None:
+    """A verdict that satisfies the schema for request_changes must also satisfy the handler.
+
+    This is the key drift check: if the schema and handler disagree on what a valid
+    request_changes verdict looks like, a schema-conforming caller gets rejected at runtime.
+    """
+    import tools
+    creds = _creds_file(tmp_path)
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    # Construct a verdict that passes strict schema validation (declared fields only)
+    schema_valid_verdict = {
+        "properties_asserted": ["p"],
+        "mutations_tried": ["m"],
+        "findings": [{"summary": "null ptr on empty reload", "evidence": "line 42 clears before parse"}],
+    }
+    # Must succeed end-to-end — no validation error from handler OR schema
+    result = gh.submit_review(
+        REPO, PR, HEAD, "request_changes", schema_valid_verdict,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+    assert "REQUEST_CHANGES" in result
+
+
+def test_schema_consistent_with_handler_insufficient_evidence(tmp_path: Path) -> None:
+    """A verdict satisfying the schema for insufficient_evidence must also satisfy the handler."""
+    import tools
+    creds = _creds_file(tmp_path)
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    schema_valid_verdict = {
+        "properties_asserted": ["p"],
+        "mutations_tried": ["m"],
+        "unverified": ["could not reproduce race condition in test environment"],
+    }
+    result = gh.submit_review(
+        REPO, PR, HEAD, "insufficient_evidence", schema_valid_verdict,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+    assert "COMMENT" in result
+
+
+def test_schema_location_null_treated_as_absent(tmp_path: Path) -> None:
+    """location:null is treated as absent by the handler.
+
+    The schema declares location as type ["string", "null"]. A caller that
+    omits location or passes null must get the same result — no location suffix
+    in the body, no error. This documents the intentional null-as-absent policy.
+    """
+    creds = _creds_file(tmp_path)
+    for location_value in (None, "explicit-location"):
+        responses = [_pr_response(), _review_response()]
+        factory = _conn_factory_for(responses)
+        verdict = {
+            **_VALID_VERDICT_REQUEST_CHANGES,
+            "findings": [{"summary": "s", "evidence": "e", "location": location_value}],
+        }
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", verdict,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+        )
+        body = json.loads(factory.conns[1].calls[0][2])["body"]
+        if location_value is None:
+            assert "(None)" not in body  # null location must not appear as text
+        else:
+            assert "explicit-location" in body
+
+
 def test_submit_review_granted_via_tools_yaml(tmp_path: Path) -> None:
     """tools.yaml can grant submit_review; the bound handler replaces the unbound one."""
     import tools

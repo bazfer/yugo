@@ -304,8 +304,12 @@ REGISTRY: Mapping[str, Tool] = {
         description=(
             "Submit a formal GitHub PR review. "
             "`decision` must be approve, request_changes, or insufficient_evidence. "
-            "`verdict` must have non-empty `properties_asserted` and `mutations_tried` "
-            "lists. The PR head is re-fetched and must match `head_sha`."
+            "`verdict` must always have non-empty `properties_asserted` and `mutations_tried` lists. "
+            "For request_changes: also requires non-empty `findings` list "
+            "(each item: non-blank `summary` and `evidence` strings, optional non-blank `location`). "
+            "For insufficient_evidence: also requires non-empty `unverified` list of non-blank strings. "
+            "For approve: only properties_asserted and mutations_tried are required. "
+            "The PR head is re-fetched and must match `head_sha`."
         ),
         parameters={
             "type": "object",
@@ -328,6 +332,16 @@ REGISTRY: Mapping[str, Tool] = {
                 },
                 "verdict": {
                     "type": "object",
+                    "description": (
+                        "Review evidence. properties_asserted and mutations_tried are always required. "
+                        "findings is required for request_changes; each item needs summary and evidence "
+                        "(non-blank strings) and an optional non-blank location string. "
+                        "location:null is treated as absent. "
+                        "unverified is required for insufficient_evidence: non-blank strings naming "
+                        "what could not be verified. approve needs only the base fields. "
+                        "summary/evidence/location/unverified are review prose and pass through to "
+                        "the GitHub review body without escaping."
+                    ),
                     "properties": {
                         "properties_asserted": {
                             "type": "array",
@@ -338,6 +352,25 @@ REGISTRY: Mapping[str, Tool] = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Mutations considered or tested",
+                        },
+                        "findings": {
+                            "type": "array",
+                            "description": "Required for request_changes. Each item names a defect.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "summary": {"type": "string", "description": "One-line defect name"},
+                                    "evidence": {"type": "string", "description": "What proves it"},
+                                    "location": {"type": ["string", "null"], "description": "File and line, optional"},
+                                },
+                                "required": ["summary", "evidence"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "unverified": {
+                            "type": "array",
+                            "description": "Required for insufficient_evidence. Names what could not be verified.",
+                            "items": {"type": "string"},
                         },
                     },
                     "required": ["properties_asserted", "mutations_tried"],
