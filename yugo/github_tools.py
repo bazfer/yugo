@@ -196,8 +196,15 @@ def submit_review(
     Three guards (all required):
 
     1. Verdict must be a mapping with non-empty `properties_asserted` and
-       `mutations_tried` lists. Forcing real evidence fields means an injection
-       must fabricate them, which is auditable afterwards.
+       `mutations_tried` lists. Additionally:
+       - `request_changes` requires a non-empty `findings` list, where each
+         item has `summary` and `evidence` strings (and an optional `location`
+         string). A blocking verdict without a named defect is not actionable.
+       - `insufficient_evidence` requires a non-empty `unverified` list of
+         strings naming what the reviewer could not verify.
+       - `approve` keeps the existing shape; no extra fields required.
+       Forcing real evidence fields means an injection must fabricate them,
+       which is auditable afterwards.
 
     2. PR head is re-fetched and must match `head_sha`. GitHub's
        dismiss_stale_reviews_on_push and require_last_push_approval are both OFF
@@ -238,6 +245,44 @@ def submit_review(
             f"decision must be one of {sorted(_DECISION_EVENT)}; got {decision!r}",
         )
 
+    # Guard 1 (continued): decision-specific required fields
+    if decision == "request_changes":
+        findings = verdict.get("findings")
+        if not isinstance(findings, list) or len(findings) == 0:
+            raise GitHubReviewError(
+                "verdict_no_findings",
+                "verdict.findings must be a non-empty list for request_changes",
+            )
+        for i, f in enumerate(findings):
+            summary = f.get("summary") if isinstance(f, dict) else None
+            evidence = f.get("evidence") if isinstance(f, dict) else None
+            if (not isinstance(f, dict)
+                    or not isinstance(summary, str) or not summary.strip()
+                    or not isinstance(evidence, str) or not evidence.strip()):
+                raise GitHubReviewError(
+                    "verdict_finding_malformed",
+                    f"verdict.findings[{i}] must have non-blank string 'summary' and 'evidence'",
+                )
+            loc = f.get("location")
+            if loc is not None and (not isinstance(loc, str) or not loc.strip()):
+                raise GitHubReviewError(
+                    "verdict_finding_malformed",
+                    f"verdict.findings[{i}].location must be a non-blank string if present",
+                )
+    elif decision == "insufficient_evidence":
+        unverified = verdict.get("unverified")
+        if not isinstance(unverified, list) or len(unverified) == 0:
+            raise GitHubReviewError(
+                "verdict_no_unverified",
+                "verdict.unverified must be a non-empty list for insufficient_evidence",
+            )
+        for i, u in enumerate(unverified):
+            if not isinstance(u, str) or not u.strip():
+                raise GitHubReviewError(
+                    "verdict_unverified_malformed",
+                    f"verdict.unverified[{i}] must be a non-blank string",
+                )
+
     token = _load_token(credentials_path)
 
     # Guard 2: re-fetch PR head and refuse if it has moved
@@ -256,6 +301,16 @@ def submit_review(
     lines.extend(f"- {p}" for p in props)
     lines.append("")
     lines.extend(f"- {m} [mutation]" for m in muts)
+    if decision == "request_changes":
+        lines.append("")
+        lines.append("Findings:")
+        for f in findings:  # type: ignore[assignment]
+            loc_str = f" ({f['location']})" if f.get("location") else ""
+            lines.append(f"- {f['summary']}: {f['evidence']}{loc_str}")
+    elif decision == "insufficient_evidence":
+        lines.append("")
+        lines.append("Could not verify:")
+        lines.extend(f"- {u}" for u in unverified)  # type: ignore[assignment]
     body_text = "\n".join(lines).strip()
 
     _github_post(

@@ -25,6 +25,18 @@ _VALID_VERDICT = {
     "mutations_tried": ["reverted continue to break — test failed"],
 }
 
+_VALID_VERDICT_REQUEST_CHANGES = {
+    **_VALID_VERDICT,
+    "findings": [
+        {"summary": "reload drops names on empty file", "evidence": "clear() runs before parse; exception leaves set empty", "location": "src/fleet-bus.ts:312"},
+    ],
+}
+
+_VALID_VERDICT_INSUFFICIENT = {
+    **_VALID_VERDICT,
+    "unverified": ["could not reproduce concurrency race under test conditions"],
+}
+
 
 # --- test transport stub ---
 
@@ -244,6 +256,133 @@ def test_bad_decision_raises(tmp_path: Path) -> None:
         )
 
 
+# --- guard 1: decision-specific fields ---
+
+
+def test_request_changes_without_findings_raises(tmp_path: Path) -> None:
+    """request_changes without findings is not actionable — the reviewer cannot say what is wrong."""
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_findings"):
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", _VALID_VERDICT,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_request_changes_empty_findings_raises(tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_findings"):
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", {**_VALID_VERDICT, "findings": []},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+@pytest.mark.parametrize("bad_finding", [
+    {"evidence": "e"},                                     # missing summary
+    {"summary": "", "evidence": "e"},                     # empty summary
+    {"summary": "   ", "evidence": "e"},                  # whitespace-only summary
+    {"summary": "s"},                                      # missing evidence
+    {"summary": "s", "evidence": ""},                     # empty evidence
+    {"summary": "s", "evidence": "   "},                  # whitespace-only evidence
+    {"summary": "s", "evidence": "e", "location": 42},    # location not a string
+    {"summary": "s", "evidence": "e", "location": ""},    # empty location
+    {"summary": "s", "evidence": "e", "location": "   "}, # whitespace-only location
+    "not a dict",                                          # wrong type entirely
+    None,                                                  # null item
+])
+def test_request_changes_malformed_finding_raises(tmp_path: Path, bad_finding: Any) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_finding_malformed"):
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", {**_VALID_VERDICT, "findings": [bad_finding]},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_request_changes_finding_location_optional(tmp_path: Path) -> None:
+    """location is optional; omitting it must not raise."""
+    creds = _creds_file(tmp_path)
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    verdict = {**_VALID_VERDICT, "findings": [{"summary": "s", "evidence": "e"}]}
+    gh.submit_review(
+        REPO, PR, HEAD, "request_changes", verdict,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+
+
+def test_insufficient_evidence_without_unverified_raises(tmp_path: Path) -> None:
+    """insufficient_evidence without unverified names nothing — the verdict's whole content is the residual."""
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_unverified"):
+        gh.submit_review(
+            REPO, PR, HEAD, "insufficient_evidence", _VALID_VERDICT,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_insufficient_evidence_empty_unverified_raises(tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_unverified"):
+        gh.submit_review(
+            REPO, PR, HEAD, "insufficient_evidence", {**_VALID_VERDICT, "unverified": []},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+@pytest.mark.parametrize("bad_item", [
+    "",         # empty string
+    "   ",      # whitespace-only string
+    None,       # null
+    42,         # wrong type
+])
+def test_insufficient_evidence_malformed_unverified_item_raises(tmp_path: Path, bad_item: Any) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_unverified_malformed"):
+        gh.submit_review(
+            REPO, PR, HEAD, "insufficient_evidence",
+            {**_VALID_VERDICT, "unverified": [bad_item]},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_findings_and_unverified_appear_in_post_body(tmp_path: Path) -> None:
+    """findings surface in request_changes body; unverified surface in insufficient_evidence body."""
+    creds = _creds_file(tmp_path)
+
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    gh.submit_review(
+        REPO, PR, HEAD, "request_changes", _VALID_VERDICT_REQUEST_CHANGES,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+    body = json.loads(factory.conns[1].calls[0][2])["body"]
+    assert "reload drops names on empty file" in body
+    assert "clear() runs before parse" in body
+    assert "src/fleet-bus.ts:312" in body
+
+    responses2 = [_pr_response(), _review_response()]
+    factory2 = _conn_factory_for(responses2)
+    gh.submit_review(
+        REPO, PR, HEAD, "insufficient_evidence", _VALID_VERDICT_INSUFFICIENT,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory2,
+    )
+    body2 = json.loads(factory2.conns[1].calls[0][2])["body"]
+    assert "could not reproduce concurrency race" in body2
+
+
+def test_approve_does_not_require_findings_or_unverified(tmp_path: Path) -> None:
+    """approve keeps the existing shape — no extra fields needed."""
+    creds = _creds_file(tmp_path)
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    gh.submit_review(
+        REPO, PR, HEAD, "approve", _VALID_VERDICT,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+
+
 # --- guard 2: head moved ---
 
 
@@ -280,22 +419,22 @@ def test_no_github_credential_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("decision", "expected_event"),
+    ("decision", "expected_event", "verdict"),
     [
-        ("approve", "APPROVE"),
-        ("request_changes", "REQUEST_CHANGES"),
-        ("insufficient_evidence", "COMMENT"),
+        ("approve", "APPROVE", _VALID_VERDICT),
+        ("request_changes", "REQUEST_CHANGES", _VALID_VERDICT_REQUEST_CHANGES),
+        ("insufficient_evidence", "COMMENT", _VALID_VERDICT_INSUFFICIENT),
     ],
 )
 def test_valid_verdict_posts_exactly_once_with_correct_event(
-    tmp_path: Path, decision: str, expected_event: str
+    tmp_path: Path, decision: str, expected_event: str, verdict: dict,
 ) -> None:
     creds = _creds_file(tmp_path)
     responses = [_pr_response(), _review_response()]
     factory = _conn_factory_for(responses)
 
     result = gh.submit_review(
-        REPO, PR, HEAD, decision, _VALID_VERDICT,
+        REPO, PR, HEAD, decision, verdict,
         credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
     )
 
@@ -376,6 +515,179 @@ def test_submit_review_in_tools_registry() -> None:
             credentials_path=None,  # allowlist check fires before credential load
             allowlist=frozenset(),
         )
+
+
+# --- schema / handler contract ---
+
+
+def test_schema_declares_findings_and_unverified() -> None:
+    """The exported schema must declare findings and unverified as known properties.
+
+    A schema with additionalProperties:false that omits these fields causes
+    strict schema validators (and LLMs reading the schema) to reject valid
+    request_changes and insufficient_evidence verdicts before they reach the handler.
+    """
+    import tools
+    verdict_schema = tools.REGISTRY["submit_review"].parameters["properties"]["verdict"]
+    declared = set(verdict_schema.get("properties", {}).keys())
+    assert "findings" in declared, "findings not in verdict schema — schema/handler contract broken"
+    assert "unverified" in declared, "unverified not in verdict schema — schema/handler contract broken"
+    # additionalProperties:false must still apply — undeclared fields must be rejected
+    assert verdict_schema.get("additionalProperties") is False
+
+
+def _submit_review_args(decision: str, verdict: dict) -> dict:
+    """Build a full submit_review args dict suitable for jsonschema.validate."""
+    return {"repo": REPO, "pr": PR, "head_sha": HEAD, "decision": decision, "verdict": verdict}
+
+
+def test_schema_rejects_request_changes_without_findings() -> None:
+    """Schema must reject request_changes when findings is absent.
+
+    This test is a canary: if findings is removed from the exported schema or the
+    if/then conditional is dropped, jsonschema.validate will no longer raise, and
+    this test will FAIL — proving the contract is enforced at the schema level.
+    """
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    # Missing findings entirely
+    args = _submit_review_args("request_changes", {"properties_asserted": ["p"], "mutations_tried": ["m"]})
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args, schema)
+    # Empty findings list
+    args2 = _submit_review_args("request_changes", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"], "findings": [],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args2, schema)
+
+
+def test_schema_rejects_insufficient_evidence_without_unverified() -> None:
+    """Schema must reject insufficient_evidence when unverified is absent.
+
+    Same canary property: removing unverified from the exported schema or dropping
+    the if/then conditional causes this test to FAIL.
+    """
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    args = _submit_review_args("insufficient_evidence", {"properties_asserted": ["p"], "mutations_tried": ["m"]})
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args, schema)
+    args2 = _submit_review_args("insufficient_evidence", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"], "unverified": [],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args2, schema)
+
+
+def test_schema_rejects_blank_strings_in_findings_and_unverified() -> None:
+    """Schema must reject blank (empty or whitespace-only) summary/evidence/unverified strings.
+
+    minLength:1 alone accepts whitespace-only strings like "   " — the handler's
+    .strip() check rejects them, creating a gap where schema-conforming callers get
+    handler errors. The pattern:\\S constraint closes it.
+
+    This test is a canary: removing the pattern from the schema (mutation) leaves
+    the whitespace cases passing jsonschema.validate, causing this test to FAIL.
+    """
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    # Empty strings — caught by minLength
+    empty_summary = _submit_review_args("request_changes", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"],
+        "findings": [{"summary": "", "evidence": "e"}],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(empty_summary, schema)
+    # Whitespace-only strings — caught by pattern:\\S (the mutation target)
+    whitespace_summary = _submit_review_args("request_changes", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"],
+        "findings": [{"summary": "   ", "evidence": "e"}],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(whitespace_summary, schema)
+    whitespace_unverified = _submit_review_args("insufficient_evidence", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"],
+        "unverified": ["   "],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(whitespace_unverified, schema)
+
+
+def test_schema_and_handler_agree_request_changes(tmp_path: Path) -> None:
+    """A verdict that passes jsonschema.validate for request_changes must also pass the handler.
+
+    Both validations run on the same args dict. Failure on either leg means drift:
+    - schema accepts but handler rejects: callers that read the schema get runtime errors
+    - schema rejects but handler accepts: schema is over-restrictive (less dangerous but wrong)
+    """
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    verdict = {
+        "properties_asserted": ["p"],
+        "mutations_tried": ["m"],
+        "findings": [{"summary": "null ptr on empty reload", "evidence": "line 42 clears before parse"}],
+    }
+    args = _submit_review_args("request_changes", verdict)
+    jsonschema.validate(args, schema)  # schema leg: must not raise
+    creds = _creds_file(tmp_path)
+    factory = _conn_factory_for([_pr_response(), _review_response()])
+    result = gh.submit_review(
+        REPO, PR, HEAD, "request_changes", verdict,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+    assert "REQUEST_CHANGES" in result  # handler leg: must not raise
+
+
+def test_schema_and_handler_agree_insufficient_evidence(tmp_path: Path) -> None:
+    """A verdict that passes jsonschema.validate for insufficient_evidence must pass the handler."""
+    import tools
+    import jsonschema
+    schema = tools.REGISTRY["submit_review"].parameters
+    verdict = {
+        "properties_asserted": ["p"],
+        "mutations_tried": ["m"],
+        "unverified": ["could not reproduce race condition in test environment"],
+    }
+    args = _submit_review_args("insufficient_evidence", verdict)
+    jsonschema.validate(args, schema)  # schema leg
+    creds = _creds_file(tmp_path)
+    factory = _conn_factory_for([_pr_response(), _review_response()])
+    result = gh.submit_review(
+        REPO, PR, HEAD, "insufficient_evidence", verdict,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+    assert "COMMENT" in result  # handler leg
+
+
+def test_schema_location_null_treated_as_absent(tmp_path: Path) -> None:
+    """location:null is treated as absent by the handler.
+
+    The schema declares location as type ["string", "null"]. A caller that
+    omits location or passes null must get the same result — no location suffix
+    in the body, no error. This documents the intentional null-as-absent policy.
+    """
+    creds = _creds_file(tmp_path)
+    for location_value in (None, "explicit-location"):
+        responses = [_pr_response(), _review_response()]
+        factory = _conn_factory_for(responses)
+        verdict = {
+            **_VALID_VERDICT_REQUEST_CHANGES,
+            "findings": [{"summary": "s", "evidence": "e", "location": location_value}],
+        }
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", verdict,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+        )
+        body = json.loads(factory.conns[1].calls[0][2])["body"]
+        if location_value is None:
+            assert "(None)" not in body  # null location must not appear as text
+        else:
+            assert "explicit-location" in body
 
 
 def test_submit_review_granted_via_tools_yaml(tmp_path: Path) -> None:

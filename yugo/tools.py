@@ -304,8 +304,12 @@ REGISTRY: Mapping[str, Tool] = {
         description=(
             "Submit a formal GitHub PR review. "
             "`decision` must be approve, request_changes, or insufficient_evidence. "
-            "`verdict` must have non-empty `properties_asserted` and `mutations_tried` "
-            "lists. The PR head is re-fetched and must match `head_sha`."
+            "`verdict` must always have non-empty `properties_asserted` and `mutations_tried` lists. "
+            "For request_changes: also requires non-empty `findings` list "
+            "(each item: non-blank `summary` and `evidence` strings, optional non-blank `location`). "
+            "For insufficient_evidence: also requires non-empty `unverified` list of non-blank strings. "
+            "For approve: only properties_asserted and mutations_tried are required. "
+            "The PR head is re-fetched and must match `head_sha`."
         ),
         parameters={
             "type": "object",
@@ -328,6 +332,17 @@ REGISTRY: Mapping[str, Tool] = {
                 },
                 "verdict": {
                     "type": "object",
+                    "description": (
+                        "Review evidence. properties_asserted and mutations_tried are always required. "
+                        "findings is required for request_changes: non-empty list, each item needs "
+                        "non-blank summary and evidence strings, optional non-blank location string; "
+                        "location:null is treated as absent. "
+                        "unverified is required for insufficient_evidence: non-empty list of non-blank "
+                        "strings naming what could not be verified. "
+                        "approve needs only the base fields. "
+                        "summary/evidence/location/unverified are review prose and pass through to "
+                        "the GitHub review body without escaping."
+                    ),
                     "properties": {
                         "properties_asserted": {
                             "type": "array",
@@ -339,6 +354,27 @@ REGISTRY: Mapping[str, Tool] = {
                             "items": {"type": "string"},
                             "description": "Mutations considered or tested",
                         },
+                        "findings": {
+                            "type": "array",
+                            "description": "Required for request_changes. Each item names a defect.",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "summary":  {"type": "string", "minLength": 1, "pattern": "\\S", "description": "One-line defect name"},
+                                    "evidence": {"type": "string", "minLength": 1, "pattern": "\\S", "description": "What proves it"},
+                                    "location": {"type": ["string", "null"], "minLength": 1, "pattern": "\\S", "description": "File and line, optional. null treated as absent."},
+                                },
+                                "required": ["summary", "evidence"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "unverified": {
+                            "type": "array",
+                            "description": "Required for insufficient_evidence. Names what could not be verified.",
+                            "minItems": 1,
+                            "items": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                        },
                     },
                     "required": ["properties_asserted", "mutations_tried"],
                     "additionalProperties": False,
@@ -346,6 +382,33 @@ REGISTRY: Mapping[str, Tool] = {
             },
             "required": ["repo", "pr", "head_sha", "decision", "verdict"],
             "additionalProperties": False,
+            # Decision-specific verdict requirements enforced at schema level so that
+            # schema-conforming callers cannot construct a call that passes the schema
+            # but fails the handler. if/then requires Draft 7; jsonschema 3+ supports it.
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"decision": {"const": "request_changes"}},
+                        "required": ["decision"],
+                    },
+                    "then": {
+                        "properties": {
+                            "verdict": {"required": ["findings"]},
+                        },
+                    },
+                },
+                {
+                    "if": {
+                        "properties": {"decision": {"const": "insufficient_evidence"}},
+                        "required": ["decision"],
+                    },
+                    "then": {
+                        "properties": {
+                            "verdict": {"required": ["unverified"]},
+                        },
+                    },
+                },
+            ],
         },
         handler=_submit_review_unbound,
         config={
