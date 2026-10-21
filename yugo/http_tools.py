@@ -127,7 +127,15 @@ def _parse_yaml(text: str, path: Path):
         node = yaml.compose(text, Loader=yaml.SafeLoader); _reject_graph(node)
         return yaml.load(text, Loader=_SafeUniqueLoader)  # custom SafeLoader, never default
     except HttpStartupError: raise
-    except yaml.YAMLError as e: raise HttpStartupError(f"credentials file {path} malformed YAML: {e}") from e
+    except yaml.YAMLError as e:
+        # Never interpolate `str(e)` — PyYAML's MarkedYAMLError quotes the
+        # offending source line verbatim, which leaks secrets into any context
+        # that surfaces this error (model context, provider API, logs).
+        # Use only the problem description and position; never the source text.
+        mark = getattr(e, 'problem_mark', None)
+        loc = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+        problem = getattr(e, 'problem', None) or type(e).__name__
+        raise HttpStartupError(f"credentials file {path} malformed YAML{loc}: {problem}") from e
 
 def _blocked_name(host: str) -> str | None:
     """Name the blocked entry `host` sits under, matching WHOLE trailing labels.

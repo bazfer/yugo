@@ -94,6 +94,32 @@ def test_duplicate_credential_id_is_refused_across_distinct_origins(tmp_path):
     assert len(load(tmp_path,ok))==2
 
 
+def test_malformed_yaml_does_not_leak_secret_value(tmp_path):
+    """A YAML parse error must never include the source line in its message.
+
+    PyYAML's MarkedYAMLError quotes the offending source line verbatim. If the
+    bad line contains a partially-written secret, that secret reaches whatever
+    surfaces the exception — the model's context and from there a provider API.
+
+    Assert the canary does NOT appear in the HttpStartupError message. The
+    error may include the file path, line number, and error problem, but not
+    the source text.
+    """
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    # Missing closing quote causes PyYAML to quote the secret-bearing line in
+    # its error message. The error is real: try yaml.safe_load to confirm.
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: "Bearer {canary}\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value), (
+        f"Secret leaked into error message: {exc_info.value}"
+    )
+
+
 @pytest.mark.parametrize("cid",['id: Bearer_secret','id: gh-Bearer_secret'],ids=["equal","contains"])
 def test_credential_id_may_not_carry_its_own_value(tmp_path,cid):
     """`id` is returned to the model as `credential_id` and is written to the
