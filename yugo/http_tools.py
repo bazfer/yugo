@@ -128,14 +128,18 @@ def _parse_yaml(text: str, path: Path):
         return yaml.load(text, Loader=_SafeUniqueLoader)  # custom SafeLoader, never default
     except HttpStartupError: raise
     except yaml.YAMLError as e:
-        # Never interpolate `str(e)` — PyYAML's MarkedYAMLError quotes the
-        # offending source line verbatim, which leaks secrets into any context
-        # that surfaces this error (model context, provider API, logs).
-        # Use only the problem description and position; never the source text.
+        # NEVER render any PyYAML-generated string in the error message.
+        # PyYAML embeds user-controlled text in both str(e) AND e.problem:
+        #   - unterminated quote: source line quoted verbatim in str(e)
+        #   - undefined alias *SECRET: "found undefined alias 'SECRET'" in e.problem
+        #   - anchor &SECRET, tag !!SECRET: similarly in e.problem
+        # Additionally, `raise ... from e` retains the raw parser exception in
+        # __cause__, exposing secrets through traceback.format_exception().
+        # Fix: fixed category + numeric position only; suppress the chain.
         mark = getattr(e, 'problem_mark', None)
         loc = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
-        problem = getattr(e, 'problem', None) or type(e).__name__
-        raise HttpStartupError(f"credentials file {path} malformed YAML{loc}: {problem}") from e
+        category = type(e).__name__  # class name: code-defined, not user data
+        raise HttpStartupError(f"credentials file {path} malformed YAML{loc} ({category})") from None
 
 def _blocked_name(host: str) -> str | None:
     """Name the blocked entry `host` sits under, matching WHOLE trailing labels.

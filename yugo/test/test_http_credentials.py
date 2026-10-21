@@ -94,6 +94,52 @@ def test_duplicate_credential_id_is_refused_across_distinct_origins(tmp_path):
     assert len(load(tmp_path,ok))==2
 
 
+def test_malformed_yaml_alias_does_not_leak_secret_value(tmp_path):
+    """PyYAML embeds the alias name verbatim in e.problem: 'found undefined alias <NAME>'.
+
+    An alias that uses the secret as its name (e.g. *CANARY in a value field)
+    leaks through e.problem even when str(e) / source lines are avoided.
+    The fix must not render e.problem at all.
+    """
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: *{canary}\n'  # undefined alias
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value), (
+        f"Alias name leaked into error message: {exc_info.value}"
+    )
+
+
+def test_malformed_yaml_does_not_leak_secret_in_traceback(tmp_path):
+    """raise ... from e retains the raw parser exception in __cause__.
+
+    traceback.format_exception() renders the full chain, including the PyYAML
+    error with its source-quoting str(). The fix uses `from None` to suppress
+    the chain and prevent secrets surfacing in formatted tracebacks.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: "Bearer {canary}\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text, (
+        f"Secret leaked into formatted traceback"
+    )
+    # `from None` sets __suppress_context__ = True. Python still mechanically sets
+    # __context__ inside the except block, but the formatter won't render the chain.
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
 def test_malformed_yaml_does_not_leak_secret_value(tmp_path):
     """A YAML parse error must never include the source line in its message.
 
