@@ -25,6 +25,18 @@ _VALID_VERDICT = {
     "mutations_tried": ["reverted continue to break — test failed"],
 }
 
+_VALID_VERDICT_REQUEST_CHANGES = {
+    **_VALID_VERDICT,
+    "findings": [
+        {"summary": "reload drops names on empty file", "evidence": "clear() runs before parse; exception leaves set empty", "location": "src/fleet-bus.ts:312"},
+    ],
+}
+
+_VALID_VERDICT_INSUFFICIENT = {
+    **_VALID_VERDICT,
+    "unverified": ["could not reproduce concurrency race under test conditions"],
+}
+
 
 # --- test transport stub ---
 
@@ -244,6 +256,112 @@ def test_bad_decision_raises(tmp_path: Path) -> None:
         )
 
 
+# --- guard 1: decision-specific fields ---
+
+
+def test_request_changes_without_findings_raises(tmp_path: Path) -> None:
+    """request_changes without findings is not actionable — the reviewer cannot say what is wrong."""
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_findings"):
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", _VALID_VERDICT,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_request_changes_empty_findings_raises(tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_findings"):
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", {**_VALID_VERDICT, "findings": []},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+@pytest.mark.parametrize("bad_finding", [
+    {"evidence": "e"},                                   # missing summary
+    {"summary": "", "evidence": "e"},                   # empty summary
+    {"summary": "s"},                                    # missing evidence
+    {"summary": "s", "evidence": ""},                   # empty evidence
+    {"summary": "s", "evidence": "e", "location": 42},  # location not a string
+    "not a dict",                                        # wrong type entirely
+])
+def test_request_changes_malformed_finding_raises(tmp_path: Path, bad_finding: Any) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_finding_malformed"):
+        gh.submit_review(
+            REPO, PR, HEAD, "request_changes", {**_VALID_VERDICT, "findings": [bad_finding]},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_request_changes_finding_location_optional(tmp_path: Path) -> None:
+    """location is optional; omitting it must not raise."""
+    creds = _creds_file(tmp_path)
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    verdict = {**_VALID_VERDICT, "findings": [{"summary": "s", "evidence": "e"}]}
+    gh.submit_review(
+        REPO, PR, HEAD, "request_changes", verdict,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+
+
+def test_insufficient_evidence_without_unverified_raises(tmp_path: Path) -> None:
+    """insufficient_evidence without unverified names nothing — the verdict's whole content is the residual."""
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_unverified"):
+        gh.submit_review(
+            REPO, PR, HEAD, "insufficient_evidence", _VALID_VERDICT,
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_insufficient_evidence_empty_unverified_raises(tmp_path: Path) -> None:
+    creds = _creds_file(tmp_path)
+    with pytest.raises(gh.GitHubReviewError, match="verdict_no_unverified"):
+        gh.submit_review(
+            REPO, PR, HEAD, "insufficient_evidence", {**_VALID_VERDICT, "unverified": []},
+            credentials_path=creds, allowlist=gh.ALLOW_ALL,
+        )
+
+
+def test_findings_and_unverified_appear_in_post_body(tmp_path: Path) -> None:
+    """findings surface in request_changes body; unverified surface in insufficient_evidence body."""
+    creds = _creds_file(tmp_path)
+
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    gh.submit_review(
+        REPO, PR, HEAD, "request_changes", _VALID_VERDICT_REQUEST_CHANGES,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+    body = json.loads(factory.conns[1].calls[0][2])["body"]
+    assert "reload drops names on empty file" in body
+    assert "clear() runs before parse" in body
+    assert "src/fleet-bus.ts:312" in body
+
+    responses2 = [_pr_response(), _review_response()]
+    factory2 = _conn_factory_for(responses2)
+    gh.submit_review(
+        REPO, PR, HEAD, "insufficient_evidence", _VALID_VERDICT_INSUFFICIENT,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory2,
+    )
+    body2 = json.loads(factory2.conns[1].calls[0][2])["body"]
+    assert "could not reproduce concurrency race" in body2
+
+
+def test_approve_does_not_require_findings_or_unverified(tmp_path: Path) -> None:
+    """approve keeps the existing shape — no extra fields needed."""
+    creds = _creds_file(tmp_path)
+    responses = [_pr_response(), _review_response()]
+    factory = _conn_factory_for(responses)
+    gh.submit_review(
+        REPO, PR, HEAD, "approve", _VALID_VERDICT,
+        credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
+    )
+
+
 # --- guard 2: head moved ---
 
 
@@ -280,22 +398,22 @@ def test_no_github_credential_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("decision", "expected_event"),
+    ("decision", "expected_event", "verdict"),
     [
-        ("approve", "APPROVE"),
-        ("request_changes", "REQUEST_CHANGES"),
-        ("insufficient_evidence", "COMMENT"),
+        ("approve", "APPROVE", _VALID_VERDICT),
+        ("request_changes", "REQUEST_CHANGES", _VALID_VERDICT_REQUEST_CHANGES),
+        ("insufficient_evidence", "COMMENT", _VALID_VERDICT_INSUFFICIENT),
     ],
 )
 def test_valid_verdict_posts_exactly_once_with_correct_event(
-    tmp_path: Path, decision: str, expected_event: str
+    tmp_path: Path, decision: str, expected_event: str, verdict: dict,
 ) -> None:
     creds = _creds_file(tmp_path)
     responses = [_pr_response(), _review_response()]
     factory = _conn_factory_for(responses)
 
     result = gh.submit_review(
-        REPO, PR, HEAD, decision, _VALID_VERDICT,
+        REPO, PR, HEAD, decision, verdict,
         credentials_path=creds, allowlist=gh.ALLOW_ALL, _conn_factory=factory,
     )
 
