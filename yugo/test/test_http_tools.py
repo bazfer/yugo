@@ -1343,26 +1343,25 @@ def test_user_agent_present_on_each_redirect_hop_bytes(monkeypatch):
         assert b"User-Agent: yugo/" in sent, f"hop {i+1} missing User-Agent: {sent[:300]}"
 
 
-def test_user_agent_non_ascii_override_does_not_reach_sendall(monkeypatch):
-    """A non-ASCII YUGO_HTTP_USER_AGENT must be rejected before sendall is called.
+def test_user_agent_non_ascii_override_rejected_before_connect(monkeypatch):
+    """A non-ASCII YUGO_HTTP_USER_AGENT must be rejected before _connect is called.
 
-    Without sanitization, the encode("ascii") at sendall would crash mid-request
-    with UnicodeEncodeError rather than a clean HttpGetError.
+    The UA is validated at the top of http_get, before the redirect loop — so
+    no socket is ever opened. A sendall-only spy would pass even if the guard
+    moved to after _connect; _connect is the tighter proof of ordering.
     """
-    sendall_calls = []
+    connect_calls = []
 
-    class TrackingSendall(FakeSocket):
-        def sendall(self, value):
-            sendall_calls.append(value)
-            super().sendall(value)
+    def spy_connect(*a, **k):
+        connect_calls.append(a)
+        return FakeSocket(response(b"ok"))
 
-    sockets = [TrackingSendall(response(b"ok"))]
     monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
-    monkeypatch.setattr(h, "_connect", lambda *a, **k: sockets[0])
+    monkeypatch.setattr(h, "_connect", spy_connect)
     monkeypatch.setenv("YUGO_HTTP_USER_AGENT", "yugo/café")
     with pytest.raises(h.HttpGetError, match="non-ASCII"):
         h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=0, remaining_budget=30, credentials={})
-    assert sendall_calls == [], "sendall must not have been called before the non-ASCII header is rejected"
+    assert connect_calls == [], "_connect must not have been called before the non-ASCII UA is rejected"
 
 
 def test_audit_includes_http_status_on_4xx(monkeypatch):
@@ -1394,3 +1393,39 @@ def test_audit_http_status_null_on_transport_error(monkeypatch):
     with pytest.raises(h.HttpGetError) as exc_info:
         h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=0, remaining_budget=30, credentials={})
     assert exc_info.value.audit_fields["http_status"] is None
+
+
+def test_audit_http_status_null_when_redirect_second_hop_fails(monkeypatch):
+    """A redirect whose second hop fails at transport must leave http_status null.
+
+    status_cell is set only AFTER the redirect branch is not taken — i.e., when
+    the hop is known to be final. Without this constraint, a 302 followed by a
+    transport error on hop 2 reports http_status=302, describing the intermediate
+    redirect rather than the response that produced (or failed to produce) the result.
+
+    Ion's mutation: setting status_cell immediately after _read_headers (before
+    the redirect check) makes this test fail — the audit carries 302 instead of None.
+    """
+    hop1 = response(b"", status=302, headers=[("Location", "http://public.example/y"), ("Content-Length", "0")])
+
+    call_count = [0]
+
+    def patched_connect(*a, **k):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return FakeSocket(hop1)
+        raise OSError("connection refused on hop 2")
+
+    monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
+    monkeypatch.setattr(h, "_connect", patched_connect)
+    monkeypatch.delenv("YUGO_HTTP_USER_AGENT", raising=False)
+
+    with pytest.raises(h.HttpGetError) as exc_info:
+        h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=5, remaining_budget=30, credentials={})
+
+    assert call_count[0] == 2, "expected two _connect calls (hop 1 succeeded, hop 2 failed)"
+    assert exc_info.value.audit_fields["http_status"] is None, (
+        f"http_status must be null when the final hop never received a response; "
+        f"got {exc_info.value.audit_fields['http_status']} — "
+        f"a redirect's intermediate status must not leak into the audit"
+    )

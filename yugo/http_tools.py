@@ -739,7 +739,6 @@ def http_get(url: str, *, max_bytes: int, timeout_ms: int, max_redirects: int, r
                     req.append(f"{selected.header}: {selected.value}"); attached.append(origin.rendered())
                 sock.sendall(("\r\n".join(req)+"\r\n\r\n").encode("ascii"))
                 status, hs, initial, headers_total=_read_headers(sock,deadline,headers_total)
-                status_cell[0]=status
                 if status in REDIRECTS:
                     # SPEC 9.3.3: body bytes that shared the header read are
                     # discarded UNCHARGED and no further read is issued. The
@@ -767,6 +766,10 @@ def http_get(url: str, *, max_bytes: int, timeout_ms: int, max_redirects: int, r
                     # close immediately: never drain redirect body
                     redirects+=1; current,origin,parts=next_url,next_origin,next_parts
                     continue
+                # Only reached when this hop is the final one (not a redirect).
+                # Setting the cell here guarantees http_status describes the response
+                # that produced the result — never an intermediate redirect status.
+                status_cell[0]=status
                 encoding=_encoding(hs)
                 decoder=zlib.decompressobj(16+zlib.MAX_WBITS) if encoding=="gzip" else None
                 output=bytearray()
