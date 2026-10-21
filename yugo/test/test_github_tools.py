@@ -583,22 +583,38 @@ def test_schema_rejects_insufficient_evidence_without_unverified() -> None:
 
 
 def test_schema_rejects_blank_strings_in_findings_and_unverified() -> None:
-    """Schema must reject blank summary/evidence strings and blank unverified entries."""
+    """Schema must reject blank (empty or whitespace-only) summary/evidence/unverified strings.
+
+    minLength:1 alone accepts whitespace-only strings like "   " — the handler's
+    .strip() check rejects them, creating a gap where schema-conforming callers get
+    handler errors. The pattern:\\S constraint closes it.
+
+    This test is a canary: removing the pattern from the schema (mutation) leaves
+    the whitespace cases passing jsonschema.validate, causing this test to FAIL.
+    """
     import tools
     import jsonschema
     schema = tools.REGISTRY["submit_review"].parameters
-    blank_summary = _submit_review_args("request_changes", {
+    # Empty strings — caught by minLength
+    empty_summary = _submit_review_args("request_changes", {
         "properties_asserted": ["p"], "mutations_tried": ["m"],
         "findings": [{"summary": "", "evidence": "e"}],
     })
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(blank_summary, schema)
-    blank_unverified = _submit_review_args("insufficient_evidence", {
+        jsonschema.validate(empty_summary, schema)
+    # Whitespace-only strings — caught by pattern:\\S (the mutation target)
+    whitespace_summary = _submit_review_args("request_changes", {
         "properties_asserted": ["p"], "mutations_tried": ["m"],
-        "unverified": [""],
+        "findings": [{"summary": "   ", "evidence": "e"}],
     })
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(blank_unverified, schema)
+        jsonschema.validate(whitespace_summary, schema)
+    whitespace_unverified = _submit_review_args("insufficient_evidence", {
+        "properties_asserted": ["p"], "mutations_tried": ["m"],
+        "unverified": ["   "],
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(whitespace_unverified, schema)
 
 
 def test_schema_and_handler_agree_request_changes(tmp_path: Path) -> None:

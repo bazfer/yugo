@@ -361,9 +361,9 @@ REGISTRY: Mapping[str, Tool] = {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "summary": {"type": "string", "minLength": 1, "description": "One-line defect name"},
-                                    "evidence": {"type": "string", "minLength": 1, "description": "What proves it"},
-                                    "location": {"type": ["string", "null"], "minLength": 1, "description": "File and line, optional. null treated as absent."},
+                                    "summary":  {"type": "string", "minLength": 1, "pattern": "\\S", "description": "One-line defect name"},
+                                    "evidence": {"type": "string", "minLength": 1, "pattern": "\\S", "description": "What proves it"},
+                                    "location": {"type": ["string", "null"], "minLength": 1, "pattern": "\\S", "description": "File and line, optional. null treated as absent."},
                                 },
                                 "required": ["summary", "evidence"],
                                 "additionalProperties": False,
@@ -373,7 +373,7 @@ REGISTRY: Mapping[str, Tool] = {
                             "type": "array",
                             "description": "Required for insufficient_evidence. Names what could not be verified.",
                             "minItems": 1,
-                            "items": {"type": "string", "minLength": 1},
+                            "items": {"type": "string", "minLength": 1, "pattern": "\\S"},
                         },
                     },
                     "required": ["properties_asserted", "mutations_tried"],
