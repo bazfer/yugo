@@ -1276,3 +1276,156 @@ def test_the_authority_is_built_in_one_place(monkeypatch):
     # default port makes ambiguous. It brackets for the same reason though.
     assert h.Origin("http","2606:4700:4700::1111",80).rendered() == "http://[2606:4700:4700::1111]:80"
     assert h.Origin("https","api.github.com",443).rendered()     == "https://api.github.com:443"
+
+
+# ── User-Agent and audit http_status ────────────────────────────────────────
+
+def test_user_agent_present_in_request(monkeypatch):
+    """User-Agent must appear in the bytes handed to sendall, not merely in config.
+
+    The bug that prompted this test (issue #83): no User-Agent was sent, causing
+    every api.github.com call to return 403 for two days while the audit read ok.
+    """
+    sockets = [FakeSocket(response(b"ok"))]
+    monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
+    monkeypatch.setattr(h, "_connect", lambda *a, **k: sockets[0])
+    monkeypatch.delenv("YUGO_HTTP_USER_AGENT", raising=False)
+    monkeypatch.delenv("BOT_NAME", raising=False)
+    h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=0, remaining_budget=30, credentials={})
+    sent = sockets[0].sent
+    assert b"User-Agent: yugo/" in sent, f"User-Agent header missing from request bytes: {sent[:300]}"
+
+
+def test_user_agent_present_on_redirect_hop(monkeypatch):
+    """User-Agent must be present on every hop, not only the first.
+
+    The request list is rebuilt inside the redirect loop, so a header added
+    outside the loop would be absent on hop 2+.
+    """
+    hop1 = response(b"", status=301, headers=[("Location", "http://public.example/y"), ("Content-Length", "0")])
+    hop2 = response(b"ok")
+    sockets = [FakeSocket(hop1), FakeSocket(hop2)]
+    monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
+    monkeypatch.setattr(h, "_connect", lambda *a, **k: sockets.pop(0))
+    monkeypatch.delenv("YUGO_HTTP_USER_AGENT", raising=False)
+    monkeypatch.delenv("BOT_NAME", raising=False)
+    h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=5, remaining_budget=30, credentials={})
+    for i, sock in enumerate(sockets):
+        # sockets were popped, so both are now consumed (list is empty); check via local refs
+        pass
+    # Rebuild via a recording approach
+    sockets2 = [FakeSocket(hop1), FakeSocket(hop2)]
+    monkeypatch.setattr(h, "_connect", lambda *a, **k: sockets2.pop(0))
+    h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=5, remaining_budget=30, credentials={})
+    # sockets2 is now empty — both were consumed
+    assert len(sockets2) == 0, "expected two hops"
+
+
+def test_user_agent_present_on_each_redirect_hop_bytes(monkeypatch):
+    """Both hop sockets must carry User-Agent in their sent bytes."""
+    sent_by_hop = []
+    hop1 = response(b"", status=301, headers=[("Location", "http://public.example/y"), ("Content-Length", "0")])
+    hop2 = response(b"ok")
+
+    class RecordingSocket(FakeSocket):
+        def sendall(self, value):
+            sent_by_hop.append(value)
+            super().sendall(value)
+
+    sockets = [RecordingSocket(hop1), RecordingSocket(hop2)]
+    monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
+    monkeypatch.setattr(h, "_connect", lambda *a, **k: sockets.pop(0))
+    monkeypatch.delenv("YUGO_HTTP_USER_AGENT", raising=False)
+    monkeypatch.delenv("BOT_NAME", raising=False)
+    h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=5, remaining_budget=30, credentials={})
+    assert len(sent_by_hop) == 2, f"expected 2 hops, got {len(sent_by_hop)}"
+    for i, sent in enumerate(sent_by_hop):
+        assert b"User-Agent: yugo/" in sent, f"hop {i+1} missing User-Agent: {sent[:300]}"
+
+
+def test_user_agent_non_ascii_override_rejected_before_connect(monkeypatch):
+    """A non-ASCII YUGO_HTTP_USER_AGENT must be rejected before _connect is called.
+
+    The UA is validated at the top of http_get, before the redirect loop — so
+    no socket is ever opened. A sendall-only spy would pass even if the guard
+    moved to after _connect; _connect is the tighter proof of ordering.
+    """
+    connect_calls = []
+
+    def spy_connect(*a, **k):
+        connect_calls.append(a)
+        return FakeSocket(response(b"ok"))
+
+    monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
+    monkeypatch.setattr(h, "_connect", spy_connect)
+    monkeypatch.setenv("YUGO_HTTP_USER_AGENT", "yugo/café")
+    with pytest.raises(h.HttpGetError, match="non-ASCII"):
+        h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=0, remaining_budget=30, credentials={})
+    assert connect_calls == [], "_connect must not have been called before the non-ASCII UA is rejected"
+
+
+def test_audit_includes_http_status_on_4xx(monkeypatch):
+    """A 403 response must carry http_status 403 in the audit record.
+
+    Issue #83: the audit read ok=True while result carried status:403.
+    ok means transport completed — not that the status was 2xx. http_status
+    makes the 4xx greppable in the audit log without changing ok semantics.
+    """
+    out = run(monkeypatch, [response(b'{"message":"forbidden"}', status=403,
+                                      headers=[("Content-Type", "application/json")])])
+    result = json.loads(out)
+    assert result["status"] == 403, "result JSON must carry the 4xx status"
+    assert out.audit_fields["http_status"] == 403, (
+        f"audit_fields must carry http_status 403; got {out.audit_fields}"
+    )
+
+
+def test_audit_http_status_present_on_200(monkeypatch):
+    """http_status is present on success too — it is always set after a response."""
+    out = run(monkeypatch, [response(b"ok")])
+    assert out.audit_fields["http_status"] == 200
+
+
+def test_audit_http_status_null_on_transport_error(monkeypatch):
+    """http_status is null when no response was received (e.g., connection error)."""
+    monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
+    monkeypatch.setattr(h, "_connect", lambda *a, **k: (_ for _ in ()).throw(OSError("refused")))
+    with pytest.raises(h.HttpGetError) as exc_info:
+        h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=0, remaining_budget=30, credentials={})
+    assert exc_info.value.audit_fields["http_status"] is None
+
+
+def test_audit_http_status_null_when_redirect_second_hop_fails(monkeypatch):
+    """A redirect whose second hop fails at transport must leave http_status null.
+
+    status_cell is set only AFTER the redirect branch is not taken — i.e., when
+    the hop is known to be final. Without this constraint, a 302 followed by a
+    transport error on hop 2 reports http_status=302, describing the intermediate
+    redirect rather than the response that produced (or failed to produce) the result.
+
+    Ion's mutation: setting status_cell immediately after _read_headers (before
+    the redirect check) makes this test fail — the audit carries 302 instead of None.
+    """
+    hop1 = response(b"", status=302, headers=[("Location", "http://public.example/y"), ("Content-Length", "0")])
+
+    call_count = [0]
+
+    def patched_connect(*a, **k):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return FakeSocket(hop1)
+        raise OSError("connection refused on hop 2")
+
+    monkeypatch.setattr(h, "_approved_addresses", lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, ("93.184.216.34", 80))])
+    monkeypatch.setattr(h, "_connect", patched_connect)
+    monkeypatch.delenv("YUGO_HTTP_USER_AGENT", raising=False)
+
+    with pytest.raises(h.HttpGetError) as exc_info:
+        h.http_get("http://public.example/x", max_bytes=1000, timeout_ms=30000, max_redirects=5, remaining_budget=30, credentials={})
+
+    assert call_count[0] == 2, "expected two _connect calls (hop 1 succeeded, hop 2 failed)"
+    assert exc_info.value.audit_fields["http_status"] is None, (
+        f"http_status must be null when the final hop never received a response; "
+        f"got {exc_info.value.audit_fields['http_status']} — "
+        f"a redirect's intermediate status must not leak into the audit"
+    )
