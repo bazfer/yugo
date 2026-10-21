@@ -117,10 +117,14 @@ def test_credential_raise_sites_use_only_safe_diagnostics():
     load_credentials (or any other non-allowlisted function) and this test goes red.
     """
     # Functions that legitimately raise something other than CredentialConfigError.
+    # Keys are the dot-joined function path from the module root (no class prefix).
+    #
     # parse_authority: raises HttpStartupError with detail for authority-grammar tests;
     #   load_credentials catches every HttpStartupError from it and converts to
     #   CredentialConfigError("host_invalid", ...) before it reaches a caller.
     # HTTP transport functions: raise HttpGetError only; never touch credential content.
+    # _body_chunks.charge / _body_chunks.more: closures inside _body_chunks; raise
+    #   HttpGetError for wire-size and timeout limits.
     ALLOWLISTED_FUNCS = frozenset({
         "parse_authority",
         "_remaining",
@@ -129,9 +133,9 @@ def test_credential_raise_sites_use_only_safe_diagnostics():
         "_connect",
         "_read_headers",
         "_reject_repeated_fields",
-        "charge",
-        "more",
         "_body_chunks",
+        "_body_chunks.charge",
+        "_body_chunks.more",
         "_content_type",
         "_encoding",
         "http_get",
@@ -143,21 +147,34 @@ def test_credential_raise_sites_use_only_safe_diagnostics():
 
     class RaiseChecker(ast.NodeVisitor):
         def __init__(self):
-            self.stack: list[str] = []
+            self.func_stack: list[str] = []
+            self.class_stack: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.class_stack.append(node.name)
+            self.generic_visit(node)
+            self.class_stack.pop()
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self.stack.append(node.name)
+            self.func_stack.append(node.name)
             self.generic_visit(node)
-            self.stack.pop()
+            self.func_stack.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_Raise(self, node: ast.Raise) -> None:
             if node.exc is None:
                 return  # bare re-raise — always safe
-            fname = self.stack[-1] if self.stack else "<module>"
-            if fname in ALLOWLISTED_FUNCS:
+            # Allowlist keys are the dot-joined function path with no class prefix.
+            # A class method "parse_authority" on class "Foo" is NOT exempt:
+            # class_stack is non-empty so qualified_name is never checked.
+            if self.class_stack:
+                qname = None  # inside a class — allowlist never applies
+            else:
+                qname = ".".join(self.func_stack) if self.func_stack else "<module>"
+            if qname in ALLOWLISTED_FUNCS:
                 return
+            loc = f"{qname or '<class>.' + (self.func_stack[-1] if self.func_stack else '<module>')} line {node.lineno}"
             exc = node.exc
             if not (
                 isinstance(exc, ast.Call)
@@ -165,19 +182,19 @@ def test_credential_raise_sites_use_only_safe_diagnostics():
                 and exc.func.id == "CredentialConfigError"
             ):
                 violations.append(
-                    f"  {fname} line {node.lineno}: raise does not use CredentialConfigError"
+                    f"  {loc}: raise does not use CredentialConfigError"
                     f" — {ast.dump(exc)[:80]}"
                 )
                 return
             if not exc.args or not (isinstance(exc.args[0], ast.Constant) and isinstance(exc.args[0].value, str)):
                 violations.append(
-                    f"  {fname} line {node.lineno}: CredentialConfigError code is not a string literal"
+                    f"  {loc}: CredentialConfigError code is not a string literal"
                     f" — {ast.dump(exc.args[0] if exc.args else ast.Constant(value=None))[:80]}"
                 )
             for kw in exc.keywords:
                 if kw.arg not in ("line", "col", "index"):
                     violations.append(
-                        f"  {fname} line {node.lineno}: unexpected keyword {kw.arg!r} in CredentialConfigError"
+                        f"  {loc}: unexpected keyword {kw.arg!r} in CredentialConfigError"
                     )
 
     RaiseChecker().visit(tree)
@@ -332,6 +349,66 @@ def test_unhashable_key_does_not_leak_key_repr(tmp_path):
     assert canary not in str(exc_info.value)
     tb_text = "".join(traceback.format_exception(exc_info.value))
     assert canary not in tb_text
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_int_type_tag_does_not_leak_secret(tmp_path):
+    """!!int with a non-integer value raises ValueError — not yaml.YAMLError.
+
+    PyYAML's int constructor calls int() on the parsed scalar. If the scalar is
+    the secret itself (e.g. `value: !!int CANARYSECRET`), the ValueError message
+    contains it verbatim: 'invalid literal for int() with base 10: CANARYSECRET'.
+
+    The old `except yaml.YAMLError` boundary does not catch ValueError, so it
+    escapes _parse_yaml and leaks through load_credentials to the caller.
+
+    Canary: removing the catch-all boundary (`except Exception`) and leaving only
+    `except yaml.YAMLError` makes this test fail — the wrong exception type
+    (ValueError) escapes and pytest.raises(CredentialConfigError) re-raises it.
+    """
+    import traceback
+    canary = "CANARY_SECRET_INT_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: !!int {canary}\n'
+    )
+    with pytest.raises(h.CredentialConfigError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__cause__ is None
+    # __context__ is set by Python inside any except block even with `from None`
+    # — that is expected. `from None` sets __suppress_context__ = True, which
+    # prevents the formatter from rendering the context chain. The canary above
+    # (tb_text) confirms the secret doesn't surface via traceback.format_exception.
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_float_type_tag_does_not_leak_secret(tmp_path):
+    """!!float with a non-float value raises ValueError — same class as !!int.
+
+    Demonstrates the catch-all boundary handles different non-YAML constructor
+    exceptions, not just the !!int case. A second independent path proves
+    'except Exception' is the effective constraint, not a one-off.
+
+    Canary: removing `except Exception` causes ValueError to escape, failing
+    pytest.raises(CredentialConfigError).
+    """
+    import traceback
+    canary = "CANARY_SECRET_FLOAT_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: !!float {canary}\n'
+    )
+    with pytest.raises(h.CredentialConfigError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__cause__ is None
     assert exc_info.value.__suppress_context__ is True
 
 

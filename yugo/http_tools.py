@@ -94,13 +94,17 @@ class CredentialConfigError(HttpStartupError):
         col: int | None = None,
         index: int | None = None,
     ) -> None:
-        self.code = code
-        self.line = line
-        self.col = col
-        self.index = index
+        # Normalize code: unknown codes become "unknown" — never echo arbitrary strings.
+        self.code = code if code in self._MSG else "unknown"
+        # Coerce positions to int — rejects any attempt to carry text via a position
+        # argument (e.g. CredentialConfigError("malformed_yaml", line="CANARYSECRET")
+        # raises ValueError here rather than rendering the string downstream).
+        self.line = int(line) if line is not None else None
+        self.col = int(col) if col is not None else None
+        self.index = int(index) if index is not None else None
 
     def __str__(self) -> str:
-        msg = self._MSG.get(self.code, f"credential error [{self.code}]")
+        msg = self._MSG.get(self.code, "credential error")
         parts: list[str] = []
         if self.index is not None:
             parts.append(f"entry {self.index}")
@@ -210,11 +214,12 @@ def _parse_yaml(text: str, path: Path):
         node = yaml.compose(text, Loader=yaml.SafeLoader); _reject_graph(node)
         return yaml.load(text, Loader=_SafeUniqueLoader)  # custom SafeLoader, never default
     except CredentialConfigError: raise
-    except yaml.YAMLError as e:
-        # NEVER render any PyYAML-generated string. e.problem embeds user-controlled
-        # alias/anchor/tag names; str(e) quotes source lines verbatim; from e exposes
-        # the raw parser exception in __cause__ via traceback.format_exception().
-        # Fix: CredentialConfigError with numeric position only, from None.
+    except Exception as e:
+        # Catches yaml.YAMLError AND non-YAML exceptions from type constructors
+        # (e.g. ValueError from `!!int CANARYSECRET` — not a YAMLError subclass).
+        # Neither the exception type nor its message is forwarded — numeric position
+        # only, from None. problem_mark is a PyYAML attribute; ValueError has none,
+        # so getattr returns None and we fall back to no position.
         mark = getattr(e, "problem_mark", None)
         line = mark.line + 1 if mark else None
         col = mark.column + 1 if mark else None
