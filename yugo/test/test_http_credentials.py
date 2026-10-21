@@ -97,57 +97,96 @@ def test_duplicate_credential_id_is_refused_across_distinct_origins(tmp_path):
 
 
 def test_credential_raise_sites_use_only_safe_diagnostics():
-    """All raise sites in credential-loading functions must use CredentialConfigError
-    with a string literal as the first argument — no f-strings, no !r, no parsed values.
+    """Every raise in http_tools.py must use CredentialConfigError with a literal code,
+    unless the function is on the explicit allowlist of legitimate non-credential raises.
 
-    This is the class-level structural guard. The canary tests below prove specific
-    known paths. This test makes it impossible to add a new leak silently:
-    any raise that does NOT use CredentialConfigError('literal_code', ...) fails here
-    before CI even runs the canaries.
+    This is option (b) from the design — inverted from a named-function watchlist:
+    rather than enumerating the four credential-loading functions by name, we watch
+    the WHOLE FILE and require CredentialConfigError everywhere, with an explicit
+    exemption list for functions that legitimately raise something else.
 
-    Acceptance criterion (Myc's mutation): add `entries!r` to any raise inside a
-    credential-loading function and this test goes red.
+    New functions default to being watched. A new function that raises HttpStartupError
+    with a parsed value is caught here immediately. Adding an exemption is a visible
+    line in the allowlist that a reviewer sees in the diff.
+
+    The allowlist currently contains:
+      parse_authority  — raises HttpStartupError; load_credentials catches and converts
+      11 HTTP-transport functions — raise HttpGetError only; never in the credential path
+
+    Acceptance criterion (Myc's mutation): add `entries!r` to any raise in
+    load_credentials (or any other non-allowlisted function) and this test goes red.
     """
+    # Functions that legitimately raise something other than CredentialConfigError.
+    # parse_authority: raises HttpStartupError with detail for authority-grammar tests;
+    #   load_credentials catches every HttpStartupError from it and converts to
+    #   CredentialConfigError("host_invalid", ...) before it reaches a caller.
+    # HTTP transport functions: raise HttpGetError only; never touch credential content.
+    ALLOWLISTED_FUNCS = frozenset({
+        "parse_authority",
+        "_remaining",
+        "_normalize_url",
+        "_approved_addresses",
+        "_connect",
+        "_read_headers",
+        "_reject_repeated_fields",
+        "charge",
+        "more",
+        "_body_chunks",
+        "_content_type",
+        "_encoding",
+        "http_get",
+    })
+
     src = pathlib.Path(__file__).parent.parent / "http_tools.py"
     tree = ast.parse(src.read_text())
-
-    CRED_FUNCS = {"load_credentials", "_mapping", "_reject_graph", "_parse_yaml"}
     violations: list[str] = []
 
-    for node in ast.walk(tree):
-        if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in CRED_FUNCS):
-            continue
-        for child in ast.walk(node):
-            if not (isinstance(child, ast.Raise) and child.exc is not None):
-                continue
-            exc = child.exc
-            # Only CredentialConfigError(...) is permitted.
+    class RaiseChecker(ast.NodeVisitor):
+        def __init__(self):
+            self.stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Raise(self, node: ast.Raise) -> None:
+            if node.exc is None:
+                return  # bare re-raise — always safe
+            fname = self.stack[-1] if self.stack else "<module>"
+            if fname in ALLOWLISTED_FUNCS:
+                return
+            exc = node.exc
             if not (
                 isinstance(exc, ast.Call)
                 and isinstance(exc.func, ast.Name)
                 and exc.func.id == "CredentialConfigError"
             ):
                 violations.append(
-                    f"  line {child.lineno}: raise does not use CredentialConfigError — {ast.dump(exc)[:80]}"
+                    f"  {fname} line {node.lineno}: raise does not use CredentialConfigError"
+                    f" — {ast.dump(exc)[:80]}"
                 )
-                continue
-            # First argument must be a string literal (no f-string, no variable).
-            if not exc.args:
-                violations.append(f"  line {child.lineno}: CredentialConfigError called with no code argument")
-            elif not (isinstance(exc.args[0], ast.Constant) and isinstance(exc.args[0].value, str)):
+                return
+            if not exc.args or not (isinstance(exc.args[0], ast.Constant) and isinstance(exc.args[0].value, str)):
                 violations.append(
-                    f"  line {child.lineno}: CredentialConfigError code is not a string literal — {ast.dump(exc.args[0])[:80]}"
+                    f"  {fname} line {node.lineno}: CredentialConfigError code is not a string literal"
+                    f" — {ast.dump(exc.args[0] if exc.args else ast.Constant(value=None))[:80]}"
                 )
-            # Keyword arguments must be named line/col/index only.
             for kw in exc.keywords:
                 if kw.arg not in ("line", "col", "index"):
                     violations.append(
-                        f"  line {child.lineno}: unexpected keyword {kw.arg!r} in CredentialConfigError"
+                        f"  {fname} line {node.lineno}: unexpected keyword {kw.arg!r} in CredentialConfigError"
                     )
 
+    RaiseChecker().visit(tree)
+
     assert not violations, (
-        "Credential-loading raise sites must use CredentialConfigError('literal_code', ...)\n"
-        "with no f-strings, !r, or parsed values. Violations:\n" + "\n".join(violations)
+        "All raise sites in http_tools.py outside the allowlist must use\n"
+        "CredentialConfigError('literal_code', ...) with no f-strings or parsed values.\n"
+        "To add a legitimate non-credential raise, add the function name to ALLOWLISTED_FUNCS.\n"
+        "Violations:\n" + "\n".join(violations)
     )
 
 
