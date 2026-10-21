@@ -79,13 +79,13 @@ def _validate_inputs(repo: Any, pr: Any) -> int:
             f"repo must be owner/name with alphanumeric, dot, hyphen, underscore "
             f"(1-100 chars each); got {repo!r}",
         )
-    try:
-        pr_int = int(pr)
-    except (TypeError, ValueError) as exc:
-        raise GitHubReviewError("invalid_pr", f"pr must be an integer; got {pr!r}") from exc
-    if pr_int <= 0:
-        raise GitHubReviewError("invalid_pr", f"pr must be positive; got {pr_int}")
-    return pr_int
+    # bool is an int subclass: isinstance(True, int) is True, so int(True) == 1
+    # reaches the wire as PR #1. type() is not int rejects bool and float both.
+    if type(pr) is not int:
+        raise GitHubReviewError("invalid_pr", f"pr must be a plain int; got {pr!r}")
+    if pr <= 0:
+        raise GitHubReviewError("invalid_pr", f"pr must be positive; got {pr}")
+    return pr
 
 
 def _load_token(credentials_path: Path | None) -> str:
@@ -209,7 +209,9 @@ def submit_review(
     2. PR head is re-fetched and must match `head_sha`. GitHub's
        dismiss_stale_reviews_on_push and require_last_push_approval are both OFF
        on the current fleet repos, so without this guard an approval survives a
-       later push and covers code the reviewer never saw.
+       later push and covers code the reviewer never saw. Note: this check is
+       snapshot-scoped — it proves the head matched at the instant of the GET,
+       not at the POST. A push landing between the two calls is not prevented.
 
     3. The reviewed SHA is written into the review body so the record is
        self-describing even if the guard is later disabled.

@@ -1,4 +1,6 @@
+import ast
 import os
+import pathlib
 import pytest
 import yaml
 import http_tools as h
@@ -92,6 +94,358 @@ def test_duplicate_credential_id_is_refused_across_distinct_origins(tmp_path):
     with pytest.raises(h.HttpStartupError,match='duplicate credential id'): load(tmp_path,text)
     ok=GOOD+'  - id: second\n    host: other.example.com\n    header: X-Token\n    value: other_secret\n'
     assert len(load(tmp_path,ok))==2
+
+
+def test_credential_raise_sites_use_only_safe_diagnostics():
+    """Every raise in http_tools.py must use CredentialConfigError with a literal code,
+    unless the function is on the explicit allowlist of legitimate non-credential raises.
+
+    This is option (b) from the design — inverted from a named-function watchlist:
+    rather than enumerating the four credential-loading functions by name, we watch
+    the WHOLE FILE and require CredentialConfigError everywhere, with an explicit
+    exemption list for functions that legitimately raise something else.
+
+    New functions default to being watched. A new function that raises HttpStartupError
+    with a parsed value is caught here immediately. Adding an exemption is a visible
+    line in the allowlist that a reviewer sees in the diff.
+
+    The allowlist currently contains:
+      parse_authority  — raises HttpStartupError; load_credentials catches and converts
+      11 HTTP-transport functions — raise HttpGetError only; never in the credential path
+
+    Acceptance criterion (Myc's mutation): add `entries!r` to any raise in
+    load_credentials (or any other non-allowlisted function) and this test goes red.
+    """
+    # Functions that legitimately raise something other than CredentialConfigError.
+    # Keys are the dot-joined function path from the module root (no class prefix).
+    #
+    # parse_authority: raises HttpStartupError with detail for authority-grammar tests;
+    #   load_credentials catches every HttpStartupError from it and converts to
+    #   CredentialConfigError("host_invalid", ...) before it reaches a caller.
+    # HTTP transport functions: raise HttpGetError only; never touch credential content.
+    # _body_chunks.charge / _body_chunks.more: closures inside _body_chunks; raise
+    #   HttpGetError for wire-size and timeout limits.
+    ALLOWLISTED_FUNCS = frozenset({
+        "parse_authority",
+        "_remaining",
+        "_normalize_url",
+        "_approved_addresses",
+        "_connect",
+        "_read_headers",
+        "_reject_repeated_fields",
+        "_body_chunks",
+        "_body_chunks.charge",
+        "_body_chunks.more",
+        "_content_type",
+        "_encoding",
+        "http_get",
+    })
+
+    src = pathlib.Path(__file__).parent.parent / "http_tools.py"
+    tree = ast.parse(src.read_text())
+    violations: list[str] = []
+
+    class RaiseChecker(ast.NodeVisitor):
+        def __init__(self):
+            self.func_stack: list[str] = []
+            self.class_stack: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.class_stack.append(node.name)
+            self.generic_visit(node)
+            self.class_stack.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self.func_stack.append(node.name)
+            self.generic_visit(node)
+            self.func_stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Raise(self, node: ast.Raise) -> None:
+            if node.exc is None:
+                return  # bare re-raise — always safe
+            # Allowlist keys are the dot-joined function path with no class prefix.
+            # A class method "parse_authority" on class "Foo" is NOT exempt:
+            # class_stack is non-empty so qualified_name is never checked.
+            if self.class_stack:
+                qname = None  # inside a class — allowlist never applies
+            else:
+                qname = ".".join(self.func_stack) if self.func_stack else "<module>"
+            if qname in ALLOWLISTED_FUNCS:
+                return
+            loc = f"{qname or '<class>.' + (self.func_stack[-1] if self.func_stack else '<module>')} line {node.lineno}"
+            exc = node.exc
+            if not (
+                isinstance(exc, ast.Call)
+                and isinstance(exc.func, ast.Name)
+                and exc.func.id == "CredentialConfigError"
+            ):
+                violations.append(
+                    f"  {loc}: raise does not use CredentialConfigError"
+                    f" — {ast.dump(exc)[:80]}"
+                )
+                return
+            if not exc.args or not (isinstance(exc.args[0], ast.Constant) and isinstance(exc.args[0].value, str)):
+                violations.append(
+                    f"  {loc}: CredentialConfigError code is not a string literal"
+                    f" — {ast.dump(exc.args[0] if exc.args else ast.Constant(value=None))[:80]}"
+                )
+            for kw in exc.keywords:
+                if kw.arg not in ("line", "col", "index"):
+                    violations.append(
+                        f"  {loc}: unexpected keyword {kw.arg!r} in CredentialConfigError"
+                    )
+
+    RaiseChecker().visit(tree)
+
+    assert not violations, (
+        "All raise sites in http_tools.py outside the allowlist must use\n"
+        "CredentialConfigError('literal_code', ...) with no f-strings or parsed values.\n"
+        "To add a legitimate non-credential raise, add the function name to ALLOWLISTED_FUNCS.\n"
+        "Violations:\n" + "\n".join(violations)
+    )
+
+
+def test_malformed_yaml_alias_does_not_leak_secret_value(tmp_path):
+    """PyYAML embeds the alias name verbatim in e.problem: 'found undefined alias <NAME>'.
+
+    An alias that uses the secret as its name (e.g. *CANARY in a value field)
+    leaks through e.problem even when str(e) / source lines are avoided.
+    The fix must not render e.problem at all.
+    """
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: *{canary}\n'  # undefined alias
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value), (
+        f"Alias name leaked into error message: {exc_info.value}"
+    )
+
+
+def test_malformed_yaml_does_not_leak_secret_in_traceback(tmp_path):
+    """raise ... from e retains the raw parser exception in __cause__.
+
+    traceback.format_exception() renders the full chain, including the PyYAML
+    error with its source-quoting str(). The fix uses `from None` to suppress
+    the chain and prevent secrets surfacing in formatted tracebacks.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: "Bearer {canary}\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text, (
+        f"Secret leaked into formatted traceback"
+    )
+    # `from None` sets __suppress_context__ = True. Python still mechanically sets
+    # __context__ inside the except block, but the formatter won't render the chain.
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_malformed_yaml_does_not_leak_secret_value(tmp_path):
+    """A YAML parse error must never include the source line in its message.
+
+    PyYAML's MarkedYAMLError quotes the offending source line verbatim. If the
+    bad line contains a partially-written secret, that secret reaches whatever
+    surfaces the exception — the model's context and from there a provider API.
+
+    Assert the canary does NOT appear in the HttpStartupError message. The
+    error may include the file path, line number, and error problem, but not
+    the source text.
+    """
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    # Missing closing quote causes PyYAML to quote the secret-bearing line in
+    # its error message. The error is real: try yaml.safe_load to confirm.
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: "Bearer {canary}\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value), (
+        f"Secret leaked into error message: {exc_info.value}"
+    )
+
+
+def test_duplicate_mapping_key_does_not_leak_secret(tmp_path):
+    """_mapping interpolated the duplicate key verbatim: 'duplicate mapping key CANARY'.
+
+    Parsed keys are user-controlled data. The fix uses only numeric node position.
+    This canary independently fails when key!r is restored.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: one\n'
+        f'    {canary}: extra\n'
+        f'    {canary}: extra2\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    # Direct raise inside _mapping (not in an except block) — no chain to suppress.
+    assert exc_info.value.__context__ is None
+
+
+def test_alias_in_value_does_not_leak_key_path(tmp_path):
+    """_reject_graph built a path from parsed key values: 'alias at root.value.CANARY'.
+
+    Parsed key names are user-controlled data. The fix uses only numeric node position.
+    This canary independently fails when the path-building is restored.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    # Anchor on a valid key, alias it as the value of a field named after the canary.
+    # _reject_graph walks the composed node tree and previously embedded key.value in path.
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - &anchor id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: v\n'
+        f'    {canary}: *anchor\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    # Direct raise inside _reject_graph (not in an except block) — no chain to suppress.
+    assert exc_info.value.__context__ is None
+
+
+def test_unhashable_key_does_not_leak_key_repr(tmp_path):
+    """_mapping interpolated the unhashable key repr: 'unhashable mapping key [CANARY]'.
+
+    The TypeError from `key in out` previously propagated the key repr via `from e`.
+    The fix uses only numeric node position and suppresses the chain.
+    This canary independently fails when key!r and from e are restored.
+    """
+    import traceback
+    canary = "CANARY_SECRET_DO_NOT_LEAK"
+    # A list key is unhashable. YAML allows it; Python dicts do not.
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: v\n'
+        f'    ? [{canary}]\n    : extra\n'
+    )
+    with pytest.raises(h.HttpStartupError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_invalid_utf8_does_not_leak_file_contents(tmp_path):
+    """Invalid UTF-8 raises UnicodeDecodeError BEFORE _parse_yaml is entered.
+
+    UnicodeDecodeError.object contains the full file bytes — including every
+    credential value in the file. The old `except OSError` boundary never saw
+    this; UnicodeDecodeError is a ValueError subclass, not an OSError.
+
+    Fix: explicit `except UnicodeDecodeError` at the read site converts it to
+    CredentialConfigError("malformed_yaml") from None before .object can reach
+    a caller.
+
+    Canary: removing the except UnicodeDecodeError clause (leaving only OSError)
+    makes this test fail — the wrong exception type escapes and pytest.raises
+    re-raises it.
+    """
+    import traceback
+    canary = "CANARY_SECRET_UTF8_DO_NOT_LEAK"
+    # Valid ASCII payload with the canary embedded, then an invalid UTF-8 byte.
+    # When read_text() tries to decode this, UnicodeDecodeError.object will be
+    # the entire byte string including the canary.
+    raw = (
+        f"version: 1\ncredentials:\n  - id: {canary}\n"
+        f"    host: api.github.com\n    header: Authorization\n    value: v\n"
+    ).encode("ascii") + b"\x80invalid"
+    p = tmp_path / "c.yaml"
+    p.write_bytes(raw)
+    p.chmod(0o600)
+    with pytest.raises(h.CredentialConfigError) as exc_info:
+        h.load_credentials(p)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_int_type_tag_does_not_leak_secret(tmp_path):
+    """!!int with a non-integer value raises ValueError — not yaml.YAMLError.
+
+    PyYAML's int constructor calls int() on the parsed scalar. If the scalar is
+    the secret itself (e.g. `value: !!int CANARYSECRET`), the ValueError message
+    contains it verbatim: 'invalid literal for int() with base 10: CANARYSECRET'.
+
+    The old `except yaml.YAMLError` boundary does not catch ValueError, so it
+    escapes _parse_yaml and leaks through load_credentials to the caller.
+
+    Canary: removing the catch-all boundary (`except Exception`) and leaving only
+    `except yaml.YAMLError` makes this test fail — the wrong exception type
+    (ValueError) escapes and pytest.raises(CredentialConfigError) re-raises it.
+    """
+    import traceback
+    canary = "CANARY_SECRET_INT_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: !!int {canary}\n'
+    )
+    with pytest.raises(h.CredentialConfigError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__cause__ is None
+    # __context__ is set by Python inside any except block even with `from None`
+    # — that is expected. `from None` sets __suppress_context__ = True, which
+    # prevents the formatter from rendering the context chain. The canary above
+    # (tb_text) confirms the secret doesn't surface via traceback.format_exception.
+    assert exc_info.value.__suppress_context__ is True
+
+
+def test_float_type_tag_does_not_leak_secret(tmp_path):
+    """!!float with a non-float value raises ValueError — same class as !!int.
+
+    Demonstrates the catch-all boundary handles different non-YAML constructor
+    exceptions, not just the !!int case. A second independent path proves
+    'except Exception' is the effective constraint, not a one-off.
+
+    Canary: removing `except Exception` causes ValueError to escape, failing
+    pytest.raises(CredentialConfigError).
+    """
+    import traceback
+    canary = "CANARY_SECRET_FLOAT_DO_NOT_LEAK"
+    malformed = (
+        f'version: 1\ncredentials:\n'
+        f'  - id: github-review\n    host: api.github.com\n'
+        f'    header: Authorization\n    value: !!float {canary}\n'
+    )
+    with pytest.raises(h.CredentialConfigError) as exc_info:
+        load(tmp_path, malformed)
+    assert canary not in str(exc_info.value)
+    tb_text = "".join(traceback.format_exception(exc_info.value))
+    assert canary not in tb_text
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
 
 
 @pytest.mark.parametrize("cid",['id: Bearer_secret','id: gh-Bearer_secret'],ids=["equal","contains"])

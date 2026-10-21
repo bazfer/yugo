@@ -162,6 +162,9 @@ def test_invalid_repo_raises_before_network(bad_repo: str, tmp_path: Path) -> No
         "abc",       # non-integer string
         0,           # non-positive
         -5,          # negative
+        True,        # bool is int subclass — isinstance(True, int) passes; type() is not int
+        1.9,         # float coerces to 1 via int(); must be rejected
+        "1",         # string "1" coerces to 1 via int(); must be rejected
     ],
 )
 def test_invalid_pr_raises_before_network(bad_pr: Any, tmp_path: Path) -> None:

@@ -642,7 +642,7 @@ def resolve_declared(
             try:
                 credentials = http_tools.load_credentials(credentials_path)
             except http_tools.HttpStartupError as error:
-                raise ToolDeclarationError(f"http_get credentials key: {error}") from error
+                raise ToolDeclarationError(f"http_get credentials: {error}") from None
             tool = selected["http_get"]
             values = {
                 key: configured_values["http_get"].get(key, bound.default)
