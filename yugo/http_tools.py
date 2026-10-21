@@ -19,6 +19,8 @@ from typing import Any, Callable, Mapping
 
 import yaml
 
+from version import YUGO_VERSION
+
 DEFAULT_CREDENTIALS_FILE = "/etc/yugo/http-credentials.yaml"
 MAX_URL_BYTES = 8192
 MAX_HEADER_BYTES = 64 * 1024
@@ -677,6 +679,28 @@ def http_get(url: str, *, max_bytes: int, timeout_ms: int, max_redirects: int, r
     forwarding=False
     first_hop=True
     attached=[]; dropped_at=None; redirects=0; wire=decoded=headers_total=0
+
+    # User-Agent — built once, sent on every hop. Non-ASCII in the override
+    # would crash the encode("ascii") at sendall, so we reject it here rather
+    # than mid-request.
+    ua_override = os.getenv("YUGO_HTTP_USER_AGENT", "").strip()
+    if ua_override:
+        try:
+            ua_override.encode("ascii")
+        except UnicodeEncodeError:
+            raise HttpGetError(
+                "http_get_bad_config",
+                "YUGO_HTTP_USER_AGENT contains non-ASCII characters",
+            )
+        user_agent = ua_override
+    else:
+        bot_name = os.getenv("BOT_NAME", "").strip()
+        user_agent = f"yugo/{YUGO_VERSION} ({bot_name})" if bot_name else f"yugo/{YUGO_VERSION}"
+
+    # Mutable cell so the audit closure can report the final HTTP status even
+    # before the result dict is built — covers both success and error paths.
+    status_cell: list[int | None] = [None]
+
     audit=lambda: {
         "credential_id": selected.id if selected else None,
         "credential_origins": attached,
@@ -684,6 +708,11 @@ def http_get(url: str, *, max_bytes: int, timeout_ms: int, max_redirects: int, r
             {"event": "credential_dropped", "hop": dropped_at}
             if dropped_at is not None else None
         ),
+        # http_status reflects the final hop status (None if no response was
+        # received). Additive: existing consumers that do not read this field
+        # are unaffected. ok=True means transport completed — not that the
+        # status was 2xx. This distinction is now greppable in the audit log.
+        "http_status": status_cell[0],
     }
     try:
         while True:
@@ -699,7 +728,7 @@ def http_get(url: str, *, max_bytes: int, timeout_ms: int, max_redirects: int, r
             try:
                 target=urllib.parse.urlunsplit(("","",parts.path or "/",parts.query,""))
                 host_header=_authority(origin.scheme,origin.host,origin.port)
-                req=[f"GET {target} HTTP/1.1",f"Host: {host_header}","Accept: text/*, application/json, application/*+json","Accept-Encoding: gzip","Connection: close"]
+                req=[f"GET {target} HTTP/1.1",f"Host: {host_header}",f"User-Agent: {user_agent}","Accept: text/*, application/json, application/*+json","Accept-Encoding: gzip","Connection: close"]
                 # `attached` is the chain-wide audit view; `hop_attached` is the
                 # one this response was produced by. SPEC §9.3.3's result-shape
                 # row: they answer different questions and must not share a
@@ -710,6 +739,7 @@ def http_get(url: str, *, max_bytes: int, timeout_ms: int, max_redirects: int, r
                     req.append(f"{selected.header}: {selected.value}"); attached.append(origin.rendered())
                 sock.sendall(("\r\n".join(req)+"\r\n\r\n").encode("ascii"))
                 status, hs, initial, headers_total=_read_headers(sock,deadline,headers_total)
+                status_cell[0]=status
                 if status in REDIRECTS:
                     # SPEC 9.3.3: body bytes that shared the header read are
                     # discarded UNCHARGED and no further read is issued. The
