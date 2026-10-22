@@ -18,7 +18,8 @@
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-MIN_TESTS=150
+# Floor under the current collected count (~1071). Must be raised as the suite grows.
+MIN_TESTS=1050
 
 echo "==> Running yugo test suite in python:3.13-slim (min ${MIN_TESTS} tests)"
 echo "    Repo root: ${REPO_ROOT}"
