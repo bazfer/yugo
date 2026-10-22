@@ -668,7 +668,7 @@
       "reason": "envelope_too_large"
     },
     {
-      "name": "divergence/hops-at-ceiling",
+      "name": "reject/hops-at-ceiling",
       "why": "SPEC says reject at 16, and the ceiling must fire on INBOUND wire validation — otherwise a peer publishing `hops: 100` slips past validate and is caught only if the local bot happens to derive a further increment. TypeScript enforces this; Python enforces it only in derive_baton_fields, so it accepts an at-or-over-ceiling frame off the wire.",
       "envelope": {
         "envelope_version": 1,
@@ -683,16 +683,10 @@
         "hops": 16
       },
       "expect": "reject",
-      "reason": "invalid_hops_ceiling",
-      "status": "known_divergence",
-      "actual": {
-        "typescript": "reject",
-        "python": "accept"
-      },
-      "resolution": "Port the inbound ceiling check into bus.py::validate_envelope. Tracked as INF-037."
+      "reason": "invalid_hops_ceiling"
     },
     {
-      "name": "divergence/hops-far-over-ceiling",
+      "name": "reject/hops-far-over-ceiling",
       "why": "The same gap at a value no legitimate chain can reach, so the fix cannot be mistaken for an off-by-one.",
       "envelope": {
         "envelope_version": 1,
@@ -707,13 +701,7 @@
         "hops": 100
       },
       "expect": "reject",
-      "reason": "invalid_hops_ceiling",
-      "status": "known_divergence",
-      "actual": {
-        "typescript": "reject",
-        "python": "accept"
-      },
-      "resolution": "Same fix as divergence/hops-at-ceiling."
+      "reason": "invalid_hops_ceiling"
     },
     {
       "name": "divergence/ts-naive-no-offset",
