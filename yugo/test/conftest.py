@@ -8,6 +8,7 @@ still monkeypatch behaviour they care about (e.g. `bot.HISTORY_MAX_TURNS`).
 import os
 import sys
 from pathlib import Path
+import pytest
 
 # Make the repo root importable so `import history` / `import bot` works when
 # pytest is invoked from any directory.
@@ -38,7 +39,20 @@ def pytest_configure(config):
 
 # Opt-in only: broker integration tests retain real file-backed durable stores.
 # Startup-refusal tests deliberately do NOT request this fixture.
-import pytest
+
+
+def pytest_sessionfinish(session, exitstatus):
+    # Guard against silent thin-collection (e.g. an import crash that silently
+    # skips whole files). Only active when PYTEST_MIN_COLLECTED is set — so
+    # local Docker runs can assert a floor without changing CI behaviour.
+    minimum = int(os.environ.get("PYTEST_MIN_COLLECTED") or "0")
+    if minimum and len(session.items) < minimum:
+        sys.stderr.write(
+            f"\nERROR: Only {len(session.items)} tests collected — expected ≥ {minimum}.\n"
+            "Likely cause: import error in one or more test files.\n"
+            "Run with -v --tb=short to see collection errors.\n"
+        )
+        session.exitstatus = 1
 
 
 @pytest.fixture

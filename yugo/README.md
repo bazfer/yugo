@@ -254,6 +254,22 @@ A present-but-malformed baton field is a reject, not an ignore. The fields are a
 
 Values are required to be **already** canonical rather than folded into canonical form: `root_id` is "copied unchanged into every descendant", and a field this adapter rewrites in transit is not being copied unchanged.
 
+## Running the test suite locally
+
+The full test suite must run inside the yugo container image. Do not invoke pytest directly against a host Python.
+
+**Why:** the DeetOps tool-cache Python 3.12.14 (at `~/DeetOps/tool-cache/Python/3.12.14/x64/`) is not ABI-compatible with the host glibc. Importing `filesystem_tools` → `ctypes` raises `undefined symbol: _PyErr_SetLocaleString` and silently drops every test file that transitively imports `tools`. The affected files are `test_bot_tool_loop.py`, `test_filesystem_tools.py`, `test_github_tools.py`, `test_source_scan.py`, and `test_tools.py` — exactly the files that exercise tool grants, tool schemas, and the `submit_review` binding. A green run on the DeetOps Python is therefore a false green for those paths.
+
+**The command** (from repo root):
+
+```sh
+sh yugo/scripts/test-in-docker.sh
+```
+
+This mounts the source tree into a throwaway `python:3.13-slim` container — the same base as the production image — installs both `requirements.txt` and `test-requirements.txt`, and runs the full suite with a minimum-collected guard. If fewer than 150 tests are collected (indicating a collection error), the script exits non-zero. The guard is enforced via `PYTEST_MIN_COLLECTED=150` in the container environment; CI does not set this variable and is unaffected.
+
+CI (the `yugo-tests` job in `.github/workflows/`) runs against GitHub Actions' own Python 3.12 on `ubuntu-latest`, which carries a glibc-compatible stdlib. CI stays unchanged and authoritative for pull-request gates.
+
 ## LICENSE
 
 TBD — see repo owner.
