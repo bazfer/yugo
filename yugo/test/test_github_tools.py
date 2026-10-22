@@ -736,6 +736,8 @@ def test_submit_review_decision_schema_matches_handler():
     )
     handler_keys = set(gh._DECISION_EVENT.keys())
 
+    assert schema_enum, "decision enum must not be empty"
+
     in_schema_not_handler = schema_enum - handler_keys
     in_handler_not_schema = handler_keys - schema_enum
 
