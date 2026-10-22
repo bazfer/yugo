@@ -268,7 +268,7 @@ sh yugo/scripts/test-in-docker.sh
 
 This mounts the source tree into a throwaway `python:3.13-slim` container — the same base as the production image — installs both `requirements.txt` and `test-requirements.txt`, and runs the full suite with a minimum-collected guard. If fewer than 1050 tests are collected (indicating a collection error), the script exits non-zero. The guard is enforced via `PYTEST_MIN_COLLECTED=1050` in the container environment; CI does not set this variable and is unaffected. The floor must be kept near the real count: raise it when new tests are added, and lower it only after an explicit reviewed decision — never auto-adjust it from a run's output.
 
-CI (the `yugo-tests` job in `.github/workflows/`) runs against GitHub Actions' own Python 3.12 on `ubuntu-latest`, which carries a glibc-compatible stdlib. CI stays unchanged and authoritative for pull-request gates.
+CI (the `yugo-pytest` job in `.github/workflows/`) runs against GitHub Actions' own Python 3.12 and 3.13 on `ubuntu-latest`, which carries a glibc-compatible stdlib. CI stays unchanged and authoritative for pull-request gates.
 
 ## LICENSE
 
