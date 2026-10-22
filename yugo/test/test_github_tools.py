@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 import github_tools as gh
+import tools
 
 
 HEAD = "abc1234def5678901234567890123456789012ab"
@@ -716,3 +717,31 @@ def test_submit_review_granted_via_tools_yaml(tmp_path: Path) -> None:
     assert "submit_review" in selected
     # Handler must have been replaced (not the unbound sentinel)
     assert selected["submit_review"].handler is not tools._submit_review_unbound
+
+
+def test_submit_review_decision_schema_matches_handler():
+    """REGISTRY['submit_review'].decision enum must equal _DECISION_EVENT keys exactly.
+
+    The schema and the handler map decisions independently. They can drift:
+    add a value to the enum with no handler, or add a key to _DECISION_EVENT
+    with no schema entry, and 55 existing tests still pass. This test enforces
+    agreement by construction rather than one canary per decision.
+
+    Myc proved the gap during the #80 review by adding a fourth schema value
+    with no handler support — all tests passed. This is the structural catch.
+    """
+    schema_enum = set(
+        tools.REGISTRY["submit_review"].parameters
+        ["properties"]["decision"]["enum"]
+    )
+    handler_keys = set(gh._DECISION_EVENT.keys())
+
+    in_schema_not_handler = schema_enum - handler_keys
+    in_handler_not_schema = handler_keys - schema_enum
+
+    assert not in_schema_not_handler, (
+        f"decisions declared in schema but absent from _DECISION_EVENT: {sorted(in_schema_not_handler)}"
+    )
+    assert not in_handler_not_schema, (
+        f"decisions in _DECISION_EVENT but absent from schema enum: {sorted(in_handler_not_schema)}"
+    )
