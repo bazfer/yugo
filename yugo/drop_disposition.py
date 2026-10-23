@@ -9,6 +9,8 @@ class Disposition(str, Enum):
 
 
 class DropReason(str, Enum):
+    CLAUDE_DISCORD_ADAPTER_SUBSCRIBE_REFUSED = "claude_discord_adapter_subscribe_refused"
+    YUGO_SUBSCRIBE_REFUSED = "yugo_subscribe_refused"
     MALFORMED_JSON = "malformed_json"
     CLAUDE_DISCORD_ADAPTER_MALFORMED_JSON = "claude_discord_adapter_malformed_json"
     RECIPIENT_MISMATCH = "recipient_mismatch"
@@ -75,6 +77,8 @@ class DropReason(str, Enum):
     YUGO_DUPLICATE_ENVELOPE = "yugo_duplicate_envelope"
 
 DROP_DISPOSITION: dict[DropReason, Disposition] = {
+    DropReason.CLAUDE_DISCORD_ADAPTER_SUBSCRIBE_REFUSED: Disposition.TERMINAL,
+    DropReason.YUGO_SUBSCRIBE_REFUSED: Disposition.TERMINAL,
     DropReason.MALFORMED_JSON: Disposition.TERMINAL,
     DropReason.CLAUDE_DISCORD_ADAPTER_MALFORMED_JSON: Disposition.TERMINAL,
     DropReason.RECIPIENT_MISMATCH: Disposition.TERMINAL,

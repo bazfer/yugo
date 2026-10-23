@@ -15,6 +15,8 @@ def harness():
     bus._log = Mock()
     bus._nc = SimpleNamespace(publish=AsyncMock())
     bus._drop_counts = dict.fromkeys(["terminal", "transient", "throttled", "duplicate"], 0)
+    bus._state = "connected"
+    bus._subjects_refused = set()
     bus._notice_tasks = set()
     bus._notifying_contexts = {}
     return bus

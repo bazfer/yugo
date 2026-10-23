@@ -1250,6 +1250,9 @@ class FleetBus:
         self._notifying_contexts: dict[int, dict] = {}
         self._log = logger
         self._nc = None
+        self._state = "disconnected"
+        self._subjects_refused: set[str] = set()
+        self._subscription_handles: dict[str, Any] = {}
         self._on_envelope = on_envelope
         # Reported on every heartbeat from 3b. See create_heartbeat_envelope.
         self._injection_delivered_ts: str | None = None
@@ -1263,7 +1266,28 @@ class FleetBus:
 
     def bus_status(self) -> dict:
         """Snapshot for host status UIs; also included in every heartbeat."""
-        return {"drop_counts": dict(self._drop_counts)}
+        return {"drop_counts": dict(self._drop_counts), "state": self._state,
+                "healthy": self._state == "connected",
+                "subjects_refused": sorted(self._subjects_refused)}
+
+    def _refuse_subject(self, subject: str) -> None:
+        if subject not in self.subjects or subject in self._subjects_refused:
+            return
+        self._subjects_refused.add(subject)
+        self._state = "unhealthy"  # Sticky until an explicit new connection.
+        self._record_drop(subject, context=None, reason=DropReason.YUGO_SUBSCRIBE_REFUSED,
+                          event="subscribe_refused")
+
+    def _verify_subscriptions(self) -> None:
+        # nats-py 2.15 retains refused handles in _subs. Registry membership
+        # alone is NOT broker acceptance: combine it with errors before PONG.
+        for subject in self.subjects:
+            sub = self._subscription_handles.get(subject)
+            if (sub is None or sub.subject != subject or sub._closed
+                    or self._nc._subs.get(sub._id) is not sub):
+                self._refuse_subject(subject)
+        if not self._subjects_refused:
+            self._state = "connected"
 
     def _record_suppression(self, subject: str, *, reason: SuppressionReason,
                             **fields: Any) -> None:
@@ -1320,10 +1344,11 @@ class FleetBus:
         NOT `fleet.<self>.inbox`. SPEC §15's 3a line says `.inbox`; §7 says the
         adapter subscribes `.request` directly until its FB-3 flip, and §7 is
         the one that matches the live wire (and the reference TS adapter). See
-        the §15 erratum. `.inbox` does not exist pre-JetStream, and per-user
-        authz does not grant subscribe on it — and a nats-py permissions
-        violation calls `error_cb` and RETURNS without closing the connection,
-        so subscribing it would leave a bot connected, heartbeating and deaf.
+        the §15 erratum. Live per-user authz DOES grant each bot its own
+        `.inbox` subscribe; this adapter has not flipped consumption yet (#10).
+        A nats-py permissions violation calls `error_cb` and RETURNS without
+        closing the connection, so a refused subscribe would otherwise leave
+        a bot connected, heartbeating and deaf.
         """
         name = self._config.bot_name
         return (
@@ -1379,8 +1404,13 @@ class FleetBus:
                 await self._heartbeat_loop()
             finally:
                 await self._teardown()
+            if self._subjects_refused:
+                return  # Terminal admission failure: no supervisor retry loop.
 
     async def _connect(self) -> None:
+        self._state = "connecting"
+        self._subjects_refused.clear()
+        self._subscription_handles.clear()
         nats = _lazy_nats()
         self._nc = await nats.connect(
             servers=[self._config.url],
@@ -1414,12 +1444,17 @@ class FleetBus:
             # makes publish → server → subscribe → validate → audit testable with
             # no peer on the bus at all.
             for subject in self.subjects:
-                await self._nc.subscribe(subject, cb=self._on_message)
+                self._subscription_handles[subject] = await self._nc.subscribe(subject, cb=self._on_message)
+            # In pinned nats-py, flush() writes PING directly, while SUB may
+            # still be queued. Drain that queue BEFORE the PING/PONG fence.
+            await self._nc._flush_pending(force_flush=True)
             await self._nc.flush()
+            self._verify_subscriptions()
         # BaseException, not Exception: SIGTERM during the `flush()` — which
         # blocks up to 10s — cancels this coroutine, and a leak on the
         # shutdown path is the one nothing ever cleans up.
         except BaseException:
+            self._state = "unhealthy" if self._subjects_refused else "disconnected"
             client, self._nc = self._nc, None
             try:
                 await client.close()
@@ -1431,7 +1466,8 @@ class FleetBus:
         self._audit.record(
             "conn",
             None,
-            event="connected",
+            event="connected" if self._state == "connected" else "unhealthy",
+            **self.bus_status(),
             url=str(self._nc.connected_url.netloc if self._nc.connected_url else self._config.url),
             subjects=list(self.subjects),
         )
@@ -1463,7 +1499,7 @@ class FleetBus:
         # disconnected bot is the quietest lane there is, and returning early
         # meant the one state this feature is named for never swept.
         self._sweep_expired_claims()
-        if self._nc is None or self._nc.is_closed:
+        if self._nc is None or self._nc.is_closed or self._state != "connected":
             return
         envelope = create_heartbeat_envelope(
             self._config.bot_name,
@@ -2263,6 +2299,7 @@ class FleetBus:
         return delivered
 
     async def _teardown(self) -> None:
+        self._state = "unhealthy" if self._subjects_refused else "disconnected"
         nats = _lazy_nats()
         if self._notice_tasks:
             await asyncio.gather(*self._notice_tasks, return_exceptions=True)
@@ -2290,6 +2327,10 @@ class FleetBus:
     # rest of the process's life. See test_source_scan.
 
     async def _on_error(self, e) -> None:
+        # Runs on nats-py's reader: never await a flush here (deadlock).
+        match = re.search(r'permissions violation for subscription to "([^"\s]+)"', str(e), re.IGNORECASE)
+        if match:
+            self._refuse_subject(match.group(1))
         # Bad credentials are a CONFIG fault the operator has to fix, but
         # failing closed on them would be worse than the noise: a token
         # rotated a beat early would take the bot off Discord too. So it keeps
@@ -2302,12 +2343,16 @@ class FleetBus:
         self._audit.record("conn", None, event=event, error=repr(e))
 
     async def _on_disconnected(self) -> None:
+        self._state = "unhealthy" if self._subjects_refused else "reconnecting"
         self._audit.record("conn", None, event="disconnected")
 
     async def _on_reconnected(self) -> None:
+        # nats-py replays SUBs and flushes before invoking this callback.
+        self._verify_subscriptions()
         self._audit.record("conn", None, event="reconnected")
 
     async def _on_closed(self) -> None:
+        self._state = "unhealthy" if self._subjects_refused else "disconnected"
         # Tripwire. With max_reconnect_attempts=-1 this should be reachable
         # only from our own shutdown path. If it shows up in an audit log
         # without a shutdown next to it, nats-py abandoned the server and the

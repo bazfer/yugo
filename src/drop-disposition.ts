@@ -1,6 +1,8 @@
 /** Core NATS has no acknowledgements. This is a diagnostic disposition, not an ack. */
 export type Disposition = 'terminal' | 'transient' | 'throttled' | 'duplicate'
 export type DropReason =
+  | 'claude_discord_adapter_subscribe_refused'
+  | 'yugo_subscribe_refused'
   | 'malformed_json'
   | 'claude_discord_adapter_malformed_json'
   | 'recipient_mismatch'
@@ -68,6 +70,8 @@ export type DropReason =
 
 // Deliberately independent of the union: missing or extra keys are compile errors.
 export const DROP_DISPOSITION: Record<DropReason, Disposition> = {
+  claude_discord_adapter_subscribe_refused: 'terminal',
+  yugo_subscribe_refused: 'terminal',
   malformed_json: 'terminal',
   claude_discord_adapter_malformed_json: 'terminal',
   recipient_mismatch: 'terminal',

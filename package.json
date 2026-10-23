@@ -20,12 +20,13 @@
     "src/drop-disposition.ts"
   ],
   "scripts": {
-    "test": "bun test src/fleet-bus.test.ts src/drop-disposition.test.ts",
+    "test": "bun test src/fleet-bus.test.ts src/drop-disposition.test.ts src/subscribe-health.test.ts",
     "test:gates": "bun test/gates/test-suite.ts",
     "schema:hash": "sha256sum schema/envelope.v1.schema.json",
     "conformance": "bun conformance/run-ts.ts",
     "vectors:hash": "sha256sum conformance/envelope.v1.vectors.json",
-    "test:drops:mutations": "python test/gates/drop-disposition.py"
+    "test:drops:mutations": "python test/gates/drop-disposition.py",
+    "test:subscribe:mutations": "python test/gates/subscribe-health.py"
   },
   "dependencies": {
     "nats": "^2.29.3",

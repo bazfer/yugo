@@ -1123,6 +1123,9 @@ function requireDedupStorePath(config: FleetBusConfig): string {
  */
 export class FleetBus {
   private nc?: NatsConnection
+  private state: 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'unhealthy' = 'disconnected'
+  private readonly subjectsRefused = new Set<string>()
+  private readonly subscriptionHandles = new Map<string, Subscription>()
   private readonly subscriptions = new Set<Subscription>()
   private heartbeatTimer?: ReturnType<typeof setInterval>
   private readonly codec = JSONCodec<unknown>()
@@ -1310,6 +1313,36 @@ export class FleetBus {
     return seen
   }
 
+  private subscriptionPlan(): Array<{ subject: string; handler: (message: Msg) => void | Promise<void> }> {
+    if (this.mode === 'publish-only') return []
+    const botName = normalizeBotName(this.config.botName)!
+    return [
+      { subject: `fleet.${botName}.request`, handler: message => this.onRequest(message) },
+      { subject: `fleet.${botName}.result`, handler: message => this.onResult(message) },
+      { subject: `fleet.${botName}.status`, handler: message => this.onStatus(message) },
+      ...(this.config.subscribeBroadcast ? [{ subject: 'fleet.broadcast.>', handler: (message: Msg) => this.onBroadcast(message) }] : []),
+    ]
+  }
+
+  private refuseSubject(subject: string): void {
+    if (!this.subscriptionPlan().some(planned => planned.subject === subject) || this.subjectsRefused.has(subject)) return
+    this.subjectsRefused.add(subject)
+    this.state = 'unhealthy'
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.heartbeatTimer = undefined
+    this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_subscribe_refused', event: 'subscribe_refused' }, undefined)
+  }
+
+  private verifySubscriptions(): void {
+    for (const { subject } of this.subscriptionPlan()) {
+      const subscription = this.subscriptionHandles.get(subject)
+      if (!subscription || subscription.getSubject() !== subject || subscription.isClosed() || !this.subscriptions.has(subscription)) {
+        this.refuseSubject(subject)
+      }
+    }
+    if (this.subjectsRefused.size === 0) this.state = 'connected'
+  }
+
   async connect(): Promise<void> {
     if (this.nc) return
 
@@ -1319,6 +1352,9 @@ export class FleetBus {
       throw new Error('FleetBus botName and user must be the same canonical fleet identity')
     }
 
+    this.state = 'connecting'
+    this.subjectsRefused.clear()
+    this.subscriptionHandles.clear()
     const nc = await this.connectFn({
       servers: this.config.url,
       user,
@@ -1329,22 +1365,29 @@ export class FleetBus {
 
     try {
       this.nc = nc
-      if (this.mode !== 'publish-only') {
-        this.subscribe(`fleet.${botName}.request`, message => this.onRequest(message))
-        this.subscribe(`fleet.${botName}.result`, message => this.onResult(message))
-        this.subscribe(`fleet.${botName}.status`, message => this.onStatus(message))
-        if (this.config.subscribeBroadcast) {
-          this.subscribe('fleet.broadcast.>', message => this.onBroadcast(message))
-        }
+      void nc.closed().then(() => {
+        if (this.nc !== nc) return
+        this.state = this.subjectsRefused.size ? 'unhealthy' : 'disconnected'
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+        this.heartbeatTimer = undefined
+      })
+      // Register before SUB: permission events can precede the first flush.
+      void this.watchConnectionStatus(nc).catch(error => this.log(`status watcher failed: ${String(error)}`))
+      for (const planned of this.subscriptionPlan()) this.subscribe(planned.subject, planned.handler)
+      // Core NATS has no positive SUB ack. PONG fences preceding SUB errors;
+      // also inspect each returned handle (nats.js closes refused handles).
+      await nc.flush()
+      this.verifySubscriptions()
+      if (this.mode !== 'publish-only' && this.busStatus().healthy) {
         this.publishHeartbeat()
         this.heartbeatTimer = setInterval(
           () => this.publishHeartbeat(),
           this.config.heartbeatIntervalMs ?? 30_000,
         )
       }
-      this.log(`connected as ${botName}${this.mode === 'publish-only' ? ' [publish-only]' : ''}`)
-      void this.watchConnectionStatus(nc)
+      this.log(`${this.state} as ${botName}${this.mode === 'publish-only' ? ' [publish-only]' : ''}`)
     } catch (error) {
+      this.state = this.subjectsRefused.size ? 'unhealthy' : 'disconnected'
       this.nc = undefined
       await nc.close()
       throw error
@@ -1352,6 +1395,7 @@ export class FleetBus {
   }
 
   async disconnect(): Promise<void> {
+    this.state = this.subjectsRefused.size ? 'unhealthy' : 'disconnected'
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
     this.heartbeatTimer = undefined
     for (const subscription of this.subscriptions) subscription.unsubscribe()
@@ -1392,6 +1436,7 @@ export class FleetBus {
       }
       await this.waitClosed()
       if (this.supervisorStopping) break
+      if (this.subjectsRefused.size) break // Terminal until explicit operator restart.
       this.log('supervisor: connection closed, reconnecting after backoff')
       await this.disconnect().catch(() => {})
       await this.sleep(sleepMs)
@@ -2218,6 +2263,8 @@ export class FleetBus {
   private subscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
     if (!this.nc) throw new Error('FleetBus is not connected')
     const subscription = this.nc.subscribe(subject)
+    const nc = this.nc
+    this.subscriptionHandles.set(subject, subscription)
     this.subscriptions.add(subscription)
     void (async () => {
       try {
@@ -2236,9 +2283,13 @@ export class FleetBus {
       } catch (error) {
         // Reaching here means the ITERATOR itself failed — the subscription is
         // gone, not one message. That genuinely ends this lane.
-        if (!this.nc?.isClosed()) this.log(`subscription ${subject} failed: ${String(error)}`)
+        if (this.nc === nc && !nc.isClosed()) {
+          this.refuseSubject(subject)
+          this.log(`subscription ${subject} failed: ${String(error)}`)
+        }
       } finally {
         this.subscriptions.delete(subscription)
+        if (this.nc === nc && !nc.isClosed()) this.refuseSubject(subject)
       }
     })()
   }
@@ -2255,7 +2306,7 @@ export class FleetBus {
       this.log(`idle dedup prune failed, heartbeat continues: ${String(error)}`)
     }
 
-    if (!this.nc || this.nc.isClosed()) return
+    if (!this.nc || this.nc.isClosed() || this.state !== 'connected') return
     const heartbeat = createHeartbeatEnvelope(this.config.botName, this.config.pluginVersion ?? '0.4.0')
     heartbeat.payload = { ...(heartbeat.payload as Record<string, unknown>), ...this.busStatus() }
     this.nc.publish(`fleet.${this.config.botName}.status`, this.codec.encode(heartbeat))
@@ -2263,6 +2314,25 @@ export class FleetBus {
 
   private async watchConnectionStatus(nc: NatsConnection): Promise<void> {
     for await (const status of nc.status()) {
+      if (this.nc !== nc) return // Ignore retired connections' status streams.
+      if (status.type === 'error' && status.permissionContext?.operation === 'subscription') {
+        this.refuseSubject(status.permissionContext.subject)
+      }
+      if (status.type === 'disconnect' && this.subjectsRefused.size === 0) this.state = 'reconnecting'
+      if (status.type === 'reconnect') {
+        try {
+          await nc.flush()
+          if (this.nc !== nc) return
+          this.verifySubscriptions()
+        } catch (error) {
+          // A second transport outage during the fence is transient. Keep
+          // observing so the next replay can be verified, but never advertise
+          // healthy before a successful fence.
+          if (this.nc !== nc) return
+          if (this.subjectsRefused.size === 0) this.state = 'reconnecting'
+          this.log(`subscription verification interrupted: ${String(error)}`)
+        }
+      }
       if (status.type === 'disconnect' || status.type === 'reconnect' || status.type === 'error') {
         this.log(`${status.type}: ${String(status.data)}`)
       }
@@ -2322,8 +2392,8 @@ export class FleetBus {
   private dropCounts: Record<Disposition, number> = { terminal: 0, transient: 0, throttled: 0, duplicate: 0 }
 
   /** Snapshot for the host's bus_status command; also carried on heartbeats. */
-  busStatus(): { drop_counts: Record<Disposition, number> } {
-    return { drop_counts: { ...this.dropCounts } }
+  busStatus(): { drop_counts: Record<Disposition, number>; state: string; healthy: boolean; subjects_refused: string[] } {
+    return { drop_counts: { ...this.dropCounts }, state: this.state, healthy: this.state === 'connected', subjects_refused: [...this.subjectsRefused].sort() }
   }
 
   private recordDrop(entry: Record<string, unknown> & { dir: 'drop'; reason: DropReason; subject: string }, value: unknown): void {
