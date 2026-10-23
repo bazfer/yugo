@@ -16,14 +16,18 @@ BUN = shutil.which("bun") or str(ROOT / "node_modules/.bin/bun")
 assert shutil.which("nats-server"), "install real nats-server before running this gate"
 
 
-def check(label, command, cwd, env, red=False):
+def check(label, command, cwd, env, red=False, contains=None):
     result = subprocess.run(command, cwd=cwd, env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if (result.returncode != 0) != red:
         raise AssertionError(f"{label}: unexpected exit {result.returncode}\n{result.stdout}")
     if red and not ("fail" in result.stdout.lower()):
         raise AssertionError(f"{label}: not an assertion/test failure\n{result.stdout}")
+    if contains is not None and contains not in result.stdout:
+        raise AssertionError(f"{label}: failed for the wrong reason (missing {contains!r})\n{result.stdout}")
     print(f"{'RED detected' if red else 'GREEN control'}: {label}", flush=True)
+    if red and contains is not None:
+        print(next(line.strip() for line in result.stdout.splitlines() if contains in line), flush=True)
 
 
 with tempfile.TemporaryDirectory(prefix=".subscribe-gate-", dir=ROOT) as directory:
@@ -40,6 +44,57 @@ with tempfile.TemporaryDirectory(prefix=".subscribe-gate-", dir=ROOT) as directo
     py_file = tmp / "yugo/fleet_bus.py"
     ts = ts_file.read_text()
     py = py_file.read_text()
+    # Narrow mutant: leave refusal/state/audit reporting intact; remove ONLY
+    # the physical heartbeat stop. Require the actual post-recovery beat assertion.
+    start = ts.index('  private refuseSubject(')
+    end = ts.index('  private verifySubscriptions()', start)
+    cancellation = '    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)\n    this.heartbeatTimer = undefined\n'
+    refusal = ts[start:end]
+    assert refusal.count(cancellation) == 1
+    ts_heartbeat = ts[:start] + refusal.replace(cancellation, '') + ts[end:]
+    ts_guard = "if (!this.nc || this.nc.isClosed() || this.state !== 'connected') return"
+    assert ts_heartbeat.count(ts_guard) == 1
+    ts_heartbeat = ts_heartbeat.replace(ts_guard, 'if (!this.nc || this.nc.isClosed()) return')
+    py_guard = 'if self._nc is None or self._nc.is_closed or self._state != "connected":'
+    assert py.count(py_guard) == 1
+    py_heartbeat = py.replace(py_guard, 'if self._nc is None or self._nc.is_closed:')
+    ts_replay = ts_cmd + ["-t", "refused replay after reconnect"]
+    py_replay = py_cmd + ["-k", "replayed_subscribe_refusal_after_reconnect"]
+    ts_file.write_text(ts_heartbeat)
+    py_file.write_text(py_heartbeat)
+    check("TS heartbeat-only mutant retains initial unhealthy/refusal/audit reporting",
+          ts_cmd + ["-t", "refused SUB is unhealthy"], tmp, env)
+    check("TS heartbeat-only mutant emits beats after witnessed observer recovery",
+          ts_replay, tmp, env, red=True,
+          contains="error: heartbeat continued after observer recovery")
+    check("Python heartbeat-only mutant emits beats after witnessed observer recovery",
+          py_replay, tmp, env, red=True,
+          contains="AssertionError: heartbeat continued after observer recovery")
+    check("Python initial-refusal heartbeat-stop proof remains effective",
+          py_cmd + ["-k", "refused_subject_is_unhealthy"], tmp, env, red=True,
+          contains="AssertionError: a deaf bot must not publish liveness")
+    ts_file.write_text(ts)
+    py_file.write_text(py)
+
+    # Positive controls for the new observation barrier: reconnect alone must
+    # not allow silence to be measured when a fresh delivery is never received.
+    ts_test = tmp / "src/subscribe-health.test.ts"
+    py_test = tmp / "yugo/test/test_subscribe_health.py"
+    ts_tests = ts_test.read_text()
+    py_tests = py_test.read_text()
+    assert ts_tests.count('pendingWitnesses.get(frame.id)?.(frame)') == 1
+    assert py_tests.count('delivery.set_result(frame)') == 1
+    ts_test.write_text(ts_tests.replace('pendingWitnesses.get(frame.id)?.(frame)', 'void frame'))
+    py_test.write_text(py_tests.replace('delivery.set_result(frame)', 'pass  # discard witness delivery'))
+    check("TS reconnect without fresh delivery is rejected, not mistaken for silence",
+          ts_replay, tmp, env, red=True,
+          contains="error: observer did not receive fresh status-subscription witness")
+    check("Python reconnect without fresh delivery is rejected, not mistaken for silence",
+          py_replay, tmp, env, red=True,
+          contains="AssertionError: observer did not receive fresh status-subscription witness")
+    ts_test.write_text(ts_tests)
+    py_test.write_text(py_tests)
+
     ts_mutant = ts.replace('  private refuseSubject(subject: string): void {',
                            '  private refuseSubject(subject: string): void {\n    return')
     py_mutant = py.replace('    def _refuse_subject(self, subject: str) -> None:',

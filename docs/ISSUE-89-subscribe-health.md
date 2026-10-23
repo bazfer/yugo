@@ -97,3 +97,44 @@ This proves the check changes observed broker behavior, not just an assertion
 or a mocked error. The TS CI job now installs the broker instead of silently
 skipping these tests. TS's unrelated native-clock seam is injected exactly as
 in existing behavioral tests; these are not native-ABI qualification claims.
+
+## Review 5630640882: repair the heartbeat-stop proof, not production
+
+The original replay tests had an invalid observation window: they measured
+silence before their peer's default ~2-second reconnect completed. Reproduced
+this exactly: the heartbeat-only mutant passed **all six TS tests** and the
+Python replay test. The broad refusal-method mutant was insufficient evidence
+for physical heartbeat cessation because state/audit assertions caught it first.
+
+**Production adapter files are unchanged by this repair.** Both replay tests now:
+
+1. Observe the peer's actual reconnect event (with a failure deadline, not a
+   guessed recovery sleep).
+2. Publish a fresh unique `observer_witness` envelope and require actual receipt
+   on the **same existing `fleet.yugo.status` subscription** that counts beats.
+   The valid test envelope is not counted as a heartbeat.
+3. Only then snapshot the count and observe the existing multi-period silence
+   window. Require another freshly received nonce to bookend that window before
+   checking the count, so a blinded observer cannot manufacture a green result.
+
+These are test-only traffic/witnesses; production admission still depends on
+protocol fences, errors, and subscription handles, not application traffic.
+The TS test deadline accommodates default observer reconnect plus a bounded
+witness deadline; no production reconnect intervals or stop logic change.
+Python's initial-refusal test body is unchanged (verified by AST comparison).
+
+The existing broad controls remain. New gate controls leave unhealthy/refusal/
+terminal-audit reporting intact and remove **only** physical heartbeat stopping:
+
+- TS: remove timer cancellation inside `refuseSubject` and the publication state
+  guard. Initial refusal reporting stays green, but replay must fail specifically
+  with `heartbeat continued after observer recovery`, including actual counts.
+- Python: remove only the publication state guard. Both replay and the unchanged
+  initial-refusal test must fail on actual forbidden heartbeat observations.
+- Discard only witness delivery in each test harness, retaining reconnect events
+  and correct production code: replay must fail specifically for missing fresh
+  delivery. Reconnect alone is therefore insufficient to accept silence.
+
+The gate checks the specific runtime assertion/error text for these narrow
+mutants, not merely any non-zero exit. Unmodified suites pass with the same
+witness requirements; no silence/state/audit expectation is relaxed.

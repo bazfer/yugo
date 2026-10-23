@@ -14,6 +14,15 @@ afterEach(() => clockSpy.mockRestore())
 const jc = JSONCodec<any>()
 const binary = Bun.which('nats-server')
 const brokerTest = !binary && !process.env.CI ? test.skip : test
+async function observed<T>(promise: Promise<T>, failure: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(failure)), 5000)
+    })])
+  } finally { if (timer) clearTimeout(timer) }
+}
+
 async function fixture(refused: string[]) {
   if (!binary) throw new Error('real nats-server required (CI must install it)')
   const dir = mkdtempSync(join(tmpdir(), 'subscribe-health-'))
@@ -34,7 +43,33 @@ authorization { users: [
     }
     if (!peer) throw new Error('broker did not start')
     const beats: any[] = [], events: any[] = [], audits: any[] = []
-    peer.subscribe('fleet.yugo.status', { callback: (_, msg) => beats.push(jc.decode(msg.data)) })
+    let reconnectObserved!: () => void
+    const reconnected = new Promise<void>(resolve => { reconnectObserved = resolve })
+    const pendingWitnesses = new Map<string, (frame: any) => void>()
+    void (async () => {
+      for await (const status of peer!.status()) {
+        if (status.type === 'reconnect') reconnectObserved()
+      }
+    })()
+    peer.subscribe('fleet.yugo.status', { callback: (_, msg) => {
+      const frame = jc.decode(msg.data)
+      if (frame.kind === 'observer_witness') {
+        pendingWitnesses.get(frame.id)?.(frame)
+      } else if (frame.kind === 'status_heartbeat') beats.push(frame)
+    } })
+    async function freshObserverWitness(): Promise<void> {
+      const id = `observer-${crypto.randomUUID()}`
+      const delivery = new Promise<any>(resolve => { pendingWitnesses.set(id, resolve) })
+      try {
+        // Same subscription as the heartbeat observer, not a new probe lane.
+        peer!.publish('fleet.yugo.status', jc.encode({ envelope_version: 1, id, from: 'vec', to: 'yugo',
+          kind: 'observer_witness', ts: new Date().toISOString(), payload: { nonce: id } }))
+        await peer!.flush()
+        const frame = await observed(delivery, 'observer did not receive fresh status-subscription witness')
+        expect(frame.id).toBe(id)
+        expect(frame.payload.nonce).toBe(id)
+      } finally { pendingWitnesses.delete(id) }
+    }
     await peer.flush()
     const bus = new FleetBus({ botName: 'yugo', user: 'yugo', password: 'test', url: `nats://127.0.0.1:${port}`,
       dedupStorePath: ':memory:', heartbeatIntervalMs: 20,
@@ -43,7 +78,12 @@ authorization { users: [
       logger: message => { try { audits.push(JSON.parse(message.slice('FleetBus: '.length))) } catch {} },
     }, new Set(['yugo', 'vec']))
     await bus.connect()
-    return { bus, peer, beats, events, audits,
+    return { bus, peer, beats, events, audits, freshObserverWitness,
+      async recoverObserver() {
+        await observed(reconnected, 'observer reconnect was not observed')
+        await peer!.flush()
+        await freshObserverWitness()
+      },
       async restartWithRefusal(subject: string) {
         proc.kill(); await proc.exited
         const { readFileSync } = await import('node:fs')
@@ -116,13 +156,19 @@ brokerTest('refused replay after reconnect stops an already-running heartbeat', 
     for (let i = 0; i < 300 && f.bus.busStatus().healthy; i++) await Bun.sleep(10)
     for (let i = 0; i < 300 && f.bus.busStatus().state !== 'unhealthy'; i++) await Bun.sleep(10)
     expect(f.bus.busStatus()).toMatchObject({ healthy: false, state: 'unhealthy', subjects_refused: ['fleet.yugo.request'] })
-    await Bun.sleep(100)
+    expect(f.audits.filter(a => a.reason === 'claude_discord_adapter_subscribe_refused')).toHaveLength(1)
+    // Silence is meaningful only after this observer has actually recovered.
+    await f.recoverObserver() // Reconnect event AND fresh same-subscription delivery.
     const count = f.beats.length
-    await Bun.sleep(100)
+    await Bun.sleep(100) // Five heartbeat intervals, with a live observer.
+    await f.freshObserverWitness() // Bookend the window with another received nonce.
+    if (f.beats.length !== count) {
+      throw new Error(`heartbeat continued after observer recovery: before=${count} after=${f.beats.length}`)
+    }
     expect(f.beats).toHaveLength(count)
     expect(f.audits.filter(a => a.reason === 'claude_discord_adapter_subscribe_refused')).toHaveLength(1)
   } finally { await f.close() }
-}, 10000)
+}, 15000)
 
 test('transient replay flush failure does not abandon status observation', async () => {
   let flushes = 0

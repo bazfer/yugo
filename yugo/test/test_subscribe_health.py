@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import uuid
 
 import nats
 import pytest
@@ -38,7 +39,44 @@ authorization {{ users: [
         server.stop()
 
 
-async def setup_bus(broker, tmp_path):
+class Observer:
+    def __init__(self):
+        self.reconnected = asyncio.Event()
+        self.pending = {}
+
+    async def on_reconnected(self):
+        self.reconnected.set()
+
+    async def fresh_witness(self, peer):
+        identifier = f"observer-{uuid.uuid4()}"
+        delivery = asyncio.get_running_loop().create_future()
+        self.pending[identifier] = delivery
+        try:
+            # Same subscription as beats; never mistake the witness for a beat.
+            await peer.publish("fleet.yugo.status", json.dumps({"envelope_version": 1,
+                "id": identifier, "from": "vec", "to": "yugo", "kind": "observer_witness",
+                "ts": "2026-10-23T15:00:00Z", "payload": {"nonce": identifier}}).encode())
+            await peer._flush_pending(force_flush=True)
+            await peer.flush()
+            try:
+                frame = await asyncio.wait_for(delivery, 5)
+            except TimeoutError as error:
+                raise AssertionError("observer did not receive fresh status-subscription witness") from error
+            assert frame["id"] == identifier
+            assert frame["payload"]["nonce"] == identifier
+        finally:
+            self.pending.pop(identifier, None)
+
+    async def recover(self, peer):
+        await asyncio.wait_for(self.reconnected.wait(), 5)
+        await peer._flush_pending(force_flush=True)
+        await peer.flush()
+        await self.fresh_witness(peer)
+
+
+async def setup_bus(broker, tmp_path, observer=None):
+    if observer is None:
+        observer = Observer()
     records = []
     class Audit:
         def record(self, direction, subject, **fields):
@@ -46,10 +84,16 @@ async def setup_bus(broker, tmp_path):
     bus = FleetBus(FleetBusConfig(bot_name="yugo", url=broker.url, user="yugo", password="test",
                     allowed_from=frozenset({"yugo", "vec"}), dedup_store_path=str(tmp_path / "dedup.sqlite"),
                     plugin_version="test", heartbeat_interval_s=0.03, reconnect_time_wait_s=0.03), Audit())
-    peer = await nats.connect(broker.url, user="vec", password="test")
+    peer = await nats.connect(broker.url, user="vec", password="test", reconnected_cb=observer.on_reconnected)
     beats = []
     async def on_beat(msg):
-        await collect(beats, msg)
+        frame = json.loads(msg.data)
+        if frame.get("kind") == "observer_witness":
+            delivery = observer.pending.get(frame["id"])
+            if delivery is not None and not delivery.done():
+                delivery.set_result(frame)
+        elif frame.get("kind") == "status_heartbeat":
+            await collect(beats, msg)
     await peer.subscribe("fleet.yugo.status", cb=on_beat)
     await peer.flush()
     await bus._connect()
@@ -139,7 +183,8 @@ async def test_positive_control_broker_really_refuses_but_retains_local_handle(r
 
 async def test_replayed_subscribe_refusal_after_reconnect_is_terminal(restricted_broker, tmp_path):
     broker = restricted_broker([])
-    bus, peer, beats, records = await setup_bus(broker, tmp_path)
+    observer = Observer()
+    bus, peer, beats, records = await setup_bus(broker, tmp_path, observer)
     loop = asyncio.create_task(bus._heartbeat_loop())
     try:
         await asyncio.sleep(0.06)
@@ -153,10 +198,14 @@ async def test_replayed_subscribe_refusal_after_reconnect_is_terminal(restricted
             await asyncio.sleep(0.01)
         assert bus.bus_status()["subjects_refused"] == ["fleet.yugo.request"]
         assert bus.bus_status()["healthy"] is False
-        await asyncio.sleep(0.1)  # Drain any pre-refusal beat already on the wire.
+        assert len([r for r in records if r.get("reason") == "yugo_subscribe_refused"]) == 1
+        await observer.recover(peer)  # Reconnect AND a received fresh nonce on the beat subscription.
         count = len(beats)
-        await asyncio.sleep(0.13)
-        assert len(beats) == count
+        await asyncio.sleep(0.13)  # Multiple heartbeat periods, now actually observed.
+        await observer.fresh_witness(peer)  # Delivery also bookends the observation window.
+        assert len(beats) == count, (
+            f"heartbeat continued after observer recovery: before={count} after={len(beats)}"
+        )
         assert len([r for r in records if r.get("reason") == "yugo_subscribe_refused"]) == 1
     finally:
         loop.cancel()
