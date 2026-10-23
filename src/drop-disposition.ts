@@ -36,9 +36,6 @@ export type DropReason =
   | 'yugo_invalid_owner'
   | 'yugo_invalid_hops'
   | 'yugo_bus_tag_rejected'
-  | 'yugo_autoreply_suppressed'
-  | 'yugo_baton_hops_exceeded'
-  | 'yugo_baton_warning_suppressed'
   | 'claude_discord_adapter_injection_failed'
   | 'injection_failed'
   | 'claude_discord_adapter_publish_failed'
@@ -106,9 +103,6 @@ export const DROP_DISPOSITION: Record<DropReason, Disposition> = {
   yugo_invalid_owner: 'terminal',
   yugo_invalid_hops: 'terminal',
   yugo_bus_tag_rejected: 'terminal',
-  yugo_autoreply_suppressed: 'terminal',
-  yugo_baton_hops_exceeded: 'terminal',
-  yugo_baton_warning_suppressed: 'terminal',
   claude_discord_adapter_injection_failed: 'transient',
   injection_failed: 'transient',
   claude_discord_adapter_publish_failed: 'transient',

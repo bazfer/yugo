@@ -84,3 +84,9 @@ test('cleanup drops count but do not send two notices for one decoded delivery',
   bus.recordDrop({ dir: 'drop', subject: 'fleet.kat.request', reason: 'injection_failed' }, { ...envelope })
   expect(published).toHaveLength(2)
 })
+
+test('successful Python suppression audit reasons are not drop reasons', () => {
+  for (const reason of ['yugo_autoreply_suppressed', 'yugo_baton_hops_exceeded', 'yugo_baton_warning_suppressed']) {
+    expect(Object.hasOwn(DROP_DISPOSITION, reason)).toBe(false)
+  }
+})

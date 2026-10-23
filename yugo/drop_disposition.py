@@ -44,9 +44,6 @@ class DropReason(str, Enum):
     YUGO_INVALID_OWNER = "yugo_invalid_owner"
     YUGO_INVALID_HOPS = "yugo_invalid_hops"
     YUGO_BUS_TAG_REJECTED = "yugo_bus_tag_rejected"
-    YUGO_AUTOREPLY_SUPPRESSED = "yugo_autoreply_suppressed"
-    YUGO_BATON_HOPS_EXCEEDED = "yugo_baton_hops_exceeded"
-    YUGO_BATON_WARNING_SUPPRESSED = "yugo_baton_warning_suppressed"
     CLAUDE_DISCORD_ADAPTER_INJECTION_FAILED = "claude_discord_adapter_injection_failed"
     INJECTION_FAILED = "injection_failed"
     CLAUDE_DISCORD_ADAPTER_PUBLISH_FAILED = "claude_discord_adapter_publish_failed"
@@ -113,9 +110,6 @@ DROP_DISPOSITION: dict[DropReason, Disposition] = {
     DropReason.YUGO_INVALID_OWNER: Disposition.TERMINAL,
     DropReason.YUGO_INVALID_HOPS: Disposition.TERMINAL,
     DropReason.YUGO_BUS_TAG_REJECTED: Disposition.TERMINAL,
-    DropReason.YUGO_AUTOREPLY_SUPPRESSED: Disposition.TERMINAL,
-    DropReason.YUGO_BATON_HOPS_EXCEEDED: Disposition.TERMINAL,
-    DropReason.YUGO_BATON_WARNING_SUPPRESSED: Disposition.TERMINAL,
     DropReason.CLAUDE_DISCORD_ADAPTER_INJECTION_FAILED: Disposition.TRANSIENT,
     DropReason.INJECTION_FAILED: Disposition.TRANSIENT,
     DropReason.CLAUDE_DISCORD_ADAPTER_PUBLISH_FAILED: Disposition.TRANSIENT,

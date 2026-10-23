@@ -81,6 +81,17 @@ with tempfile.TemporaryDirectory(prefix=".drop-gate-", dir=ROOT) as directory:
     (tmp / "src/fleet-bus.ts").write_text(ts_bus)
     (tmp / "fleet_bus.py").write_text(py_bus)
 
+    # A successful suppression must never become a paid failure-notice turn.
+    suppression_mutant = py_bus.replace(
+        'self._audit.record("in", subject, event="suppression", reason=reason.value, **fields)',
+        'self._record_drop(subject, reason=DropReason.INJECTION_FAILED, '
+        'context={"id": fields.get("id"), "from": "deet", "kind": "text_message"})')
+    assert suppression_mutant != py_bus
+    (tmp / "fleet_bus.py").write_text(suppression_mutant)
+    check("successful suppression emits failure notice", py_tests, tmp,
+          red=True, contains="failed", env=env)
+    (tmp / "fleet_bus.py").write_text(py_bus)
+
     # Informational events must remain outside classification AND still emit.
     (tmp / "src/drop-disposition.ts").write_text(ts_map.replace("export const DROP_DISPOSITION: Record<DropReason, Disposition> = {", "export const DROP_DISPOSITION: Record<DropReason, Disposition> = {\n  fleet_manifest_loaded: 'terminal',"))
     check("manifest misclassified as drop", ts_tests, tmp, red=True, contains="fail")

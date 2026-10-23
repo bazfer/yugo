@@ -69,6 +69,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, NamedTuple
 
@@ -778,28 +779,28 @@ def format_envelope_for_session(envelope: dict, req_id: str) -> str:
 _BUS_TAG_OPEN = "<BUS"
 _BUS_TAG_CLOSE = "</BUS>"
 
-# Reject reasons 3c can write.
-#
-# Anything the shared taxonomy already names is spelled the way it spells it —
-# a tag we cannot resolve to a publishable recipient is `invalid_to`, the
-# fleet-bus SPEC §5 code, and an envelope we build and then fail to validate
-# reports whatever §5 code `validate_envelope` returns. The three below have no
-# §5 spelling because §5 describes the INBOUND wire and these are all upstream
-# of any wire: a tag that never parsed, a publish that never left, a reply we
-# chose not to send. §8 covers exactly that case — a drop reason is "a §5 code
-# or an implementation-specific code prefixed with the harness name" — and the
-# sibling adapter design uses the same convention with `codex_adapter_`.
-# Prefixing is what keeps them from colliding with a future §5 addition.
+# Keep genuine output failures separate from deliberate non-publication.
+# Shared validation failures use the §5 vocabulary; adapter-only failures use
+# the yugo_ prefix. The compatibility REJECT_* names below also include three
+# successful/policy suppressions, but those are NOT drop reasons.
+class SuppressionReason(str, Enum):
+    """Intentional non-publication, not failed delivery or a fifth disposition."""
+    AUTOREPLY = "yugo_autoreply_suppressed"
+    HOPS_EXHAUSTED = "yugo_baton_hops_exceeded"
+    WARNING = "yugo_baton_warning_suppressed"
+
+
 REJECT_TAG = DropReason.YUGO_BUS_TAG_REJECTED
 REJECT_PUBLISH_FAILED = DropReason.YUGO_PUBLISH_FAILED
-REJECT_AUTOREPLY_SUPPRESSED = DropReason.YUGO_AUTOREPLY_SUPPRESSED
+# Compatibility constant names; these three are informational, NOT DropReason.
+REJECT_AUTOREPLY_SUPPRESSED = SuppressionReason.AUTOREPLY
 
 # v0.3d, same prefixing rule and the same reason: §5 describes the inbound
 # wire and has no baton vocabulary at all. The ceiling is not a malformed
 # envelope — `validate_envelope` has already passed it — it is a WELL-FORMED
 # envelope we refuse to carry any further, so it cannot borrow a §5 code.
-REJECT_HOPS_EXCEEDED = DropReason.YUGO_BATON_HOPS_EXCEEDED
-REJECT_WARNING_SUPPRESSED = DropReason.YUGO_BATON_WARNING_SUPPRESSED
+REJECT_HOPS_EXCEEDED = SuppressionReason.HOPS_EXHAUSTED
+REJECT_WARNING_SUPPRESSED = SuppressionReason.WARNING
 
 # `note` on the `out` line of a hop-8 warning. Without it the warning is
 # indistinguishable in the audit log from any other `text_message` this bot
@@ -1263,6 +1264,11 @@ class FleetBus:
     def bus_status(self) -> dict:
         """Snapshot for host status UIs; also included in every heartbeat."""
         return {"drop_counts": dict(self._drop_counts)}
+
+    def _record_suppression(self, subject: str, *, reason: SuppressionReason,
+                            **fields: Any) -> None:
+        # Success/policy boundary: never increment drop counters or notify a peer.
+        self._audit.record("in", subject, event="suppression", reason=reason.value, **fields)
 
     def _record_drop(self, subject: str | None, *,
                      reason: DropReason, context: Any, **fields: Any) -> None:
@@ -1746,9 +1752,8 @@ class FleetBus:
         # of that is not sixteen turns.
         hops = envelope.get("hops")
         if isinstance(hops, int) and hops >= BATON_HOPS_REJECT_AT:
-            self._record_drop(
-                subject,
-                context=envelope, reason=REJECT_HOPS_EXCEEDED,
+            self._record_suppression(
+                subject, reason=REJECT_HOPS_EXCEEDED,
                 id=envelope["id"],
                 hops=hops,
                 **{"from": envelope["from"]},
@@ -2040,9 +2045,8 @@ class FleetBus:
         """
         origin = envelope.get("origin")
         if not origin:
-            self._record_drop(
-                subject,
-                context=envelope, reason=REJECT_WARNING_SUPPRESSED,
+            self._record_suppression(
+                subject, reason=REJECT_WARNING_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="no_origin",
@@ -2050,9 +2054,8 @@ class FleetBus:
             )
             return
         if normalize_bot_name(origin) == self._config.bot_name:
-            self._record_drop(
-                subject,
-                context=envelope, reason=REJECT_WARNING_SUPPRESSED,
+            self._record_suppression(
+                subject, reason=REJECT_WARNING_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="self_origin",
@@ -2228,9 +2231,8 @@ class FleetBus:
                 delivered = False
 
         if envelope.get("in_reply_to") is not None:
-            self._record_drop(
-                subject,
-                context=envelope, reason=REJECT_AUTOREPLY_SUPPRESSED,
+            self._record_suppression(
+                subject, reason=REJECT_AUTOREPLY_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="in_reply_to",
@@ -2241,9 +2243,8 @@ class FleetBus:
         if not answer:
             # A turn whose entire output was tags has already said everything
             # it had to say, to the peers it named.
-            self._record_drop(
-                subject,
-                context=envelope, reason=REJECT_AUTOREPLY_SUPPRESSED,
+            self._record_suppression(
+                subject, reason=REJECT_AUTOREPLY_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="empty_reply",

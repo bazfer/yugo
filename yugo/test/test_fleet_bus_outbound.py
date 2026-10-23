@@ -252,8 +252,15 @@ class OutboundHarness:
             if raw.strip()
         ]
 
+    def suppressions(self, reason: str) -> list[dict]:
+        records = [line for line in self.lines() if line.get("reason") == reason]
+        assert all(line["dir"] == "in" and line.get("event") == "suppression" and "disposition" not in line for line in records)
+        return records
+
     def drops(self, reason: str) -> list[dict]:
-        return [line for line in self.lines() if line.get("reason") == reason]
+        records = [line for line in self.lines() if line.get("reason") == reason]
+        assert all(line["dir"] == "drop" and "disposition" in line for line in records)
+        return records
 
     async def wait_for(self, predicate, timeout: float = 20.0, what: str = "condition"):
         deadline = time.monotonic() + timeout
@@ -524,20 +531,27 @@ async def test_a_tag_we_cannot_honour_publishes_nothing_and_says_why(
             f"fleet.{BOT_NAME}.request", _encode(_peer_envelope(id=f"ask-{label}"))
         )
         await peer.flush()
-        await inbox.wait_for(1)
+        await inbox.wait_for(2)
         await asyncio.sleep(0.3)
     finally:
         await peer.close()
 
     published = [subject for subject, _ in inbox.received]
-    assert published == [f"fleet.{PEER_NAME}.request"], (
+    assert published == [f"fleet.{PEER_NAME}.request"] * 2, (
         f"{label}: an unhonourable tag reached the wire on {published}"
     )
     assert harness.drops(expected_reason), (
         f"{label}: no {expected_reason} audit line; lines were "
         f"{[line.get('reason') for line in harness.lines()]}"
     )
-    answer = inbox.on(f"fleet.{PEER_NAME}.request")[0]
+    messages = inbox.on(f"fleet.{PEER_NAME}.request")
+    notices = [message for message in messages if message["kind"] == "drop_notice"]
+    assert len(notices) == 1
+    assert notices[0]["payload"] == {
+        "envelope_id": f"ask-{label}", "reason": expected_reason,
+        "disposition": "terminal", "subject": f"fleet.{BOT_NAME}.request",
+    }
+    answer, = [message for message in messages if message["kind"] == "text_message"]
     assert answer["payload"]["text"] == "told them."
     await harness.stop()
 
@@ -566,19 +580,26 @@ async def test_a_broken_tag_costs_one_tag_not_the_turn_or_the_subscription(
             f"fleet.{BOT_NAME}.request", _encode(_peer_envelope(id="broken"))
         )
         await peer.flush()
-        await inbox.wait_for(1)
+        await inbox.wait_for(2)
 
         harness.replies["reply"] = "second answer"
         await peer.publish(
             f"fleet.{BOT_NAME}.request", _encode(_peer_envelope(id="after-broken"))
         )
         await peer.flush()
-        await inbox.wait_for(2)
+        await inbox.wait_for(3)
     finally:
         await peer.close()
 
     assert inbox.on(f"fleet.{THIRD_NAME}.request") == []
-    answers = inbox.on(f"fleet.{PEER_NAME}.request")
+    messages = inbox.on(f"fleet.{PEER_NAME}.request")
+    answers = [message for message in messages if message["kind"] == "text_message"]
+    notices = [message for message in messages if message["kind"] == "drop_notice"]
+    assert len(notices) == 1
+    assert notices[0]["payload"] == {
+        "envelope_id": "broken", "reason": "yugo_bus_tag_rejected",
+        "disposition": "terminal", "subject": f"fleet.{BOT_NAME}.request",
+    }
     assert [answer["in_reply_to"] for answer in answers] == ["broken", "after-broken"]
     assert answers[0]["payload"] == {"text": "sure thing"}
     assert answers[1]["payload"] == {"text": "second answer"}
@@ -688,7 +709,8 @@ async def test_a_turn_that_is_nothing_but_tags_sends_no_empty_answer(
         await peer.close()
 
     assert [subject for subject, _ in inbox.received] == [f"fleet.{THIRD_NAME}.request"]
-    suppressed = harness.drops(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
+    assert not any(harness.bus.bus_status()["drop_counts"].values())
+    suppressed = harness.suppressions(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
     assert [line["cause"] for line in suppressed] == ["empty_reply"]
     await harness.stop()
 
@@ -748,7 +770,7 @@ async def test_an_envelope_that_is_itself_a_reply_is_not_auto_answered(
     assert [envelope["in_reply_to"] for envelope in inbox.on(f"fleet.{PEER_NAME}.request")] == [
         "a-question"
     ]
-    suppressed = harness.drops(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
+    suppressed = harness.suppressions(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
     assert [line["cause"] for line in suppressed] == ["in_reply_to"]
     assert suppressed[0]["id"] == "a-reply"
     await harness.stop()
@@ -913,7 +935,9 @@ async def test_two_bots_do_not_ping_pong(nats_server, tmp_path):  # noqa: F811
         line["subject"] for line in yugo.lines() if line["dir"] == "out"
     ]
     assert yugo_out.count(f"fleet.{PEER_NAME}.request") == 1
-    vec_suppressed = vec.drops(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
+    assert not any(yugo.bus.bus_status()["drop_counts"].values())
+    assert not any(vec.bus.bus_status()["drop_counts"].values())
+    vec_suppressed = vec.suppressions(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
     assert [line["cause"] for line in vec_suppressed] == ["in_reply_to"]
 
 
@@ -1033,11 +1057,18 @@ async def test_a_fault_in_the_dispatcher_does_not_wedge_the_subscription(
             f"fleet.{BOT_NAME}.request", _encode(_peer_envelope(id="after-explosion"))
         )
         await peer.flush()
-        await inbox.wait_for(1)
+        await inbox.wait_for(2)
     finally:
         await peer.close()
 
-    answers = inbox.on(f"fleet.{PEER_NAME}.request")
+    messages = inbox.on(f"fleet.{PEER_NAME}.request")
+    answers = [message for message in messages if message["kind"] == "text_message"]
+    notices = [message for message in messages if message["kind"] == "drop_notice"]
+    assert len(notices) == 1
+    assert notices[0]["payload"] == {
+        "envelope_id": "explodes", "reason": "yugo_publish_failed",
+        "disposition": "transient", "subject": f"fleet.{BOT_NAME}.request",
+    }
     assert [answer["in_reply_to"] for answer in answers] == ["after-explosion"]
     assert "parser fell over" in harness.drops(fleet_bus.REJECT_PUBLISH_FAILED)[0]["error"]
     assert not harness.task.done()
@@ -1077,5 +1108,12 @@ async def test_an_envelope_the_validator_refuses_never_reaches_the_wire(
     finally:
         await peer.close()
 
-    assert inbox.received == []
+    notices = inbox.on(f"fleet.{PEER_NAME}.request")
+    assert len(notices) == 1
+    assert notices[0]["kind"] == "drop_notice"
+    assert notices[0]["payload"] == {
+        "envelope_id": "huge", "reason": "envelope_too_large",
+        "disposition": "terminal", "subject": f"fleet.{PEER_NAME}.request",
+    }
+    assert len(_encode(notices[0])) < fleet_bus.DEFAULT_MAX_ENVELOPE_BYTES
     await harness.stop()

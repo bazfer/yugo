@@ -123,3 +123,34 @@ def test_drop_audits_cannot_bypass_the_classifying_helper():
                     and call.args[0].value == "drop"):
                 drop_writers.append(function.name)
     assert drop_writers == ["_record_drop"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["reply", "tags_only", "ceiling", "warning_missing", "warning_self"])
+async def test_successful_nonpublication_is_info_and_never_notifies(boundary):
+    from fleet_bus import SuppressionReason
+    bus = harness()
+    envelope = {"id": "original", "from": "deet", "to": "kat", "kind": "text_message"}
+    if boundary == "ceiling":
+        envelope["hops"] = 16
+        await bus._on_request("fleet.kat.request", envelope)
+    elif boundary.startswith("warning"):
+        if boundary == "warning_self":
+            envelope["origin"] = "kat"
+        await bus._warn_origin("fleet.kat.request", envelope, "req")
+    else:
+        bus.publish_request = AsyncMock(return_value=True)
+        if boundary == "reply":
+            envelope["in_reply_to"] = "parent"
+        output = "thanks" if boundary == "reply" else '<BUS to="deet">handled</BUS>'
+        assert await bus._publish_turn_output("fleet.kat.request", envelope, "req", output)
+        assert bus.publish_request.await_count == (0 if boundary == "reply" else 1)
+    await asyncio.gather(*bus._notice_tasks)
+    bus._nc.publish.assert_not_awaited()
+    assert bus.bus_status()["drop_counts"] == dict.fromkeys(["terminal", "transient", "throttled", "duplicate"], 0)
+    args, fields = bus._audit.record.call_args
+    assert args == ("in", "fleet.kat.request")
+    assert fields["event"] == "suppression"
+    assert "disposition" not in fields
+    assert fields["reason"] in {reason.value for reason in SuppressionReason}
+    assert not ({reason.value for reason in SuppressionReason} & {reason.value for reason in DropReason})
