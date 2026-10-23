@@ -278,6 +278,7 @@ def test_no_reject_code_enters_fleet_bus_without_a_row_in_the_table_above():
         # `owner_lost` and `lease_lost` are not faults at all — they record
         # that another consumer holds the claim, which under the at-least-once
         # execution contract is a visible duplicate rather than an error.
+        "yugo_subscribe_refused",  # Terminal SUB admission failure, not an envelope.
         "yugo_dedup_complete_failed",
         "yugo_dedup_release_failed",
         "yugo_dedup_renew_failed",

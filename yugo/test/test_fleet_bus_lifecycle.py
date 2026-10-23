@@ -173,8 +173,8 @@ def _encode(value) -> bytes:
 async def test_subscribes_the_live_wire_subjects_not_inbox(bus_factory, nats_server):  # noqa: F811
     """SPEC §15 erratum E-1.
 
-    `fleet.<self>.inbox` does not exist until FB-1 lands, and per-user authz
-    does not grant subscribe on it. nats-py answers a permissions violation by
+    Live per-user authz grants each bot its own `fleet.<self>.inbox`.
+    Consumption intentionally remains on the current subjects until #10. nats-py answers a permissions violation by
     calling `error_cb` and RETURNING — the connection stays up. A bot that
     subscribed `.inbox` today would be connected, heartbeating, and deaf,
     while every lifecycle assertion below still passed.

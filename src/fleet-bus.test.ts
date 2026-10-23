@@ -535,7 +535,7 @@ class FakeNatsConnection {
     this.publishes.push({ subject, envelope: jc.decode(data) })
   }
 
-  subscribe(subject: string): { unsubscribe: () => void; [Symbol.asyncIterator]: () => AsyncIterator<Msg> } {
+  subscribe(subject: string): { unsubscribe: () => void; getSubject: () => string; isClosed: () => boolean; [Symbol.asyncIterator]: () => AsyncIterator<Msg> } {
     this.subscribed.push(subject)
     const queue: Msg[] = []
     let notify: (() => void) | null = null
@@ -556,6 +556,8 @@ class FakeNatsConnection {
     this.subscriptions.push({ subject, push, unsubscribe })
     return {
       unsubscribe,
+      getSubject: () => subject,
+      isClosed: () => done,
       [Symbol.asyncIterator](): AsyncIterator<Msg> {
         return {
           async next(): Promise<IteratorResult<Msg>> {
@@ -577,6 +579,7 @@ class FakeNatsConnection {
     sub.push(msg)
   }
 
+  async flush(): Promise<void> {}
   isClosed(): boolean { return this.closed_ }
   async close(): Promise<void> { this.markClosed() }
   async drain(): Promise<void> { this.markClosed() }

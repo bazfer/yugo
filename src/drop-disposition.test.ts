@@ -6,7 +6,7 @@ function harness() {
   const published: any[] = [], audits: any[] = []
   const bus: any = Object.create(FleetBus.prototype)
   Object.assign(bus, {
-    notifiedDrops: new WeakSet(),
+    notifiedDrops: new WeakSet(), subjectsRefused: new Set(), state: 'connected',
     config: { botName: 'kat' }, allowedFromClaims: new Set(['deet', 'kat']),
     dropCounts: { terminal: 0, transient: 0, throttled: 0, duplicate: 0 },
     nc: { publish: (subject: string, data: Uint8Array) => published.push({ subject, envelope: JSON.parse(new TextDecoder().decode(data)) }) },
