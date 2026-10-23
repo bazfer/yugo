@@ -16,14 +16,16 @@
     "src/monotonic-clock.ts",
     "schema/envelope.v1.schema.json",
     "SPEC.md",
-    "conformance/envelope.v1.vectors.json"
+    "conformance/envelope.v1.vectors.json",
+    "src/drop-disposition.ts"
   ],
   "scripts": {
-    "test": "bun test src/fleet-bus.test.ts",
+    "test": "bun test src/fleet-bus.test.ts src/drop-disposition.test.ts",
     "test:gates": "bun test/gates/test-suite.ts",
     "schema:hash": "sha256sum schema/envelope.v1.schema.json",
     "conformance": "bun conformance/run-ts.ts",
-    "vectors:hash": "sha256sum conformance/envelope.v1.vectors.json"
+    "vectors:hash": "sha256sum conformance/envelope.v1.vectors.json",
+    "test:drops:mutations": "python test/gates/drop-disposition.py"
   },
   "dependencies": {
     "nats": "^2.29.3",

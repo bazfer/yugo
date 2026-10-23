@@ -1,3 +1,5 @@
+import { DROP_DISPOSITION, type DropReason, type Disposition } from './drop-disposition'
+export { DROP_DISPOSITION, type DropReason, type Disposition } from './drop-disposition'
 import {
   connect as natsConnect,
   JSONCodec,
@@ -475,7 +477,7 @@ export interface FleetBusReplyResult {
 
 export type EnvelopeValidationResult =
   | { ok: true; envelope: Envelope }
-  | { ok: false; error: string }
+  | { ok: false; error: DropReason }
 
 const BOT_NAME_PATTERN = /^[a-z0-9_-]+$/
 export const BROADCAST_KIND_RE = /^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/
@@ -758,8 +760,8 @@ export function validateEnvelope(
 /* -------------------------------------------------------------------------- */
 
 export class BatonDerivationError extends Error {
-  readonly reason: string
-  constructor(reason: string, message: string) {
+  readonly reason: DropReason
+  constructor(reason: DropReason, message: string) {
     super(message)
     this.reason = reason
     this.name = 'BatonDerivationError'
@@ -1006,6 +1008,7 @@ export function defaultRateLimiters(): FleetBusRateLimiters {
 
 /** A claim held open until its `.request` turn publishes an answer. */
 interface PendingReplyClaim {
+  envelope: Envelope
   envelopeId: string
   owner: string
   subject: string
@@ -1032,7 +1035,7 @@ interface PendingReplyClaim {
    * logged under the wrong one on the deferred branch. Undefined means the
    * default, which is what every pre-existing trigger sets.
    */
-  abandonDropReason?: string
+  abandonDropReason?: DropReason
   /** Identifies the attempt that owns this claim; see `FleetBusSessionEvent.replyToken`. */
   token: string
 }
@@ -1188,7 +1191,7 @@ export class FleetBus {
           return
         }
         claim.stopRenewing()
-        this.releaseClaim(claim.subject, claim.envelopeId, reqId, claim.owner)
+        this.releaseClaim(claim.subject, claim.envelope, reqId, claim.owner)
       },
     )
     this.evictedLedger = new BoundedLru<string, true>(config.evictedLedgerCap ?? DEFAULT_EVICTED_LEDGER_CAP)
@@ -1251,43 +1254,46 @@ export class FleetBus {
    * injection, deliberately, because an unsolicited inject may legitimately
    * never reply; that remaining asymmetry is yugo#27.
    */
-  private completeClaim(subject: string, envelopeId: string, reqId: string, owner: string): boolean {
+  private completeClaim(subject: string, envelope: Envelope, reqId: string, owner: string): boolean {
+    const envelopeId = envelope.id
     let won: boolean
     try {
       won = this.durableDedup.complete(envelopeId, owner)
     } catch (error) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_complete_failed',
         envelope_id: envelopeId, req_id: reqId, note: String(error),
-      })
+      }, envelope)
       return false
     }
     if (!won) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_owner_lost',
         envelope_id: envelopeId, req_id: reqId,
-      })
+      }, envelope)
     }
     return won
   }
 
-  private releaseClaim(subject: string, envelopeId: string, reqId: string, owner: string): boolean {
+  private releaseClaim(subject: string, envelope: Envelope, reqId: string, owner: string): boolean {
+    const envelopeId = envelope.id
     try {
       return this.durableDedup.release(envelopeId, owner)
     } catch (error) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_release_failed',
         envelope_id: envelopeId, req_id: reqId, note: String(error),
-      })
+      }, envelope)
       return false
     }
   }
 
-  private claimDedup(subject: string, envelopeId: string, reqId: string) {
+  private claimDedup(subject: string, envelope: Envelope, reqId: string) {
+    const envelopeId = envelope.id
     try {
       return this.durableDedup.claim(envelopeId, reqId)
     } catch (error) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_store_failed', envelope_id: envelopeId, req_id: reqId, error: String(error) })
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_store_failed', envelope_id: envelopeId, req_id: reqId, error: String(error) }, envelope)
       return undefined
     }
   }
@@ -1416,17 +1422,24 @@ export class FleetBus {
 
   async request(options: FleetBusRequestOptions): Promise<FleetBusRequestResult> {
     if (this.mode === 'publish-only' && options.wait === true) {
+      this.recordDrop({ dir: 'drop', subject: `fleet.${options.to}.request`, reason: 'claude_discord_adapter_multi_instance_publish_only' }, options.inbound)
       return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only' }
     }
-    if (!this.nc || this.nc.isClosed()) return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected' }
+    if (!this.nc || this.nc.isClosed()) {
+      this.recordDrop({ dir: 'drop', subject: `fleet.${options.to}.request`, reason: 'claude_discord_adapter_fleet_bus_not_connected' }, options.inbound)
+      return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected' }
+    }
 
     const canonicalTo = normalizeBotName(options.to)
-    if (canonicalTo === null) return { ok: false, error: 'claude_discord_adapter_invalid_recipient' }
+    if (canonicalTo === null) {
+      this.recordDrop({ dir: 'drop', subject: `fleet.${options.to}.request`, reason: 'claude_discord_adapter_invalid_recipient' }, options.inbound)
+      return { ok: false, error: 'claude_discord_adapter_invalid_recipient' }
+    }
     if (!payloadIsJsonSerializable(options.payload)) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop', subject: `fleet.${canonicalTo}.request`,
         reason: 'claude_discord_adapter_payload_not_json_serializable',
-      })
+      }, options.inbound)
       return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable' }
     }
     const canonicalBot = normalizeBotName(this.config.botName)!
@@ -1442,7 +1455,7 @@ export class FleetBus {
       })
     } catch (error) {
       const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
-      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason, envelope_id: envelopeId })
+      this.recordDrop({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason, envelope_id: envelopeId }, options.inbound)
       return { ok: false, error: reason }
     }
     const envelope: Envelope = {
@@ -1457,7 +1470,7 @@ export class FleetBus {
     }
     const validation = this.validateWithManifest(envelope)
     if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId })
+      this.recordDrop({ dir: 'drop', subject: `fleet.${canonicalTo}.request`, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId }, options.inbound)
       return { ok: false, error: validation.error, envelope }
     }
     const subject = `fleet.${canonicalTo}.request`
@@ -1467,7 +1480,7 @@ export class FleetBus {
     try {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, req_id: localReqId, error: String(error) })
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, req_id: localReqId, error: String(error) }, options.inbound)
       return { ok: false, error: 'claude_discord_adapter_publish_failed', envelope }
     }
     this.recordAudit({ dir: 'out', subject, envelope_id: envelopeId, req_id: localReqId })
@@ -1487,7 +1500,7 @@ export class FleetBus {
         if (this.outboundLedger.has(envelopeId)) {
           this.outboundLedger.delete(envelopeId)
           this.evictedLedger.set(envelopeId, true)
-          this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_request_timeout', envelope_id: envelopeId, req_id: localReqId })
+          this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_request_timeout', envelope_id: envelopeId, req_id: localReqId }, options.inbound)
           resolve({ ok: false, timed_out: true, envelope })
         }
       }, timeoutMs)
@@ -1537,9 +1550,11 @@ export class FleetBus {
       this.abandonRepliedClaim(reqId, reason)
     }
     if (this.mode === 'publish-only') {
+      this.recordDrop({ dir: 'drop', subject: `fleet.${this.config.botName}.request`, reason: 'claude_discord_adapter_multi_instance_publish_only' }, this.receiveLedger.get(reqId))
       return { ok: false, error: 'claude_discord_adapter_multi_instance_publish_only', req_id: reqId }
     }
     if (!this.nc || this.nc.isClosed()) {
+      this.recordDrop({ dir: 'drop', subject: `fleet.${this.config.botName}.request`, reason: 'claude_discord_adapter_fleet_bus_not_connected' }, this.receiveLedger.get(reqId))
       abandonOwn('claude_discord_adapter_fleet_bus_not_connected')
       return { ok: false, error: 'claude_discord_adapter_fleet_bus_not_connected', req_id: reqId }
     }
@@ -1550,26 +1565,27 @@ export class FleetBus {
     // and late-reply paths) are unaffected: they mutate no claim.
     const claimAtKey = this.pendingReplyClaims.get(reqId)
     if (claimAtKey !== undefined && claimAtKey.token !== replyToken) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop', subject: claimAtKey.subject,
         reason: 'claude_discord_adapter_reply_token_mismatch',
         envelope_id: claimAtKey.envelopeId, req_id: reqId,
-      })
+      }, claimAtKey.envelope)
       return { ok: false, error: 'claude_discord_adapter_reply_token_mismatch', req_id: reqId }
     }
     const inbound = this.receiveLedger.get(reqId)
     if (inbound === undefined) {
       // The inbound envelope is gone, so this reply can never be built — and
       // a claim that cannot be answered must not keep renewing.
+      this.recordDrop({ dir: 'drop', subject: `fleet.${this.config.botName}.request`, reason: 'claude_discord_adapter_req_id_unknown' }, claimAtKey?.envelope)
       abandonOwn('claude_discord_adapter_req_id_unknown')
       return { ok: false, error: 'claude_discord_adapter_req_id_unknown', req_id: reqId }
     }
     const subject = `fleet.${inbound.from}.request`
     if (!payloadIsJsonSerializable(payload)) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop', subject,
         reason: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId,
-      })
+      }, inbound)
       abandonOwn('claude_discord_adapter_payload_not_json_serializable')
       return { ok: false, error: 'claude_discord_adapter_payload_not_json_serializable', req_id: reqId }
     }
@@ -1586,7 +1602,7 @@ export class FleetBus {
       })
     } catch (error) {
       const reason = error instanceof BatonDerivationError ? error.reason : 'claude_discord_adapter_baton_derivation_failed'
-      this.recordAudit({ dir: 'drop', subject, reason, envelope_id: envelopeId })
+      this.recordDrop({ dir: 'drop', subject, reason, envelope_id: envelopeId }, inbound)
       // Terminal for this reply: hop exhaustion and derivation failure are
       // not retried here. Respecting the hop ceiling is correct; holding a
       // live lease for a reply that will never be sent is not a disposition.
@@ -1613,14 +1629,14 @@ export class FleetBus {
       // `subject` from main's reply-lane migration (#20): replies now go on
       // the REQUEST lane, so the audit subject is computed rather than
       // hardcoded to `.result`.
-      this.recordAudit({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId })
+      this.recordDrop({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, envelope), envelope_id: envelopeId }, inbound)
       abandonOwn(validation.error)
       return { ok: false, error: validation.error, req_id: reqId, envelope }
     }
     try {
       this.nc.publish(subject, this.codec.encode(envelope))
     } catch (error) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, error: String(error) })
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_publish_failed', envelope_id: envelopeId, error: String(error) }, inbound)
       abandonOwn('claude_discord_adapter_publish_failed')
       return { ok: false, error: 'claude_discord_adapter_publish_failed', req_id: reqId, envelope }
     }
@@ -1655,11 +1671,11 @@ export class FleetBus {
     // captured object rather than looking one up.
     if (this.pendingReplyClaims.get(reqId) === claim) this.pendingReplyClaims.delete(reqId)
     claim.stopRenewing()
-    this.releaseClaim(claim.subject, claim.envelopeId, reqId, claim.owner)
-    this.recordAudit({
+    this.releaseClaim(claim.subject, claim.envelope, reqId, claim.owner)
+    this.recordDrop({
       dir: 'drop', subject: claim.subject, reason,
       envelope_id: claim.envelopeId, req_id: reqId, note,
-    })
+    }, claim.envelope)
   }
 
   /**
@@ -1684,7 +1700,7 @@ export class FleetBus {
   private abandonRepliedClaim(
     reqId: string,
     note: string,
-    reason = 'claude_discord_adapter_reply_undelivered',
+    reason: DropReason = 'claude_discord_adapter_reply_undelivered',
   ): void {
     const pending = this.pendingReplyClaims.get(reqId)
     if (pending === undefined) return
@@ -1704,11 +1720,11 @@ export class FleetBus {
     }
     this.pendingReplyClaims.delete(reqId)
     pending.stopRenewing()
-    this.releaseClaim(pending.subject, pending.envelopeId, reqId, pending.owner)
-    this.recordAudit({
+    this.releaseClaim(pending.subject, pending.envelope, reqId, pending.owner)
+    this.recordDrop({
       dir: 'drop', subject: pending.subject, reason,
       envelope_id: pending.envelopeId, req_id: reqId, note,
-    })
+    }, pending.envelope)
   }
 
   /**
@@ -1780,7 +1796,7 @@ export class FleetBus {
     }
     this.pendingReplyClaims.delete(reqId)
     pending.stopRenewing()
-    if (this.completeClaim(pending.subject, pending.envelopeId, reqId, pending.owner)) {
+    if (this.completeClaim(pending.subject, pending.envelope, reqId, pending.owner)) {
       this.seenRequestEnvelopes.set(pending.envelopeId, { reqId, ts: Date.now() })
     }
   }
@@ -1797,20 +1813,20 @@ export class FleetBus {
   // Publication and the result subscription remain unchanged until later phases.
   private async onInbound(message: Msg, resultLane: boolean): Promise<void> {
     const subject = message.subject
-    if (!this.rateLimiters.perSubject.allow(subject)) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_rate_limited_per_subject' })
-      return
-    }
     let decoded: unknown
     try {
       decoded = this.codec.decode(message.data)
     } catch {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' })
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_malformed_json' }, decoded)
+      return
+    }
+    if (!this.rateLimiters.perSubject.allow(subject)) {
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_rate_limited_per_subject' }, decoded)
       return
     }
     const validation = this.validateWithManifest(decoded)
     if (!validation.ok) {
-      this.recordAudit({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, decoded) })
+      this.recordDrop({ dir: 'drop', subject, reason: validation.error, ...this.rejectedClaimDetails(validation.error, decoded) }, decoded)
       return
     }
     const envelope = validation.envelope
@@ -1825,28 +1841,28 @@ export class FleetBus {
     // gate and resolve waiters in the outbound ledger.
     const isReply = resultLane || envelope.in_reply_to !== undefined
     if (!isReply && normalizeBotName(envelope.to) !== canonicalBot) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'recipient_mismatch', envelope_id: envelope.id })
+      this.recordDrop({ dir: 'drop', subject, reason: 'recipient_mismatch', envelope_id: envelope.id }, envelope)
       return
     }
     if (isReply && envelope.to != null) {
       const canonicalTo = normalizeBotName(envelope.to)
       if (canonicalTo !== canonicalBot) {
-        this.recordAudit({
+        this.recordDrop({
           dir: 'drop',
           subject,
           reason: 'claude_discord_adapter_misrouted_reply',
           envelope_id: envelope.id,
-        })
+        }, envelope)
         return
       }
     }
     if (!this.rateLimiters.perFrom.allow(envelope.from)) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_rate_limited_per_from',
         envelope_id: envelope.id,
-      })
+      }, envelope)
       return
     }
 
@@ -1863,27 +1879,27 @@ export class FleetBus {
     // silently swallow one side.
     const seenRequest = this.freshSeen(this.seenRequestEnvelopes, envelope.id)
     if (seenRequest !== undefined) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_duplicate_request_envelope',
         envelope_id: envelope.id,
         req_id: seenRequest.reqId,
-      })
+      }, envelope)
       return
     }
     if (!this.rateLimiters.perSessionInject.allow('session')) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_rate_limited_per_session_inject',
         envelope_id: envelope.id,
-      })
+      }, envelope)
       return
     }
 
     let reqId = randomBytes(16).toString('hex')
-    const claim = this.claimDedup(subject, envelope.id, reqId)
+    const claim = this.claimDedup(subject, envelope, reqId)
     if (claim === undefined) return
     if (claim.duplicate) {
       // The REQUEST-specific code, matching the in-memory gate above. Now that
@@ -1891,7 +1907,7 @@ export class FleetBus {
       // reaches the durable store instead of that ledger — the suppression is
       // strictly stronger, and the audit line must not change meaning just
       // because the layer that caught it did.
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_request_envelope', envelope_id: envelope.id, req_id: claim.reqId })
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_request_envelope', envelope_id: envelope.id, req_id: claim.reqId }, envelope)
       return
     }
     reqId = claim.reqId
@@ -1903,7 +1919,7 @@ export class FleetBus {
     // FIRST IS STILL EXECUTING — the one duplication window that is closable
     // at this boundary. The post-effect/pre-commit window is not closable
     // here; it is documented as at-least-once (SPEC, and yugo#24).
-    const stopRenewing = this.renewWhileRunning(subject, envelope.id, claim.reqId, claim.owner!)
+    const stopRenewing = this.renewWhileRunning(subject, envelope, claim.reqId, claim.owner!)
     try {
       // REGISTER BEFORE AWAITING. `injectIntoSession` is an unbounded
       // `Promise<void>` and nothing stops the session replying, or a
@@ -1921,6 +1937,7 @@ export class FleetBus {
       // the eviction hook and the failure path below all stop it.
       const replyToken = randomUUID()
       const pendingClaim: PendingReplyClaim = {
+        envelope: envelope,
         envelopeId: envelope.id,
         owner: claim.owner!,
         subject,
@@ -1979,7 +1996,7 @@ export class FleetBus {
       // takeover is someone else's. `stopRenewing` is this turn's own closure
       // and is idempotent.
       stopRenewing()
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) }, envelope)
       return
     }
   }
@@ -2004,7 +2021,8 @@ export class FleetBus {
    * recovery) and is tracked as yugo#26. Until then a clock-step-induced
    * overlap is an accepted duplicate under the at-least-once contract.
    */
-  private renewWhileRunning(subject: string, envelopeId: string, reqId: string, owner: string): () => void {
+  private renewWhileRunning(subject: string, envelope: Envelope, reqId: string, owner: string): () => void {
+    const envelopeId = envelope.id
     // Floor guards against a pathological zero or negative cadence; it is not
     // a minimum tick. Kept low and matched to the Python port so the cadence
     // tracks the lease across the whole plausible range rather than being
@@ -2018,20 +2036,20 @@ export class FleetBus {
         held = this.durableDedup.renew(envelopeId, owner)
       } catch (error) {
         clearInterval(timer)
-        this.recordAudit({
+        this.recordDrop({
           dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_renew_failed',
           envelope_id: envelopeId, req_id: reqId, note: String(error),
-        })
+        }, envelope)
         return
       }
       if (!held) {
         clearInterval(timer)
         // Nothing here can cancel the in-flight turn, so record it: under the
         // at-least-once contract this duplicate must be visible, not silent.
-        this.recordAudit({
+        this.recordDrop({
           dir: 'drop', subject, reason: 'claude_discord_adapter_dedup_lease_lost',
           envelope_id: envelopeId, req_id: reqId,
-        })
+        }, envelope)
       }
     }, intervalMs)
     // Never hold the event loop open for a lease timer.
@@ -2053,13 +2071,13 @@ export class FleetBus {
     // per-subject limits first.
     const seenResult = this.freshSeen(this.seenResultEnvelopes, envelope.id)
     if (seenResult !== undefined) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_duplicate_result_envelope',
         envelope_id: envelope.id,
         req_id: seenResult.reqId,
-      })
+      }, envelope)
       return
     }
 
@@ -2068,10 +2086,10 @@ export class FleetBus {
       const match = this.outboundLedger.get(inReplyTo)
       if (match !== undefined) {
         if (envelope.from === match.expectedFrom) {
-          const claim = this.claimDedup(subject, envelope.id, match.reqId)
+          const claim = this.claimDedup(subject, envelope, match.reqId)
           if (claim === undefined) return
           if (claim.duplicate) {
-            this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId })
+            this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId }, envelope)
             return
           }
           const owner = claim.owner!
@@ -2090,19 +2108,19 @@ export class FleetBus {
             req_id: match.reqId, note: 'claude_discord_adapter_ledger_matched',
           })
           match.resolve({ ok: true, envelope: match.envelope, delivered_to_subscriber: true, reply: envelope })
-          this.completeClaim(subject, envelope.id, claim.reqId, owner)
+          this.completeClaim(subject, envelope, claim.reqId, owner)
           return
         }
         // From mismatch — anti-hijack (P2-1). Do NOT resolve the waiter; treat
         // as unsolicited and let the model see it if inject budget allows.
-        this.recordAudit({
+        this.recordDrop({
           dir: 'drop',
           subject,
           reason: 'claude_discord_adapter_reply_from_mismatch',
           envelope_id: envelope.id,
           req_id: match.reqId,
           expected_from: match.expectedFrom,
-        })
+        }, envelope)
         await this.injectUnsolicited(subject, envelope)
         return
       }
@@ -2117,19 +2135,19 @@ export class FleetBus {
 
   private async injectUnsolicited(subject: string, envelope: Envelope, lateReplyEnvId?: string): Promise<void> {
     if (!this.rateLimiters.perSessionInject.allow('session')) {
-      this.recordAudit({
+      this.recordDrop({
         dir: 'drop',
         subject,
         reason: 'claude_discord_adapter_rate_limited_per_session_inject',
         envelope_id: envelope.id,
-      })
+      }, envelope)
       return
     }
     let reqId = randomBytes(16).toString('hex')
-    const claim = this.claimDedup(subject, envelope.id, reqId)
+    const claim = this.claimDedup(subject, envelope, reqId)
     if (claim === undefined) return
     if (claim.duplicate) {
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId })
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_duplicate_envelope', envelope_id: envelope.id, req_id: claim.reqId }, envelope)
       return
     }
     reqId = claim.reqId
@@ -2149,7 +2167,7 @@ export class FleetBus {
     // pass, which left the exact P1 it claimed to fix alive on the sibling
     // route: an unsolicited or late `.result` whose turn outruns the lease
     // could be reclaimed and re-injected while the first turn still ran.
-    const stopRenewing = this.renewWhileRunning(subject, envelope.id, claim.reqId, claim.owner!)
+    const stopRenewing = this.renewWhileRunning(subject, envelope, claim.reqId, claim.owner!)
     try {
       // No attempt identity: nothing replies to an unsolicited or late result, so
       // there is no claim for a caller to prove authority over. Stated, not omitted.
@@ -2164,13 +2182,13 @@ export class FleetBus {
       // Gated for the reason `completeClaim`'s contract states: a lost owner
       // must not arm the in-memory fast path, or the real owner's result is
       // dropped here as a duplicate when it arrives.
-      if (this.completeClaim(subject, envelope.id, claim.reqId, claim.owner!)) {
+      if (this.completeClaim(subject, envelope, claim.reqId, claim.owner!)) {
         this.seenResultEnvelopes.set(envelope.id, { reqId, ts: Date.now() })
       }
     } catch (error) {
       stopRenewing()
-      this.releaseClaim(subject, envelope.id, claim.reqId, claim.owner!)
-      this.recordAudit({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) })
+      this.releaseClaim(subject, envelope, claim.reqId, claim.owner!)
+      this.recordDrop({ dir: 'drop', subject, reason: 'claude_discord_adapter_injection_failed', envelope_id: envelope.id, req_id: reqId, error: String(error) }, envelope)
     }
   }
 
@@ -2187,13 +2205,13 @@ export class FleetBus {
     // the timer (not a silent limp-to-timeout, per round-3 P2-3).
     clearTimeout(entry.timerId)
     this.evictedLedger.set(entry.envelope.id, true)
-    this.recordAudit({
+    this.recordDrop({
       dir: 'drop',
       subject: `fleet.${entry.envelope.to}.request`,
       reason: 'claude_discord_adapter_ledger_overflow',
       envelope_id: entry.envelope.id,
       req_id: entry.reqId,
-    })
+    }, entry.envelope)
     entry.resolve({ ok: false, error: 'claude_discord_adapter_ledger_overflow', envelope: entry.envelope })
   }
 
@@ -2238,13 +2256,9 @@ export class FleetBus {
     }
 
     if (!this.nc || this.nc.isClosed()) return
-    this.nc.publish(
-      `fleet.${this.config.botName}.status`,
-      this.codec.encode(createHeartbeatEnvelope(
-        this.config.botName,
-        this.config.pluginVersion ?? '0.4.0',
-      )),
-    )
+    const heartbeat = createHeartbeatEnvelope(this.config.botName, this.config.pluginVersion ?? '0.4.0')
+    heartbeat.payload = { ...(heartbeat.payload as Record<string, unknown>), ...this.busStatus() }
+    this.nc.publish(`fleet.${this.config.botName}.status`, this.codec.encode(heartbeat))
   }
 
   private async watchConnectionStatus(nc: NatsConnection): Promise<void> {
@@ -2302,7 +2316,48 @@ export class FleetBus {
       manifest_mtime_ms: manifest?.loadedMtimeMs ?? null, manifest_digest: manifest?.loadedDigest ?? null }
   }
 
-  private recordAudit(entry: Record<string, unknown>): void {
+  // One notice per decoded delivery, even when cleanup records another drop.
+  // Weak ownership: no retained IDs, TTL or interference with later re-deliveries.
+  private readonly notifiedDrops = new WeakSet<object>()
+  private dropCounts: Record<Disposition, number> = { terminal: 0, transient: 0, throttled: 0, duplicate: 0 }
+
+  /** Snapshot for the host's bus_status command; also carried on heartbeats. */
+  busStatus(): { drop_counts: Record<Disposition, number> } {
+    return { drop_counts: { ...this.dropCounts } }
+  }
+
+  private recordDrop(entry: Record<string, unknown> & { dir: 'drop'; reason: DropReason; subject: string }, value: unknown): void {
+    const disposition = DROP_DISPOSITION[entry.reason]
+    this.dropCounts[disposition]++
+    this.writeAudit({ ...entry, disposition })
+    if (disposition === 'duplicate' || typeof value !== 'object' || value === null) return
+    const envelope = value as Record<string, unknown>
+    // Inspect kind BEFORE validation: even an invalid notice must not recurse.
+    if (envelope.kind === 'drop_notice' || this.notifiedDrops.has(envelope)) return
+    const sender = normalizeBotName(envelope.from)
+    if (sender === null || sender === normalizeBotName(this.config.botName) || !this.allowedFromClaims.has(sender) || !this.nc) return
+    const notice = {
+      envelope_version: 1, id: randomUUID(), from: this.config.botName, to: sender,
+      kind: 'drop_notice', ts: new Date().toISOString(),
+      ...(typeof envelope.id === 'string' ? { in_reply_to: envelope.id } : {}),
+      payload: { envelope_id: envelope.id ?? null, reason: entry.reason, disposition, subject: entry.subject },
+    }
+    try {
+      // Same surviving publish ingress as normal requests; never .result.
+      this.notifiedDrops.add(envelope)
+      this.nc.publish(`fleet.${sender}.request`, new TextEncoder().encode(JSON.stringify(notice)))
+    } catch (error) {
+      // Do not route notice publication failures back through recordDrop.
+      this.notifiedDrops.delete(envelope)
+      this.log(`drop notice publish failed: ${String(error)}`)
+    }
+  }
+
+  private recordAudit(entry: Record<string, unknown> & { dir: 'in' | 'out' }): void {
+    this.writeAudit(entry)
+  }
+
+  private writeAudit(entry: Record<string, unknown>): void {
     if (!this.config.auditLogPath) {
       this.log(JSON.stringify(entry))
       return

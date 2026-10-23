@@ -74,6 +74,8 @@ from typing import Any, Iterable, Mapping, NamedTuple
 
 import yaml
 
+from drop_disposition import DROP_DISPOSITION, DropReason
+
 # The durable dedup store is its own module so a sibling harness can vendor it
 # without this adapter (codex-container#21 D1). `FleetBusConfigError` is
 # defined there for the same reason and re-exported here, which is the name
@@ -298,7 +300,7 @@ def load_fleet_manifest_allowlist(path: str) -> set[str]:
 class EnvelopeValidationResult(NamedTuple):
     ok: bool
     envelope: dict | None = None
-    error: str | None = None
+    error: DropReason | None = None
 
 
 def validate_envelope(
@@ -328,7 +330,7 @@ def validate_envelope(
       process, and rejecting beats silently rewriting a number to `null`.
     """
     if not isinstance(value, dict):
-        return EnvelopeValidationResult(False, error="envelope_not_object")
+        return EnvelopeValidationResult(False, error=DropReason.ENVELOPE_NOT_OBJECT)
 
     # `type(...) is not int` rather than `!= ENVELOPE_VERSION`: `True == 1` in
     # Python, so a bare `!=` ACCEPTS `envelope_version: true` — which TS
@@ -338,39 +340,39 @@ def validate_envelope(
     # closed.
     version = value.get("envelope_version")
     if type(version) is not int or version != ENVELOPE_VERSION:
-        return EnvelopeValidationResult(False, error="unsupported_envelope_version")
+        return EnvelopeValidationResult(False, error=DropReason.UNSUPPORTED_ENVELOPE_VERSION)
 
     identifier = value.get("id")
     if not isinstance(identifier, str) or not identifier:
-        return EnvelopeValidationResult(False, error="invalid_id")
+        return EnvelopeValidationResult(False, error=DropReason.INVALID_ID)
 
     kind = value.get("kind")
     if not isinstance(kind, str) or not kind:
-        return EnvelopeValidationResult(False, error="invalid_kind")
+        return EnvelopeValidationResult(False, error=DropReason.INVALID_KIND)
 
     if not _is_parseable_ts(value.get("ts")):
-        return EnvelopeValidationResult(False, error="invalid_ts")
+        return EnvelopeValidationResult(False, error=DropReason.INVALID_TS)
 
     if "payload" not in value:
-        return EnvelopeValidationResult(False, error="missing_payload")
+        return EnvelopeValidationResult(False, error=DropReason.MISSING_PAYLOAD)
 
     to = value.get("to")
     if "to" in value and to is not None and not isinstance(to, str):
-        return EnvelopeValidationResult(False, error="invalid_to")
+        return EnvelopeValidationResult(False, error=DropReason.INVALID_TO)
 
     if "in_reply_to" in value and not isinstance(value["in_reply_to"], str):
-        return EnvelopeValidationResult(False, error="invalid_in_reply_to")
+        return EnvelopeValidationResult(False, error=DropReason.INVALID_IN_REPLY_TO)
 
     from_claim = normalize_bot_name(value.get("from"))
     if from_claim is None or from_claim not in allowed_from_claims:
-        return EnvelopeValidationResult(False, error="from_claim_rejected")
+        return EnvelopeValidationResult(False, error=DropReason.FROM_CLAIM_REJECTED)
 
     try:
         encoded_bytes = len(_canonical_json(value).encode("utf-8"))
     except (TypeError, ValueError):
-        return EnvelopeValidationResult(False, error="payload_not_serializable")
+        return EnvelopeValidationResult(False, error=DropReason.PAYLOAD_NOT_SERIALIZABLE)
     if encoded_bytes > max_bytes:
-        return EnvelopeValidationResult(False, error="envelope_too_large")
+        return EnvelopeValidationResult(False, error=DropReason.ENVELOPE_TOO_LARGE)
 
     baton_error = _validate_baton_fields(value, allowed_from_claims)
     if baton_error is not None:
@@ -379,7 +381,7 @@ def validate_envelope(
     return EnvelopeValidationResult(True, envelope={**value, "from": from_claim})
 
 
-def _validate_baton_fields(value: dict, allowed_from: frozenset[str] | set[str]) -> str | None:
+def _validate_baton_fields(value: dict, allowed_from: frozenset[str] | set[str]) -> DropReason | None:
     """Reject code for a present-but-malformed baton field, or None. v0.3d.
 
     Runs AFTER every §5 check, so an envelope that fails both reports the
@@ -418,7 +420,7 @@ def _validate_baton_fields(value: dict, allowed_from: frozenset[str] | set[str])
     if "root_id" in value and (
         not isinstance(value["root_id"], str) or not value["root_id"]
     ):
-        return "yugo_invalid_root_id"
+        return DropReason.YUGO_INVALID_ROOT_ID
 
     for name in ("origin", "owner"):
         if name not in value:
@@ -429,7 +431,7 @@ def _validate_baton_fields(value: dict, allowed_from: frozenset[str] | set[str])
             or normalize_bot_name(claim) != claim
             or claim not in allowed_from
         ):
-            return f"yugo_invalid_{name}"
+            return DropReason(f"yugo_invalid_{name}")
 
     if "hops" in value:
         hops = value["hops"]
@@ -439,7 +441,7 @@ def _validate_baton_fields(value: dict, allowed_from: frozenset[str] | set[str])
         # A JSON `8.0` is rejected too; the schema says integer, and no
         # encoder in the fleet emits a float there.
         if type(hops) is not int or hops < 0:
-            return "yugo_invalid_hops"
+            return DropReason.YUGO_INVALID_HOPS
 
     return None
 
@@ -788,16 +790,16 @@ _BUS_TAG_CLOSE = "</BUS>"
 # or an implementation-specific code prefixed with the harness name" — and the
 # sibling adapter design uses the same convention with `codex_adapter_`.
 # Prefixing is what keeps them from colliding with a future §5 addition.
-REJECT_TAG = "yugo_bus_tag_rejected"
-REJECT_PUBLISH_FAILED = "yugo_publish_failed"
-REJECT_AUTOREPLY_SUPPRESSED = "yugo_autoreply_suppressed"
+REJECT_TAG = DropReason.YUGO_BUS_TAG_REJECTED
+REJECT_PUBLISH_FAILED = DropReason.YUGO_PUBLISH_FAILED
+REJECT_AUTOREPLY_SUPPRESSED = DropReason.YUGO_AUTOREPLY_SUPPRESSED
 
 # v0.3d, same prefixing rule and the same reason: §5 describes the inbound
 # wire and has no baton vocabulary at all. The ceiling is not a malformed
 # envelope — `validate_envelope` has already passed it — it is a WELL-FORMED
 # envelope we refuse to carry any further, so it cannot borrow a §5 code.
-REJECT_HOPS_EXCEEDED = "yugo_baton_hops_exceeded"
-REJECT_WARNING_SUPPRESSED = "yugo_baton_warning_suppressed"
+REJECT_HOPS_EXCEEDED = DropReason.YUGO_BATON_HOPS_EXCEEDED
+REJECT_WARNING_SUPPRESSED = DropReason.YUGO_BATON_WARNING_SUPPRESSED
 
 # `note` on the `out` line of a hop-8 warning. Without it the warning is
 # indistinguishable in the audit log from any other `text_message` this bot
@@ -1242,6 +1244,9 @@ class FleetBus:
     ) -> None:
         self._config = config
         self._audit = audit
+        self._drop_counts = {"terminal": 0, "transient": 0, "throttled": 0, "duplicate": 0}
+        self._notice_tasks: set[asyncio.Task] = set()
+        self._notifying_contexts: dict[int, dict] = {}
         self._log = logger
         self._nc = None
         self._on_envelope = on_envelope
@@ -1254,6 +1259,53 @@ class FleetBus:
         self._dedup = DurableEnvelopeDedupStore(
             config.dedup_store_path, config.dedup_ttl_s
         )
+
+    def bus_status(self) -> dict:
+        """Snapshot for host status UIs; also included in every heartbeat."""
+        return {"drop_counts": dict(self._drop_counts)}
+
+    def _record_drop(self, subject: str | None, *,
+                     reason: DropReason, context: Any, **fields: Any) -> None:
+        # Conversion deliberately raises for an unknown code: no fallback class.
+        code = DropReason(reason)
+        disposition = DROP_DISPOSITION[code]
+        self._drop_counts[disposition] += 1
+        self._audit.record("drop", subject, reason=code.value,
+                           disposition=disposition, **fields)
+        if disposition == "duplicate" or not isinstance(context, dict):
+            return
+        # Guard the raw kind, even when envelope validation itself failed.
+        if context.get("kind") == "drop_notice":
+            return
+        if id(context) in self._notifying_contexts:
+            return
+        sender = normalize_bot_name(context.get("from"))
+        if (sender is None or sender == self._config.bot_name
+                or sender not in self._config.allowed_from or self._nc is None):
+            return
+        notice = {
+            "envelope_version": 1, "id": str(uuid.uuid4()),
+            "from": self._config.bot_name, "to": sender,
+            "kind": "drop_notice", "ts": datetime.now(timezone.utc).isoformat(),
+            "payload": {"envelope_id": context.get("id"), "reason": code.value,
+                        "disposition": disposition, "subject": subject},
+        }
+        if isinstance(context.get("id"), str):
+            notice["in_reply_to"] = context["id"]
+        self._notifying_contexts[id(context)] = context
+        task = asyncio.create_task(self._publish_drop_notice(sender, notice))
+        self._notice_tasks.add(task)
+        task.add_done_callback(self._notice_tasks.discard)
+        task.add_done_callback(lambda _: self._notifying_contexts.pop(id(context), None))
+
+    async def _publish_drop_notice(self, sender: str, notice: dict) -> None:
+        try:
+            # The request publish ingress survives FB-3; never use .result.
+            await self._nc.publish(f"fleet.{sender}.request",
+                                   _canonical_json(notice).encode("utf-8"))
+        except Exception as e:
+            # A notice publication failure must not generate another notice.
+            self._log(f"[fleet-bus] drop notice publish failed: {e!r}")
 
     @property
     def subjects(self) -> tuple[str, ...]:
@@ -1413,6 +1465,7 @@ class FleetBus:
             session_last_response_ts=self._session_last_response_ts,
             injection_delivered_ts=self._injection_delivered_ts,
         )
+        envelope["payload"].update(self.bus_status())
         try:
             await self._nc.publish(
                 self.status_subject, _canonical_json(envelope).encode("utf-8")
@@ -1439,6 +1492,7 @@ class FleetBus:
         baton: dict | None = None,
         req_id: str | None = None,
         source_subject: str | None = None,
+        source_envelope: dict | None = None,
         audit_note: str | None = None,
     ) -> bool:
         """Publish one directed envelope to `fleet.<to>.request`. v0.3c/3d.
@@ -1494,10 +1548,9 @@ class FleetBus:
 
         recipient = normalize_bot_name(to)
         if recipient is None or recipient not in self._config.allowed_from:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 source_subject,
-                reason="invalid_to",
+                context=source_envelope, reason=DropReason.INVALID_TO,
                 req_id=req_id,
                 **note,
                 **{"to": _audit_excerpt(to)},
@@ -1522,10 +1575,9 @@ class FleetBus:
             # a NATS callback and promises never to raise, so it becomes an
             # audited refusal. `yugo_publish_failed` is the existing code for
             # "the envelope never left"; no new one is invented for it.
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_PUBLISH_FAILED,
+                context=source_envelope, reason=REJECT_PUBLISH_FAILED,
                 req_id=req_id,
                 error=repr(e),
                 **note,
@@ -1535,10 +1587,9 @@ class FleetBus:
             envelope, self._config.allowed_from, self._config.max_envelope_bytes
         )
         if not result.ok:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=result.error,
+                context=source_envelope, reason=result.error,
                 id=envelope["id"],
                 req_id=req_id,
                 **note,
@@ -1546,10 +1597,9 @@ class FleetBus:
             return False
 
         if self._nc is None or self._nc.is_closed:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_PUBLISH_FAILED,
+                context=source_envelope, reason=REJECT_PUBLISH_FAILED,
                 id=envelope["id"],
                 req_id=req_id,
                 error="not connected",
@@ -1561,10 +1611,9 @@ class FleetBus:
                 subject, _canonical_json(envelope).encode("utf-8")
             )
         except Exception as e:  # noqa: BLE001 — one lost envelope, not a dead bus
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_PUBLISH_FAILED,
+                context=source_envelope, reason=REJECT_PUBLISH_FAILED,
                 id=envelope["id"],
                 req_id=req_id,
                 error=repr(e),
@@ -1605,13 +1654,13 @@ class FleetBus:
             # (JSONDecodeError), non-UTF-8 bytes (UnicodeDecodeError) and a
             # non-finite constant (`_reject_json_constant`) — and `JSON.parse`
             # throws on each, so they share the one reject code.
-            self._audit.record("drop", msg.subject, reason="malformed_json")
+            self._record_drop(msg.subject, context=None, reason=DropReason.MALFORMED_JSON)
             return
         result = validate_envelope(
             decoded, self._config.allowed_from, self._config.max_envelope_bytes
         )
         if not result.ok:
-            self._audit.record("drop", msg.subject, reason=result.error)
+            self._record_drop(msg.subject, context=decoded, reason=result.error)
             return
         envelope = result.envelope
         if msg.subject == self.request_subject:
@@ -1670,10 +1719,9 @@ class FleetBus:
         # spelling that reaches every session on the bus.
         recipient = normalize_bot_name(envelope.get("to"))
         if recipient != self._config.bot_name:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason="recipient_mismatch",
+                context=envelope, reason=DropReason.RECIPIENT_MISMATCH,
                 id=envelope["id"],
                 **{"from": envelope["from"], "to": envelope.get("to")},
             )
@@ -1698,10 +1746,9 @@ class FleetBus:
         # of that is not sixteen turns.
         hops = envelope.get("hops")
         if isinstance(hops, int) and hops >= BATON_HOPS_REJECT_AT:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_HOPS_EXCEEDED,
+                context=envelope, reason=REJECT_HOPS_EXCEEDED,
                 id=envelope["id"],
                 hops=hops,
                 **{"from": envelope["from"]},
@@ -1720,11 +1767,11 @@ class FleetBus:
         try:
             duplicate, original_req_id, claim_owner = self._dedup.claim(envelope["id"], req_id)
         except Exception as e:  # store fault drops this delivery, subscription stays live
-            self._audit.record("drop", subject, reason="yugo_dedup_store_failed", id=envelope["id"], error=repr(e))
+            self._record_drop(subject, context=envelope, reason=DropReason.YUGO_DEDUP_STORE_FAILED, id=envelope["id"], error=repr(e))
             return
         if duplicate:
-            self._audit.record(
-                "drop", subject, reason="yugo_duplicate_envelope",
+            self._record_drop(
+                subject, context=envelope, reason=DropReason.YUGO_DUPLICATE_ENVELOPE,
                 id=envelope["id"], req_id=original_req_id,
             )
             return
@@ -1780,10 +1827,9 @@ class FleetBus:
                 # `injectIntoSession` rejects. The bus stays up and the
                 # subscription stays live: this envelope is lost, the next one
                 # is not.
-                self._audit.record(
-                    "drop",
+                self._record_drop(
                     subject,
-                    reason="injection_failed",
+                    context=envelope, reason=DropReason.INJECTION_FAILED,
                     id=envelope["id"],
                     req_id=req_id,
                     error=repr(e),
@@ -1820,10 +1866,9 @@ class FleetBus:
                 # looking healthy while every subsequent envelope died the same
                 # way. The claim is NOT settled — the answer never went out, so
                 # a redelivery must be able to run it again.
-                self._audit.record(
-                    "drop",
+                self._record_drop(
                     subject,
-                    reason=REJECT_PUBLISH_FAILED,
+                    context=envelope, reason=REJECT_PUBLISH_FAILED,
                     id=envelope["id"],
                     req_id=req_id,
                     error=repr(e),
@@ -1888,8 +1933,8 @@ class FleetBus:
         try:
             won = self._dedup.complete(envelope["id"], owner)
         except Exception as e:
-            self._audit.record(
-                "drop", subject, reason="yugo_dedup_complete_failed",
+            self._record_drop(
+                subject, context=envelope, reason=DropReason.YUGO_DEDUP_COMPLETE_FAILED,
                 id=envelope["id"], req_id=req_id, error=repr(e),
             )
             return False
@@ -1897,8 +1942,8 @@ class FleetBus:
             # Not an error path for THIS delivery — the work is done. It does
             # mean another consumer holds the claim, so the caller must not
             # record this as the authoritative completion.
-            self._audit.record(
-                "drop", subject, reason="yugo_dedup_owner_lost",
+            self._record_drop(
+                subject, context=envelope, reason=DropReason.YUGO_DEDUP_OWNER_LOST,
                 id=envelope["id"], req_id=req_id,
             )
         return won
@@ -1907,8 +1952,8 @@ class FleetBus:
         try:
             return self._dedup.release(envelope["id"], owner)
         except Exception as e:
-            self._audit.record(
-                "drop", subject, reason="yugo_dedup_release_failed",
+            self._record_drop(
+                subject, context=envelope, reason=DropReason.YUGO_DEDUP_RELEASE_FAILED,
                 id=envelope["id"], req_id=req_id, error=repr(e),
             )
             return False
@@ -1931,8 +1976,8 @@ class FleetBus:
             try:
                 held = self._dedup.renew(envelope["id"], owner)
             except Exception as e:
-                self._audit.record(
-                    "drop", subject, reason="yugo_dedup_renew_failed",
+                self._record_drop(
+                    subject, context=envelope, reason=DropReason.YUGO_DEDUP_RENEW_FAILED,
                     id=envelope["id"], req_id=req_id, error=repr(e),
                 )
                 return
@@ -1940,8 +1985,8 @@ class FleetBus:
                 # Lease taken by another consumer. Nothing to cancel the turn
                 # with at this boundary; record it so the duplicate is visible
                 # rather than silent.
-                self._audit.record(
-                    "drop", subject, reason="yugo_dedup_lease_lost",
+                self._record_drop(
+                    subject, context=envelope, reason=DropReason.YUGO_DEDUP_LEASE_LOST,
                     id=envelope["id"], req_id=req_id,
                 )
                 return
@@ -1995,10 +2040,9 @@ class FleetBus:
         """
         origin = envelope.get("origin")
         if not origin:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_WARNING_SUPPRESSED,
+                context=envelope, reason=REJECT_WARNING_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="no_origin",
@@ -2006,10 +2050,9 @@ class FleetBus:
             )
             return
         if normalize_bot_name(origin) == self._config.bot_name:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_WARNING_SUPPRESSED,
+                context=envelope, reason=REJECT_WARNING_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="self_origin",
@@ -2033,6 +2076,7 @@ class FleetBus:
             baton=baton,
             req_id=req_id,
             source_subject=subject,
+            source_envelope=envelope,
             audit_note=AUDIT_NOTE_HOP_WARNING,
         )
 
@@ -2124,10 +2168,9 @@ class FleetBus:
         tags = find_bus_tags(reply)
         for tag in tags:
             if tag.attrs is None:
-                self._audit.record(
-                    "drop",
+                self._record_drop(
                     subject,
-                    reason=REJECT_TAG,
+                    context=envelope, reason=REJECT_TAG,
                     req_id=req_id,
                     cause=tag.cause,
                     raw=_audit_excerpt(reply[tag.start : tag.end]),
@@ -2135,10 +2178,9 @@ class FleetBus:
                 continue
             body = (tag.body or "").strip()
             if not body:
-                self._audit.record(
-                    "drop",
+                self._record_drop(
                     subject,
-                    reason=REJECT_TAG,
+                    context=envelope, reason=REJECT_TAG,
                     req_id=req_id,
                     cause="empty_body",
                     raw=_audit_excerpt(reply[tag.start : tag.end]),
@@ -2164,10 +2206,9 @@ class FleetBus:
             # `<BUS to="ｙｕｇｏ">` walk straight past a guard that only
             # rejects the exact spelling.
             if normalize_bot_name(tag.attrs.get("to")) == self._config.bot_name:
-                self._audit.record(
-                    "drop",
+                self._record_drop(
                     subject,
-                    reason=REJECT_TAG,
+                    context=envelope, reason=REJECT_TAG,
                     req_id=req_id,
                     cause="self_addressed",
                     raw=_audit_excerpt(reply[tag.start : tag.end]),
@@ -2179,6 +2220,7 @@ class FleetBus:
                 baton=baton,
                 req_id=req_id,
                 source_subject=subject,
+                source_envelope=envelope,
             ):
                 # A tag that never reached its peer is undelivered output. The
                 # turn is not settled on a partial send; under at-least-once a
@@ -2186,10 +2228,9 @@ class FleetBus:
                 delivered = False
 
         if envelope.get("in_reply_to") is not None:
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_AUTOREPLY_SUPPRESSED,
+                context=envelope, reason=REJECT_AUTOREPLY_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="in_reply_to",
@@ -2200,10 +2241,9 @@ class FleetBus:
         if not answer:
             # A turn whose entire output was tags has already said everything
             # it had to say, to the peers it named.
-            self._audit.record(
-                "drop",
+            self._record_drop(
                 subject,
-                reason=REJECT_AUTOREPLY_SUPPRESSED,
+                context=envelope, reason=REJECT_AUTOREPLY_SUPPRESSED,
                 id=envelope["id"],
                 req_id=req_id,
                 cause="empty_reply",
@@ -2216,12 +2256,15 @@ class FleetBus:
             baton=baton,
             req_id=req_id,
             source_subject=subject,
+            source_envelope=envelope,
         ):
             delivered = False
         return delivered
 
     async def _teardown(self) -> None:
         nats = _lazy_nats()
+        if self._notice_tasks:
+            await asyncio.gather(*self._notice_tasks, return_exceptions=True)
         nc, self._nc = self._nc, None
         if nc is None or nc.is_closed:
             return
