@@ -497,8 +497,15 @@ class BatonHarness:
             if raw.strip()
         ]
 
+    def suppressions(self, reason: str) -> list[dict]:
+        records = [line for line in self.lines() if line.get("reason") == reason]
+        assert all(line["dir"] == "in" and line.get("event") == "suppression" and "disposition" not in line for line in records)
+        return records
+
     def drops(self, reason: str) -> list[dict]:
-        return [line for line in self.lines() if line.get("reason") == reason]
+        records = [line for line in self.lines() if line.get("reason") == reason]
+        assert all(line["dir"] == "drop" and "disposition" in line for line in records)
+        return records
 
     async def wait_for(self, predicate, timeout: float = 20.0, what: str = "condition"):
         deadline = time.monotonic() + timeout
@@ -691,6 +698,7 @@ async def test_a_baton_at_the_ceiling_costs_nothing_at_all(
             ),
             what="the ceiling to fire",
         )
+        assert not any(harness.bus.bus_status()["drop_counts"].values())
         assert harness.injected == [], "a refused baton drove a model turn"
         assert inbox.received == [], f"a refused baton published: {inbox.received}"
 
@@ -705,7 +713,7 @@ async def test_a_baton_at_the_ceiling_costs_nothing_at_all(
 
     assert [envelope["id"] for envelope in harness.injected] == ["just-inside"]
     assert inbox.on(f"fleet.{PEER_NAME}.request")[0]["hops"] == 16
-    refused = harness.drops(fleet_bus.REJECT_HOPS_EXCEEDED)
+    refused = harness.suppressions(fleet_bus.REJECT_HOPS_EXCEEDED)
     assert [line["id"] for line in refused] == ["too-far"]
     assert refused[0]["hops"] == 16
     await harness.stop()
@@ -863,7 +871,7 @@ async def test_a_warning_this_bot_cannot_send_is_audited_not_sent(
     assert f"fleet.{BOT_NAME}.request" not in out_subjects, (
         f"{label}: the warning was published onto our own request subject"
     )
-    suppressed = harness.drops(fleet_bus.REJECT_WARNING_SUPPRESSED)
+    suppressed = harness.suppressions(fleet_bus.REJECT_WARNING_SUPPRESSED)
     assert [line["cause"] for line in suppressed] == [cause], label
     assert suppressed[0]["hops"] == 9
     # The sender is still answered — this test cannot pass by publishing
@@ -928,7 +936,7 @@ async def test_the_reply_guard_still_fires_when_the_envelope_is_a_baton(
     answer = inbox.on(f"fleet.{PEER_NAME}.request")
     assert [envelope["in_reply_to"] for envelope in answer] == ["a-question"]
     assert answer[0]["hops"] == 3
-    suppressed = harness.drops(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
+    suppressed = harness.suppressions(fleet_bus.REJECT_AUTOREPLY_SUPPRESSED)
     assert [line["cause"] for line in suppressed] == ["in_reply_to"]
     await harness.stop()
 

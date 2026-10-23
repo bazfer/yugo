@@ -378,7 +378,7 @@ describe('envelope validation', () => {
     ['unknown sender', envelope({ from: 'fernando' }), 'from_claim_rejected'],
     ['homoglyph sender', envelope({ from: 'оhm' }), 'from_claim_rejected'],
   ])('rejects %s', (_label, value, error) => {
-    expect(validateEnvelope(value, allowlist)).toEqual({ ok: false, error })
+    expect(validateEnvelope(value, allowlist)).toEqual({ ok: false, error: error as import("./drop-disposition").DropReason })
   })
 
   test('rejects envelopes above the encoded byte limit', () => {
@@ -408,7 +408,7 @@ describe('envelope validation', () => {
       ['hops at ceiling', { hops: 16 }, 'claude_discord_adapter_invalid_hops_ceiling'],
       ['hops above ceiling', { hops: 100 }, 'claude_discord_adapter_invalid_hops_ceiling'],
     ])('rejects %s', (_label, patch, error) => {
-      expect(validateEnvelope(envelope(patch), allowlist)).toEqual({ ok: false, error })
+      expect(validateEnvelope(envelope(patch), allowlist)).toEqual({ ok: false, error: error as import("./drop-disposition").DropReason })
     })
 
     test('hops = 0 is valid', () => {
@@ -1977,7 +1977,8 @@ describe('request / publishReply / onResult', () => {
     const result = bus.publishReply(reqId, { ok: true, data: undefined }, 'result', events[0]!.replyToken)
     expect(result.ok).toBe(false)
     expect(result.error).toBe('claude_discord_adapter_payload_not_json_serializable')
-    expect(nc.publishes).toHaveLength(0)
+    expect(nc.publishes).toHaveLength(1)
+    expect(nc.publishes[0]!.envelope).toMatchObject({ kind: 'drop_notice', to: 'ohm' })
   })
 
   test('outbound request audit carries req_id alongside envelope_id (SPEC §8)', async () => {
@@ -3040,10 +3041,13 @@ describe('pending claim age deadline', () => {
       dedupStore: store, auditLogPath,
       injectIntoSession: async () => { throw new Error('boom') },
     }), allowlist)
-    bus.attachFakeNc(new FakeNatsConnection())
+    const nc = new FakeNatsConnection()
+    bus.attachFakeNc(nc)
 
     await bus.handleRequest(envelope({ id: 'fallback-code-a', to: 'vec', from: 'kat' }))
 
+    expect(nc.publishes).toHaveLength(1)
+    expect(nc.publishes[0]!.envelope).toMatchObject({ kind: 'drop_notice', payload: { disposition: 'transient', reason: 'claude_discord_adapter_reply_undelivered' } })
     const drops = readAudit(auditLogPath).filter(e => e.envelope_id === 'fallback-code-a' && e.dir === 'drop')
     const fromFinish = drops.find(e => e.note === 'claude_discord_adapter_injection_failed')
     expect(fromFinish).toBeDefined()
@@ -3593,7 +3597,7 @@ test('byte-identical content with updated mtime: digest gate, no reload (same-co
   // Only the initial load — no reload event.
   const audit = readAudit(log)
   expect(audit).toHaveLength(1)
-  expect(audit[0].reason).toBe('fleet_manifest_loaded')
+  expect(audit[0]!.reason).toBe('fleet_manifest_loaded')
   rmSync(dir, { recursive: true, force: true })
 })
 

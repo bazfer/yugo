@@ -86,7 +86,7 @@ BASE_CASES = (
         "baton hop ceiling",
         {"hops": fleet_bus.BATON_HOPS_REJECT_AT},
         "none",
-        expected=(_record("drop", fleet_bus.REJECT_HOPS_EXCEEDED),),
+        expected=(_record("in", fleet_bus.REJECT_HOPS_EXCEEDED),),
     ),
     Case("no session hook", {}, "none", expected=(_record("in"),)),
     Case(
@@ -122,7 +122,7 @@ BASE_CASES = (
         {"hops": fleet_bus.BATON_HOPS_WARN_AT},
         "none",
         expected=(
-            _record("drop", fleet_bus.REJECT_WARNING_SUPPRESSED),
+            _record("in", fleet_bus.REJECT_WARNING_SUPPRESSED),
             _record("in"),
         ),
     ),
@@ -131,7 +131,7 @@ BASE_CASES = (
         {"hops": fleet_bus.BATON_HOPS_WARN_AT, "origin": "yugo"},
         "none",
         expected=(
-            _record("drop", fleet_bus.REJECT_WARNING_SUPPRESSED),
+            _record("in", fleet_bus.REJECT_WARNING_SUPPRESSED),
             _record("in"),
         ),
     ),

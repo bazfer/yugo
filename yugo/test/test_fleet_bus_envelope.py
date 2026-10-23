@@ -287,6 +287,8 @@ def test_no_reject_code_enters_fleet_bus_without_a_row_in_the_table_above():
     source = Path(fleet_bus.__file__).read_text(encoding="utf-8")
     found = set(re.findall(r'error="([a-z_]+)"', source))
     found |= set(re.findall(r'reason="([a-z_]+)"', source))
+    # Enum references replace free-form literals at both validator and drop sites.
+    found |= {name.lower() for name in re.findall(r"(?:error|reason)=DropReason\.([A-Z_]+)", source)}
     assert found == expected, (
         "the reject codes in fleet_bus.py no longer match the table in this "
         "file. A code that belongs here needs a row above. For a SHARED "
