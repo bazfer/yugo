@@ -15,6 +15,7 @@ jobs:
       tap: ${{ steps.filter.outputs.tap }}
       typescript: ${{ steps.filter.outputs.typescript }}
       yugo: ${{ steps.filter.outputs.yugo }}
+      deploy: ${{ steps.filter.outputs.deploy }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -41,6 +42,12 @@ jobs:
               # startup gate's error names, so a change to it can break a bot's
               # only documented recovery. Outside yugo/, hence its own line.
               - 'bin/**'
+              - '.github/workflows/ci.yml'
+            deploy:
+              - 'scripts/**'
+              - 'bots/**'
+              - 'test/test_deploy_integration.sh'
+              - '.github/workflows/deploy.yml'
               - '.github/workflows/ci.yml'
 
   tap:
@@ -376,6 +383,31 @@ jobs:
         env:
           RELEASE1_CHECKOUT: ${{ github.workspace }}/release1-checkout
         run: python conformance/check-release1-mutations.py
+
+  deploy-tests:
+    # Runs test/test_deploy_integration.sh, which covers scripts/deploy.sh,
+    # scripts/drift-check.sh, scripts/assert-compose-image-form.sh,
+    # scripts/handoff.sh, and the deploy.yml workflow structure.
+    #
+    # Docker is stubbed — tests use PATH-injected scripts and never touch the
+    # daemon, so this runs on ubuntu-latest without a host runner.
+    #
+    # The CI invocation itself is proved by the three mutation-based RED
+    # negative controls already in the suite: a broken deploy.sh, a wrong
+    # CODEX label, or a stale PINNED.md each fail the job. If the job did
+    # not run, Ohm's PR-67 pattern would repeat here. (See tap job comment.)
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: Run deploy integration tests
+        run: bash test/test_deploy_integration.sh
 
   fleet-bus-docs:
     # The deploy doc shipped with three double-backslash line continuations, which is

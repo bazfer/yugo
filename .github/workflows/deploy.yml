@@ -1,0 +1,86 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  # workflow_dispatch is exempt from the GITHUB_TOKEN "won't trigger new
+  # workflow runs" suppression — used by the latest-head handoff.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: write  # allows github.token to dispatch workflow_dispatch events
+
+# Serialize deploys. cancel-in-progress: false — never cancel a running deploy.
+# Queue size is 1 pending run. The handoff step closes the coverage gap when
+# a newer commit's pending slot is cancelled by an older arrival.
+concurrency:
+  group: deploy-yugo
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, norstar]
+    # GH_TOKEN: automatic job token (github.token). All pipeline calls target
+    # bazfer/yugo with contents:read — already granted above. No repo secret
+    # needed. Scripts keep reading GH_TOKEN from env so manual/cron runs still
+    # work with a PAT.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      EXPECTED_SHA: ${{ github.sha }}
+    steps:
+      # Checkout first so scripts/ is on disk for all steps including the
+      # always-run handoff at the end.
+      - uses: actions/checkout@v4
+
+      # Stale-run guard: refuse if a newer commit has superseded this one.
+      # Exits 1 on stale — a stale deploy is an anomaly, not a graceful no-op.
+      - name: Stale-run guard
+        run: |
+          : "${GH_TOKEN:?GH_TOKEN must be set — pipeline uses github.token}"
+          HEAD="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/bazfer/yugo/commits/main" \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin)["sha"])')"
+          if [[ "$HEAD" != "${EXPECTED_SHA}" ]]; then
+            echo "DEPLOY REFUSED: this run is for ${EXPECTED_SHA:0:12} but HEAD is ${HEAD:0:12}" >&2
+            exit 1
+          fi
+          echo "==> Stale check passed: ${EXPECTED_SHA:0:12} is HEAD of main"
+
+      # Preflight: assert compose files are on image: form — no build: directive.
+      # A build: context: /home/luna/repos/yugo2 silently builds a stale image
+      # and reports success (FINDING 2). This gate refuses before any deploy runs.
+      - name: Preflight — assert compose files on image form (no host-checkout build)
+        run: |
+          bash scripts/assert-compose-image-form.sh \
+            ./bots/coordinator/compose.yml \
+            ./bots/chis/compose.yml \
+            ./bots/ion/compose.yml
+
+      - name: Deploy coordinator
+        run: bash scripts/deploy.sh coordinator "${{ github.sha }}"
+
+      - name: Deploy chis
+        run: bash scripts/deploy.sh chis "${{ github.sha }}"
+
+      # ion deploys last — same rationale as ohm in codex-container: reviewer
+      # state is sensitive to interruption.
+      - name: Deploy ion
+        run: bash scripts/deploy.sh ion "${{ github.sha }}"
+
+      - name: Drift gate — assert all containers at deployed SHA
+        env:
+          # coordinator's container name is yugo-coordinator (set by compose.yml
+          # container_name:). drift-check.sh uses docker inspect <name> directly.
+          BOTS: yugo-coordinator chis ion
+        run: bash scripts/drift-check.sh
+
+      # Handoff: if HEAD moved while this run was deploying, dispatch a fresh
+      # run for HEAD so that commit is not left undeployed.
+      # if: always() — must run on failure too.
+      - name: Handoff — dispatch for HEAD if moved
+        if: always()
+        env:
+          DISPATCH_TOKEN: ${{ github.token }}
+        run: bash scripts/handoff.sh
