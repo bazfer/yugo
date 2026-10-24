@@ -1,6 +1,6 @@
 services:
   bot:
-    image: chis-bot:${CODEX_IMAGE_TAG:?CODEX_IMAGE_TAG must be set to the full merged SHA}
+    image: chis-bot:${YUGO_IMAGE_TAG:?YUGO_IMAGE_TAG must be set to the full merged SHA}
     container_name: chis
     # Absolute path — this compose file runs from the repo checkout, not
     # from the bot's directory on the host.

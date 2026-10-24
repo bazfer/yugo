@@ -2,7 +2,7 @@ services:
   coordinator:
     # No default — fails loudly when CODEX_IMAGE_TAG is unset.
     # A silent :-latest resolve is the pattern that produced the 97-commit gap.
-    image: yugo-coordinator:${CODEX_IMAGE_TAG:?CODEX_IMAGE_TAG must be set to the full merged SHA}
+    image: yugo-coordinator:${YUGO_IMAGE_TAG:?YUGO_IMAGE_TAG must be set to the full merged SHA}
     container_name: yugo-coordinator
     environment:
       YUGO_MODE: coordinator

@@ -85,11 +85,11 @@ fi
 run_compose() {
   local image_tag="$1"; shift
   if [[ "${SUDO_USER}" == "none" ]]; then
-    CODEX_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
+    YUGO_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
   elif [[ "${SUDO_USER}" == "root" ]]; then
-    sudo env CODEX_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
+    sudo env YUGO_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
   else
-    sudo -u "$SUDO_USER" env CODEX_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
+    sudo -u "$SUDO_USER" env YUGO_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
   fi
 }
 

@@ -1,15 +1,25 @@
 services:
   bot:
-    image: ion-bot:${CODEX_IMAGE_TAG:?CODEX_IMAGE_TAG must be set to the full merged SHA}
+    image: ion-bot:${YUGO_IMAGE_TAG:?YUGO_IMAGE_TAG must be set to the full merged SHA}
     container_name: ion
     # Absolute path — this compose file runs from the repo checkout.
-    env_file: /home/deet/bots/ion/.env
+    # ion.env (not .env) confirmed against host and live container.
+    env_file: /home/deet/bots/ion/ion.env
+    # Five variables absent from ion.env, confirmed against live container env.
+    # Paths are container-side; each has a matching volume mount below.
+    environment:
+      FLEET_BUS_USER: ion
+      FLEET_BUS_URL: nats://nats:4222
+      FLEET_BUS_TOKEN_FILE: /root/.claude/fleet-bus-token-ion
+      YUGO_DEDUP_VERIFICATION_RECORD: /var/lib/yugo/ion-dedup.sqlite.verification.json
+      YUGO_GITHUB_CREDENTIALS_FILE: /etc/yugo/github-credentials.yaml
     volumes:
       - /home/deet/bots/ion/github-credentials.yaml:/etc/yugo/github-credentials.yaml:ro
       - /home/deet/bots/ion/fleet-bus-token-ion:/root/.claude/fleet-bus-token-ion:ro
       - /home/deet/bots/ion/persona.md:/root/persona.md:ro
-      - /home/luna/vault/infra/fleet-manifest.yaml:/vault/infra/fleet-manifest.yaml
-      - ion-yugo-state:/var/lib/yugo:z
+      # :ro — ion must not be able to rewrite the shared fleet manifest
+      - /home/luna/vault/infra/fleet-manifest.yaml:/vault/infra/fleet-manifest.yaml:ro
+      - ion-yugo-state:/var/lib/yugo
       - /home/deet/bots/ion/tools.yaml:/etc/yugo/tools.yaml:ro
       - /home/deet/bots/ion/http-credentials.yaml:/etc/yugo/http-credentials.yaml:ro
     networks:

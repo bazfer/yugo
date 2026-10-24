@@ -54,9 +54,9 @@ jobs:
       - name: Preflight — assert compose files on image form (no host-checkout build)
         run: |
           bash scripts/assert-compose-image-form.sh \
-            /home/luna/bots/coordinator/compose.yml \
-            /home/luna/bots/chis/compose.yml \
-            /home/deet/bots/ion/compose.yml
+            ./bots/coordinator/compose.yml \
+            ./bots/chis/compose.yml \
+            ./bots/ion/compose.yml
 
       - name: Deploy coordinator
         run: bash scripts/deploy.sh coordinator "${{ github.sha }}"
