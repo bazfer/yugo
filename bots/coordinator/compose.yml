@@ -1,0 +1,24 @@
+services:
+  coordinator:
+    # No default — fails loudly when CODEX_IMAGE_TAG is unset.
+    # A silent :-latest resolve is the pattern that produced the 97-commit gap.
+    image: yugo-coordinator:${CODEX_IMAGE_TAG:?CODEX_IMAGE_TAG must be set to the full merged SHA}
+    container_name: yugo-coordinator
+    environment:
+      YUGO_MODE: coordinator
+      FLEET_BUS_ENABLED: "1"
+      FLEET_BUS_URL: nats://nats:4222
+      FLEET_BUS_USER: coordinator
+      FLEET_BUS_TOKEN_FILE: /run/secrets/coordinator-token
+      TASK_STATE_PATH: /var/lib/yugo/state.sqlite
+      COORDINATOR_HEARTBEAT_MS: "5000"
+    volumes:
+      - /var/lib/yugo-coordinator/token:/run/secrets/coordinator-token:ro
+      - /var/lib/yugo-coordinator:/var/lib/yugo
+    networks:
+      - fleet-bus-net
+    restart: unless-stopped
+
+networks:
+  fleet-bus-net:
+    external: true

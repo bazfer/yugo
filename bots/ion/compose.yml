@@ -1,0 +1,24 @@
+services:
+  bot:
+    image: ion-bot:${CODEX_IMAGE_TAG:?CODEX_IMAGE_TAG must be set to the full merged SHA}
+    container_name: ion
+    # Absolute path — this compose file runs from the repo checkout.
+    env_file: /home/deet/bots/ion/.env
+    volumes:
+      - /home/deet/bots/ion/github-credentials.yaml:/etc/yugo/github-credentials.yaml:ro
+      - /home/deet/bots/ion/fleet-bus-token-ion:/root/.claude/fleet-bus-token-ion:ro
+      - /home/deet/bots/ion/persona.md:/root/persona.md:ro
+      - /home/luna/vault/infra/fleet-manifest.yaml:/vault/infra/fleet-manifest.yaml
+      - ion-yugo-state:/var/lib/yugo:z
+      - /home/deet/bots/ion/tools.yaml:/etc/yugo/tools.yaml:ro
+      - /home/deet/bots/ion/http-credentials.yaml:/etc/yugo/http-credentials.yaml:ro
+    networks:
+      - fleet-bus-net
+    restart: unless-stopped
+
+volumes:
+  ion-yugo-state:
+
+networks:
+  fleet-bus-net:
+    external: true
