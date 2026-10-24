@@ -307,6 +307,16 @@ exit 0
 STUBEOF
   chmod +x "$tmpdir/docker"
 
+  # git stub: HEAD matches expected SHA
+  cat > "$tmpdir/git" << STUBEOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [[ "\$a" == "rev-parse" ]]; then echo "${sha}"; exit 0; fi
+done
+exit 0
+STUBEOF
+  chmod +x "$tmpdir/git"
+
   local exit_code=0
   PATH="${tmpdir}:${PATH}" \
     EXPECTED_SHA="$sha" \
@@ -471,6 +481,295 @@ STUBEOF
   fi
 }
 
+# ── deploy.sh: compose up is actually invoked ─────────────────────────────────
+# Mutation: replace run_compose with a no-op → test goes RED.
+
+test_compose_up_is_invoked() {
+  local name="test_compose_up_is_invoked"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local commit="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  local build_id="sha256:testbuildid000000000000000000000000000000000000000000000000000000"
+  local state="${tmpdir}/container_state"
+  local compose_log="${tmpdir}/compose_calls"
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  coordinator:
+    image: yugo-coordinator:${YUGO_IMAGE_TAG:-latest}
+    container_name: yugo-coordinator
+EOF
+
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+STATE="${state}"
+COMPOSE_LOG="${compose_log}"
+BUILD_ID="${build_id}"
+COMMIT_SHA="${commit}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    [[ "\$a" == "up" ]] || continue
+    echo "called" >> "\${COMPOSE_LOG}"
+    touch "\${STATE}"
+    exit 0
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "rmi" || "\${1:-}" == "tag" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ -f "\${STATE}" ]]; then
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${BUILD_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "yugo"; exit 0; fi
+    fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$commit" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_COORDINATOR="${tmpdir}/compose.yml" \
+    YUGO_SUDO_COORDINATOR="none" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" coordinator 2>&1 || exit_code=$?
+
+  if [[ $exit_code -eq 0 ]] && [[ -s "$compose_log" ]]; then
+    pass "$name"
+  else
+    fail "$name" "compose up not called or deploy failed (exit=${exit_code})"
+  fi
+}
+
+# ── deploy.sh: compose failure triggers rollback ──────────────────────────────
+# Mutation: make rollback() a no-op → test goes RED (no ROLLBACK in output).
+
+test_compose_failure_triggers_rollback() {
+  local name="test_compose_failure_triggers_rollback"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local commit="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  local prev_commit="cccccccccccccccccccccccccccccccccccccccc"
+  local build_id="sha256:newbuild000000000000000000000000000000000000000000000000000000000"
+  local prev_id="sha256:oldbuild000000000000000000000000000000000000000000000000000000000"
+  local call_count="${tmpdir}/compose_calls"
+  local state="${tmpdir}/container_state"
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  coordinator:
+    image: yugo-coordinator:${YUGO_IMAGE_TAG:-latest}
+    container_name: yugo-coordinator
+EOF
+
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+CALLS="${call_count}"
+STATE="${state}"
+PREV_ID="${prev_id}"
+PREV_COMMIT_SHA="${prev_commit}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    [[ "\$a" == "up" ]] || continue
+    count=\$(cat "\${CALLS}" 2>/dev/null || echo 0)
+    echo \$((count+1)) > "\${CALLS}"
+    if [[ \$((count+1)) -eq 1 ]]; then exit 1; fi  # first up fails
+    touch "\${STATE}"
+    exit 0
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ -f "\${STATE}" ]]; then
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "yugo"; exit 0; fi
+    else
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "yugo"; exit 0; fi
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+    fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  local output
+  output="$(PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$commit" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_COORDINATOR="${tmpdir}/compose.yml" \
+    YUGO_SUDO_COORDINATOR="none" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" coordinator 2>&1)" || exit_code=$?
+
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -qi "ROLLBACK"; then
+    pass "$name"
+  else
+    fail "$name" "expected non-zero exit with ROLLBACK in output; got exit=${exit_code}, output=${output}"
+  fi
+}
+
+# ── deploy.sh: chis deploy updates yugo2-src ──────────────────────────────────
+# Mutation: delete the chis yugo2-src update block → test goes RED.
+
+test_chis_deploy_updates_yugo2_src() {
+  local name="test_chis_deploy_updates_yugo2_src"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local commit="dddddddddddddddddddddddddddddddddddddddd"
+  local build_id="sha256:chisbuild00000000000000000000000000000000000000000000000000000000"
+  local yugo2_src="${tmpdir}/yugo2-src"
+  local state="${tmpdir}/container_state"
+  local git_log="${tmpdir}/git_calls"
+  mkdir -p "$yugo2_src"
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:-latest}
+    container_name: chis
+EOF
+
+  # git stub: logs calls; returns stable HEAD for rev-parse
+  cat > "${tmpdir}/git" << STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "${git_log}"
+for a in "\$@"; do
+  if [[ "\$a" == "rev-parse" ]]; then echo "prevsha0000000000000000000000000000000000"; exit 0; fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/git"
+
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+STATE="${state}"
+BUILD_ID="${build_id}"
+COMMIT_SHA="${commit}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    [[ "\$a" == "up" ]] || continue
+    touch "\${STATE}"
+    exit 0
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "rmi" || "\${1:-}" == "tag" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ -f "\${STATE}" ]]; then
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${BUILD_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+    fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$commit" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
+    YUGO_SUDO_CHIS="none" \
+    YUGO_YUGO2_SRC="$yugo2_src" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1 || exit_code=$?
+
+  local pinned_sha=""
+  pinned_sha="$(grep -oP '^SHA: \K\S+' "${yugo2_src}/PINNED.md" 2>/dev/null || true)"
+
+  if [[ $exit_code -eq 0 ]] \
+      && grep -q "checkout" "${git_log}" 2>/dev/null \
+      && [[ "$pinned_sha" == "$commit" ]]; then
+    pass "$name"
+  else
+    fail "$name" "expected exit=0, git checkout called, PINNED.md updated; got exit=${exit_code}, pinned=${pinned_sha}, git_log=$(cat "$git_log" 2>/dev/null || echo EMPTY)"
+  fi
+}
+
+# ── drift-check.sh: fails on git HEAD mismatch ────────────────────────────────
+# Mutation: remove the git rev-parse HEAD check → test goes RED.
+
+test_drift_check_fails_on_git_head_mismatch() {
+  local name="test_drift_check_fails_on_git_head_mismatch"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local expected_sha="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  local head_sha="ffffffffffffffffffffffffffffffffffffffff"
+
+  # PINNED.md matches, but git HEAD does not
+  printf 'SHA: %s\nDate: 2026-10-24\n' "$expected_sha" > "$tmpdir/PINNED.md"
+
+  cat > "$tmpdir/git" << STUBEOF
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [[ "\$a" == "rev-parse" ]]; then echo "${head_sha}"; exit 0; fi
+done
+exit 0
+STUBEOF
+  chmod +x "$tmpdir/git"
+
+  cat > "$tmpdir/docker" << STUBEOF
+#!/usr/bin/env bash
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+    if [[ "\$fmt" == *"codex.commit"* ]]; then echo "${expected_sha}"; exit 0; fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "$tmpdir/docker"
+
+  local exit_code=0
+  PATH="${tmpdir}:${PATH}" \
+    EXPECTED_SHA="$expected_sha" \
+    BOTS="chis" \
+    YUGO2_SRC_DIR="$tmpdir" \
+    bash "${SCRIPT_DIR}/scripts/drift-check.sh" 2>/dev/null || exit_code=$?
+  if [[ $exit_code -ne 0 ]]; then
+    pass "$name"
+  else
+    fail "$name" "drift-check passed when git HEAD (${head_sha:0:8}) != EXPECTED_SHA (${expected_sha:0:8})"
+  fi
+}
+
 # Run all tests
 test_preflight_rejects_build_form
 test_preflight_rejects_any_build_form
@@ -488,6 +787,10 @@ test_workflow_has_actions_write_permission
 test_workflow_handoff_always_runs
 test_handoff_fails_when_dispatch_fails
 test_handoff_no_dispatch_when_head_unchanged
+test_compose_up_is_invoked
+test_compose_failure_triggers_rollback
+test_chis_deploy_updates_yugo2_src
+test_drift_check_fails_on_git_head_mismatch
 
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

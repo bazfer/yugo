@@ -71,7 +71,9 @@ jobs:
 
       - name: Drift gate — assert all containers at deployed SHA
         env:
-          BOTS: coordinator chis ion
+          # coordinator's container name is yugo-coordinator (set by compose.yml
+          # container_name:). drift-check.sh uses docker inspect <name> directly.
+          BOTS: yugo-coordinator chis ion
         run: bash scripts/drift-check.sh
 
       # Handoff: if HEAD moved while this run was deploying, dispatch a fresh

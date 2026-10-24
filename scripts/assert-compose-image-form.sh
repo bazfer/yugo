@@ -7,7 +7,8 @@
 # docker compose up -d --build was last run, and it reported success.
 #
 # Hard-fails on any file that is missing, unreadable, or contains a build:
-# directive.
+# directive (checked via PyYAML structural parse — flow-map YAML
+# {build: {context: ...}} bypasses a grep of '^[[:space:]]*build:').
 
 set -euo pipefail
 
@@ -23,9 +24,27 @@ for file in "$@"; do
     fail=1
     continue
   fi
-  if grep -q '^[[:space:]]*build:' "$file"; then
-    echo "ERROR: ${file} contains a build: directive — it will build from a host checkout." >&2
-    echo "       That checkout may be stale. Use image: form and build from a fresh tarball." >&2
+  result="$(python3 - "$file" << 'PYEOF'
+import sys, yaml
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        doc = yaml.safe_load(f)
+except Exception as e:
+    print("ERROR: " + str(e))
+    sys.exit(1)
+services = (doc or {}).get("services") or {}
+for svc_name, svc in services.items():
+    if not isinstance(svc, dict):
+        continue
+    if "build" in svc:
+        print("ERROR: service '{}' has a build: directive — it will build from a host checkout.".format(svc_name))
+        sys.exit(1)
+PYEOF
+)" && py_exit=0 || py_exit=$?
+  if [[ $py_exit -ne 0 ]]; then
+    echo "ERROR: ${file}: ${result}" >&2
+    echo "       Use image: form and build from a fresh tarball." >&2
     fail=1
   fi
 done

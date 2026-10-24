@@ -28,6 +28,12 @@ services:
 
 volumes:
   ion-yugo-state:
+    # Explicit name anchors this volume to the real host volume regardless
+    # of which directory the compose command runs from. Live host volume
+    # confirmed: ion-yugo-state (no project prefix — ion directory matched
+    # the volume key exactly when first created).
+    name: ion-yugo-state
+    external: true
 
 networks:
   fleet-bus-net:

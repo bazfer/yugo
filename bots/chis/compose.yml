@@ -20,6 +20,13 @@ services:
 
 volumes:
   chis-yugo-state:
+    # Explicit name anchors this volume to the real host volume regardless
+    # of which directory the compose command runs from. Without a name:,
+    # docker compose prefixes the project name (directory basename), so the
+    # same volume key resolves to different host volumes depending on CWD.
+    # Live host volume confirmed: chis_chis-yugo-state (project=chis).
+    name: chis_chis-yugo-state
+    external: true
 
 networks:
   fleet-bus-net:
