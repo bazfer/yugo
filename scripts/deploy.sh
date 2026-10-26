@@ -15,11 +15,17 @@
 # Requires sudoers rules for compose restart and git/tee/cat operations.
 # These grants are ABSENT as of 2026-10-26 (kat only has /usr/bin/apt-get).
 # All three deploys will fail-closed until they are added.
-# Exact entries (run `which cat` on Norstar to confirm /usr/bin/cat vs /bin/cat):
 #
-#   kat ALL=(root) NOPASSWD: /usr/bin/env
-#   kat ALL=(luna) NOPASSWD: /usr/bin/env, /usr/bin/git, /usr/bin/tee, /usr/bin/cat
-#   kat ALL=(deet) NOPASSWD: /usr/bin/env
+# WARNING: env, sh, bash, find, vi and similar must NEVER appear in a sudoers
+# grant — each can launch arbitrary commands, making any such grant equivalent
+# to unrestricted access as the target user. Grant only exact binary paths.
+#
+# Exact entries (paths confirmed on Norstar):
+#
+#   Defaults:kat env_keep += "YUGO_IMAGE_TAG"
+#   kat ALL=(root) NOPASSWD: /usr/bin/docker
+#   kat ALL=(luna) NOPASSWD: /usr/bin/docker, /usr/bin/git, /usr/bin/tee /home/luna/bots/chis/yugo2-src/PINNED.md, /usr/bin/cat /home/luna/bots/chis/yugo2-src/PINNED.md
+#   kat ALL=(deet) NOPASSWD: /usr/bin/docker
 #
 # Environment overrides (testing):
 #   YUGO_COMPOSE_COORDINATOR / _CHIS / _ION   override compose file path
@@ -76,12 +82,15 @@ esac
 
 run_compose() {
   local image_tag="$1"; shift
+  # Export YUGO_IMAGE_TAG so sudoers env_keep passes it through to docker compose.
+  # Never use `env` in the sudo call — it grants unrestricted command execution.
+  export YUGO_IMAGE_TAG="$image_tag"
   if [[ "${SUDO_USER}" == "none" ]]; then
-    YUGO_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
+    docker compose -f "$COMPOSE_FILE" "$@"
   elif [[ "${SUDO_USER}" == "root" ]]; then
-    sudo env YUGO_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
+    sudo docker compose -f "$COMPOSE_FILE" "$@"
   else
-    sudo -u "$SUDO_USER" env YUGO_IMAGE_TAG="$image_tag" docker compose -f "$COMPOSE_FILE" "$@"
+    sudo -u "$SUDO_USER" docker compose -f "$COMPOSE_FILE" "$@"
   fi
 }
 

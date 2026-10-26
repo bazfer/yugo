@@ -1446,17 +1446,33 @@ STUBEOF
 #   3. no compose up in call log
 
 test_chis_deploy_refuses_on_docker_inspect_failure() {
+  # DISCRIMINATING SETUP: real git repo with PINNED.md so snapshot succeeds.
+  # Without a viable source, a neutered inspection-error guard would still be
+  # stopped by the snapshot guard — making the test credit the wrong mechanism.
+  # With a real repo, the only thing that can stop the deploy is the inspection-error exit.
+  # The discriminating assertion is: compose up was never called.
   local name="test_chis_deploy_refuses_on_docker_inspect_failure"
   local tmpdir
   tmpdir="$(mktemp -d)"
   trap "rm -rf '$tmpdir'" RETURN
 
   local build_id="sha256:chisbuild00000000000000000000000000000000000000000000000000000000"
-  local commit="dddddddddddddddddddddddddddddddddddddddd"
   local compose_log="${tmpdir}/compose_calls"
   local yugo2_src="${tmpdir}/yugo2-src"
-  mkdir -p "$yugo2_src"
   touch "$compose_log"
+
+  # Real git repo: two commits — HEAD at prev_sha, deploy_sha one ahead
+  mkdir -p "$yugo2_src"
+  git -C "$yugo2_src" init -q
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "a"
+  local prev_sha; prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  printf 'SHA: %s\n' "$prev_sha" > "$yugo2_src/PINNED.md"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t add PINNED.md
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t commit -m "pin"
+  prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "b"
+  local deploy_sha; deploy_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" checkout -q "$prev_sha"
 
   cat > "${tmpdir}/compose.yml" << 'EOF'
 services:
@@ -1465,14 +1481,13 @@ services:
     container_name: chis
 EOF
 
-  # Docker stub: initial inspect (--format {{.Image}}) exits 1 with daemon error.
-  # All other docker calls (tag, rmi, compose, other inspect formats) succeed.
+  # Docker stub: ALL inspects fail with daemon error (not "no such object").
+  # compose and tag/rmi calls succeed.
   cat > "${tmpdir}/docker" << STUBEOF
 #!/usr/bin/env bash
-COMPOSE_LOG="${compose_log}"
 if [[ "\${1:-}" == "compose" ]]; then
   for a in "\$@"; do
-    if [[ "\$a" == "up" ]]; then echo "compose up" >> "\${COMPOSE_LOG}"; exit 0; fi
+    if [[ "\$a" == "up" ]]; then echo "compose up" >> "${compose_log}"; exit 0; fi
   done
   exit 0
 fi
@@ -1480,37 +1495,46 @@ fi
 args=("\$@")
 for i in "\${!args[@]}"; do
   if [[ "\${args[\$i]}" == "--format" ]]; then
-    fmt="\${args[\$((\$i+1))]}"
-    if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then
-      echo "Error: docker daemon timeout" >&2
-      exit 1
-    fi
-    echo ""; exit 0
+    echo "Error: docker daemon timeout" >&2
+    exit 1
   fi
 done
 exit 0
 STUBEOF
   chmod +x "${tmpdir}/docker"
 
+  # Git stub: no-op fetch, real git otherwise
+  cat > "${tmpdir}/git" << 'STUBEOF'
+#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
+exec /usr/bin/git "$@"
+STUBEOF
+  chmod +x "${tmpdir}/git"
+
   local exit_code=0
   local output
   output="$(PATH="${tmpdir}:${PATH}" \
     GH_TOKEN="fake" \
-    YUGO_COMMIT_OVERRIDE="$commit" \
+    YUGO_COMMIT_OVERRIDE="$deploy_sha" \
     YUGO_BUILD_IMAGE_ID="$build_id" \
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
-  # Assertion 2 (error message) is the discriminating control: with the mutation
-  # (|| true), `set -u` fires on IMAGE_CAPTURED before this message can be emitted.
+  local compose_reached=0
+  grep -q "compose up" "${compose_log}" 2>/dev/null && compose_reached=1 || true
+  local actual_head; actual_head="$(git -C "$yugo2_src" rev-parse HEAD 2>/dev/null || echo "no-git")"
+
+  # With the guard intact: deploy refuses at inspection-error → no compose up, HEAD unmoved.
+  # With the mutation (exit 1 → :): snapshot succeeds, compose up runs → compose_reached=1 (RED).
   if [[ $exit_code -ne 0 ]] \
       && echo "$output" | grep -q "docker inspect.*failed" \
-      && ! grep -q "compose up" "${compose_log}" 2>/dev/null; then
+      && [[ $compose_reached -eq 0 ]] \
+      && [[ "$actual_head" == "$prev_sha" ]]; then
     pass "$name"
   else
-    fail "$name" "expected exit!=0, 'docker inspect.*failed' in output, no compose up; got exit=${exit_code}, compose_up=$(grep -c 'compose up' "${compose_log}" 2>/dev/null || echo 0), output=${output}"
+    fail "$name" "expected exit!=0, 'docker inspect.*failed', no compose, HEAD at prev; got exit=${exit_code}, compose=${compose_reached}, head=${actual_head:0:12} (want ${prev_sha:0:12})"
   fi
 }
 
