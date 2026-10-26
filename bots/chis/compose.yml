@@ -1,0 +1,33 @@
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:?YUGO_IMAGE_TAG must be set to the full merged SHA}
+    container_name: chis
+    # Absolute path — this compose file runs from the repo checkout, not
+    # from the bot's directory on the host.
+    env_file: /home/luna/bots/chis/.env
+    volumes:
+      - /home/luna/repos/fleet-persona/personas/chis.md:/root/persona.md:ro
+      - /home/luna/bots/chis/.claude/fleet-bus-token-chis:/root/.claude/fleet-bus-token-chis:ro
+      - /home/luna/vault/infra/fleet-manifest.yaml:/vault/infra/fleet-manifest.yaml:ro
+      - /home/luna/bots/chis/tools.yaml:/etc/yugo/tools.yaml:ro
+      - chis-yugo-state:/var/lib/yugo
+      # Pinned source snapshot. SHA must match the deployed image commit.
+      # Updated atomically by scripts/deploy.sh on every chis deploy.
+      - /home/luna/bots/chis/yugo2-src:/var/lib/yugo/workspace/chis/yugo2:ro
+    networks:
+      - fleet-bus-net
+    restart: unless-stopped
+
+volumes:
+  chis-yugo-state:
+    # Explicit name anchors this volume to the real host volume regardless
+    # of which directory the compose command runs from. Without a name:,
+    # docker compose prefixes the project name (directory basename), so the
+    # same volume key resolves to different host volumes depending on CWD.
+    # Live host volume confirmed: chis_chis-yugo-state (project=chis).
+    name: chis_chis-yugo-state
+    external: true
+
+networks:
+  fleet-bus-net:
+    external: true

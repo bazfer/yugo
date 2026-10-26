@@ -1,0 +1,40 @@
+services:
+  bot:
+    image: ion-bot:${YUGO_IMAGE_TAG:?YUGO_IMAGE_TAG must be set to the full merged SHA}
+    container_name: ion
+    # Absolute path — this compose file runs from the repo checkout.
+    # ion.env (not .env) confirmed against host and live container.
+    env_file: /home/deet/bots/ion/ion.env
+    # Five variables absent from ion.env, confirmed against live container env.
+    # Paths are container-side; each has a matching volume mount below.
+    environment:
+      FLEET_BUS_USER: ion
+      FLEET_BUS_URL: nats://nats:4222
+      FLEET_BUS_TOKEN_FILE: /root/.claude/fleet-bus-token-ion
+      YUGO_DEDUP_VERIFICATION_RECORD: /var/lib/yugo/ion-dedup.sqlite.verification.json
+      YUGO_GITHUB_CREDENTIALS_FILE: /etc/yugo/github-credentials.yaml
+    volumes:
+      - /home/deet/bots/ion/github-credentials.yaml:/etc/yugo/github-credentials.yaml:ro
+      - /home/deet/bots/ion/fleet-bus-token-ion:/root/.claude/fleet-bus-token-ion:ro
+      - /home/deet/bots/ion/persona.md:/root/persona.md:ro
+      # :ro — ion must not be able to rewrite the shared fleet manifest
+      - /home/luna/vault/infra/fleet-manifest.yaml:/vault/infra/fleet-manifest.yaml:ro
+      - ion-yugo-state:/var/lib/yugo
+      - /home/deet/bots/ion/tools.yaml:/etc/yugo/tools.yaml:ro
+      - /home/deet/bots/ion/http-credentials.yaml:/etc/yugo/http-credentials.yaml:ro
+    networks:
+      - fleet-bus-net
+    restart: unless-stopped
+
+volumes:
+  ion-yugo-state:
+    # Explicit name anchors this volume to the real host volume regardless
+    # of which directory the compose command runs from. Live host volume
+    # confirmed: ion-yugo-state (no project prefix — ion directory matched
+    # the volume key exactly when first created).
+    name: ion-yugo-state
+    external: true
+
+networks:
+  fleet-bus-net:
+    external: true
