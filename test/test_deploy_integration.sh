@@ -672,16 +672,26 @@ services:
     container_name: chis
 EOF
 
-  # git stub: logs calls; returns stable HEAD for rev-parse
-  cat > "${tmpdir}/git" << STUBEOF
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
+  cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-echo "\$*" >> "${git_log}"
-for a in "\$@"; do
-  if [[ "\$a" == "rev-parse" ]]; then echo "prevsha0000000000000000000000000000000000"; exit 0; fi
-done
-exit 0
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: logs calls; returns stable HEAD for rev-parse
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "${git_log}"
+case "\${1:-}" in
+  rev-parse) echo "prevsha0000000000000000000000000000000000" ;;
+  checkout)  exit 0 ;;
+  fetch)     exit 0 ;;
+  *)         exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   cat > "${tmpdir}/docker" << STUBEOF
 #!/usr/bin/env bash
@@ -723,6 +733,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1 || exit_code=$?
 
   local pinned_sha=""
@@ -839,13 +850,26 @@ services:
     container_name: chis
 EOF
 
-  # git stub: intercepts fetch (no-op); passes everything else to real git
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
   cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
-exec /usr/bin/git "$@"
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: no-op fetch; real git for checkout and rev-parse
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+SRC="${yugo2_src}"
+case "\${1:-}" in
+  fetch)     exit 0 ;;
+  rev-parse) exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" rev-parse HEAD ;;
+  checkout)  exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" checkout "\${2}" ;;
+  *)         exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   # docker stub: first compose up fails (deploy triggers rollback); second succeeds (rollback)
   cat > "${tmpdir}/docker" << STUBEOF
@@ -897,6 +921,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   local actual_head actual_pinned
@@ -959,23 +984,32 @@ services:
     container_name: chis
 EOF
 
-  # git stub: intercepts fetch (no-op); first checkout passes (deploy), second fails (rollback).
-  # Tracks checkout calls with a counter so only the rollback restore checkout fails.
-  cat > "${tmpdir}/git" << STUBEOF
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
+  cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-CKCOUNT="${checkout_count}"
-for a in "\$@"; do [[ "\$a" == "fetch" ]] && exit 0; done
-for a in "\$@"; do
-  if [[ "\$a" == "checkout" ]]; then
-    count=\$(cat "\${CKCOUNT}" 2>/dev/null || echo 0)
-    echo \$((count+1)) > "\${CKCOUNT}"
-    if [[ \$((count+1)) -ge 2 ]]; then exit 1; fi  # rollback checkout fails
-    break
-  fi
-done
-exec /usr/bin/git "\$@"
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: no-op fetch; first checkout passes, second fails
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+CKCOUNT="${checkout_count}"
+SRC="${yugo2_src}"
+case "\${1:-}" in
+  fetch) exit 0 ;;
+  rev-parse) exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" rev-parse HEAD ;;
+  checkout)
+    count=\$(cat "\${CKCOUNT}" 2>/dev/null || echo 0)
+    echo \$((count+1)) > "\${CKCOUNT}"
+    if [[ \$((count+1)) -ge 2 ]]; then exit 1; fi
+    exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" checkout "\${2}"
+    ;;
+  *) exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   cat > "${tmpdir}/docker" << STUBEOF
 #!/usr/bin/env bash
@@ -1026,6 +1060,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   if [[ $exit_code -ne 0 ]] && echo "$output" | grep -qi "manual intervention required"; then
@@ -1083,26 +1118,33 @@ services:
     container_name: chis
 EOF
 
-  # git stub: fetch is a no-op; intercepts ONLY the rollback checkout (to prev_sha).
-  # Deploy's checkout (to deploy_sha) passes through to real git so HEAD actually moves.
-  # Then rollback's checkout exits 0 without moving HEAD — it stays at deploy_sha.
-  # The read-back finds deploy_sha != PREV_YUGO2_SHA (prev_sha) and must exit 1.
-  cat > "${tmpdir}/git" << STUBEOF
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
+  cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-for a in "\$@"; do [[ "\$a" == "fetch" ]] && exit 0; done
-args=("\$@")
-for i in "\${!args[@]}"; do
-  if [[ "\${args[\$i]}" == "checkout" ]]; then
-    target="\${args[\$((\$i+1))]:-}"
-    if [[ "\$target" == "${prev_sha}" ]]; then
-      exit 0  # rollback checkout: exits 0 but does NOT move HEAD (silent failure)
-    fi
-    break
-  fi
-done
-exec /usr/bin/git "\$@"
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: no-op fetch; rollback checkout (to prev_sha) is silent no-op.
+  # Deploy checkout (to deploy_sha) passes through so HEAD actually moves.
+  # The read-back finds deploy_sha != PREV_YUGO2_SHA and must exit 1.
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+SRC="${yugo2_src}"
+case "\${1:-}" in
+  fetch) exit 0 ;;
+  rev-parse) exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" rev-parse HEAD ;;
+  checkout)
+    if [[ "\${2:-}" == "${prev_sha}" ]]; then
+      exit 0  # rollback checkout: exits 0 but does NOT move HEAD (silent failure)
+    fi
+    exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" checkout "\${2}"
+    ;;
+  *) exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   # docker stub: first compose up fails (triggers rollback); second succeeds.
   cat > "${tmpdir}/docker" << STUBEOF
@@ -1154,6 +1196,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   # Checkout stub exits 0 but HEAD stays at deploy_sha.
@@ -1214,18 +1257,27 @@ services:
     container_name: chis
 EOF
 
-  # git stub: fail rev-parse (forces snapshot abort); no-op fetch; log all calls;
-  # pass checkout and everything else to real git.
-  # This way: if deploy proceeds past the snapshot (mutation), checkout moves HEAD
-  # to deploy_sha and the call log records it — both are caught by assertions below.
-  cat > "${tmpdir}/git" << STUBEOF
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
+  cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-echo "git \$*" >> "${git_log}"
-for a in "\$@"; do [[ "\$a" == "rev-parse" ]] && exit 1; done
-for a in "\$@"; do [[ "\$a" == "fetch" ]] && exit 0; done
-exec /usr/bin/git "\$@"
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: rev-parse fails (forces snapshot abort); no-op fetch; checkout logs + real git.
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+echo "\$*" >> "${git_log}"
+SRC="${yugo2_src}"
+case "\${1:-}" in
+  rev-parse) exit 1 ;;
+  fetch) exit 0 ;;
+  checkout) exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" checkout "\${2}" ;;
+  *) exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   # docker stub: container exists, compose-managed; logs compose up calls.
   cat > "${tmpdir}/docker" << STUBEOF
@@ -1263,6 +1315,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   local actual_head
@@ -1359,13 +1412,26 @@ exec /bin/cat "\$@"
 STUBEOF
   chmod +x "${tmpdir}/cat"
 
-  # git stub: fetch=no-op; everything else passes to real git
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
   cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
-exec /usr/bin/git "$@"
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: no-op fetch; real git for checkout and rev-parse
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+SRC="${yugo2_src}"
+case "\${1:-}" in
+  fetch)     exit 0 ;;
+  rev-parse) exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" rev-parse HEAD ;;
+  checkout)  exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" checkout "\${2}" ;;
+  *)         exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   # docker stub: first compose up fails (triggers rollback); second succeeds (rollback image restore)
   cat > "${tmpdir}/docker" << STUBEOF
@@ -1417,6 +1483,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   # PINNED.md read-back fails → must exit nonzero with "manual intervention required".
@@ -1503,13 +1570,26 @@ exit 0
 STUBEOF
   chmod +x "${tmpdir}/docker"
 
-  # Git stub: no-op fetch, real git otherwise
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
   cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
-exec /usr/bin/git "$@"
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: no-op fetch; real git for checkout and rev-parse
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+SRC="${yugo2_src}"
+case "\${1:-}" in
+  fetch)     exit 0 ;;
+  rev-parse) exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" rev-parse HEAD ;;
+  checkout)  exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" checkout "\${2}" ;;
+  *)         exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   local exit_code=0
   local output
@@ -1520,6 +1600,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   local compose_reached=0
@@ -1616,13 +1697,26 @@ exit 0
 STUBEOF
   chmod +x "${tmpdir}/docker"
 
-  # Git stub: no-op fetch, real git otherwise
+  # Loud-fail bare git stub: catches any bypass of YUGO_GIT_CHIS
   cat > "${tmpdir}/git" << 'STUBEOF'
 #!/usr/bin/env bash
-for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
-exec /usr/bin/git "$@"
+echo "ERROR: bare git called directly — must use yugo-git-chis wrapper" >&2
+exit 1
 STUBEOF
   chmod +x "${tmpdir}/git"
+
+  # yugo-git-chis wrapper stub: no-op fetch; real git for checkout and rev-parse
+  cat > "${tmpdir}/yugo-git-chis" << STUBEOF
+#!/usr/bin/env bash
+SRC="${yugo2_src}"
+case "\${1:-}" in
+  fetch)     exit 0 ;;
+  rev-parse) exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" rev-parse HEAD ;;
+  checkout)  exec /usr/bin/git -c "safe.directory=\${SRC}" -C "\${SRC}" checkout "\${2}" ;;
+  *)         exit 1 ;;
+esac
+STUBEOF
+  chmod +x "${tmpdir}/yugo-git-chis"
 
   local exit_code=0
   PATH="${tmpdir}:${PATH}" \
@@ -1632,6 +1726,7 @@ STUBEOF
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
+    YUGO_GIT_CHIS="${tmpdir}/yugo-git-chis" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>/dev/null || exit_code=$?
 
   local compose_reached=0
@@ -1671,6 +1766,91 @@ test_chis_deploy_refuses_when_snapshot_fails
 test_chis_rollback_fails_when_pinned_readback_fails
 test_chis_deploy_refuses_on_docker_inspect_failure
 test_chis_first_deploy_allowed_on_no_such_object
+
+# ── yugo-git-chis: wrapper argument-validation controls ───────────────────────
+# Each test calls the wrapper directly and asserts it exits nonzero with "denied"
+# in stderr. These pin the validation layer independently of deploy.sh integration.
+
+test_yugo_git_chis_rejects_non_hex_sha() {
+  local name="test_yugo_git_chis_rejects_non_hex_sha"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  mkdir -p "${tmpdir}/src"
+  local output exit_code=0
+  output="$(YUGO2_SRC_DIR="${tmpdir}/src" \
+    bash "${SCRIPT_DIR}/scripts/yugo-git-chis" checkout "not-a-hex-sha" 2>&1)" || exit_code=$?
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "denied"; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0 and 'denied'; got exit=${exit_code}, output=${output}"
+  fi
+}
+
+test_yugo_git_chis_rejects_extra_checkout_arg() {
+  local name="test_yugo_git_chis_rejects_extra_checkout_arg"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  mkdir -p "${tmpdir}/src"
+  local output exit_code=0
+  output="$(YUGO2_SRC_DIR="${tmpdir}/src" \
+    bash "${SCRIPT_DIR}/scripts/yugo-git-chis" checkout "abc1234" "extra-arg" 2>&1)" || exit_code=$?
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "denied"; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0 and 'denied'; got exit=${exit_code}, output=${output}"
+  fi
+}
+
+test_yugo_git_chis_rejects_rev_parse_with_arg() {
+  local name="test_yugo_git_chis_rejects_rev_parse_with_arg"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  mkdir -p "${tmpdir}/src"
+  local output exit_code=0
+  output="$(YUGO2_SRC_DIR="${tmpdir}/src" \
+    bash "${SCRIPT_DIR}/scripts/yugo-git-chis" rev-parse HEAD 2>&1)" || exit_code=$?
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "denied"; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0 and 'denied'; got exit=${exit_code}, output=${output}"
+  fi
+}
+
+test_yugo_git_chis_rejects_fetch_with_arg() {
+  local name="test_yugo_git_chis_rejects_fetch_with_arg"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  mkdir -p "${tmpdir}/src"
+  local output exit_code=0
+  output="$(YUGO2_SRC_DIR="${tmpdir}/src" \
+    bash "${SCRIPT_DIR}/scripts/yugo-git-chis" fetch origin 2>&1)" || exit_code=$?
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "denied"; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0 and 'denied'; got exit=${exit_code}, output=${output}"
+  fi
+}
+
+test_yugo_git_chis_rejects_unknown_subcommand() {
+  local name="test_yugo_git_chis_rejects_unknown_subcommand"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  mkdir -p "${tmpdir}/src"
+  local output exit_code=0
+  output="$(YUGO2_SRC_DIR="${tmpdir}/src" \
+    bash "${SCRIPT_DIR}/scripts/yugo-git-chis" push 2>&1)" || exit_code=$?
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -q "denied"; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0 and 'denied'; got exit=${exit_code}, output=${output}"
+  fi
+}
+
+test_yugo_git_chis_rejects_non_hex_sha
+test_yugo_git_chis_rejects_extra_checkout_arg
+test_yugo_git_chis_rejects_rev_parse_with_arg
+test_yugo_git_chis_rejects_fetch_with_arg
+test_yugo_git_chis_rejects_unknown_subcommand
 
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

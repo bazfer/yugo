@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# yugo-git-chis v1 — argument-validating git proxy for chis yugo2-src operations.
+#
+# Owner: luna. Mode: 0755. Install to: /home/luna/bots/chis/bin/yugo-git-chis
+# Sudoers grants this path, not /usr/bin/git directly (git can execute arbitrary
+# shell via -c alias.x='!sh' x — unrestricted git == unrestricted access as luna).
+# Increment VERSION and commit when changing — the grant can be pinned to a version.
+VERSION=1
+
+set -euo pipefail
+
+SRC="${YUGO2_SRC_DIR:-/home/luna/bots/chis/yugo2-src}"
+die() { echo "yugo-git-chis: denied: $*" >&2; exit 1; }
+
+case "${1:-}" in
+  rev-parse)
+    [[ $# -eq 1 ]] || die "rev-parse takes no arguments (got $(( $# - 1 )))"
+    exec /usr/bin/git -c "safe.directory=${SRC}" -C "${SRC}" rev-parse HEAD
+    ;;
+  checkout)
+    [[ $# -eq 2 ]] || die "checkout requires exactly one argument (got $(( $# - 1 )))"
+    [[ "${2}" =~ ^[0-9a-f]{7,40}$ ]] || die "checkout argument must be a hex SHA (got '${2}')"
+    exec /usr/bin/git -c "safe.directory=${SRC}" -C "${SRC}" checkout "${2}"
+    ;;
+  fetch)
+    [[ $# -eq 1 ]] || die "fetch takes no arguments (got $(( $# - 1 )))"
+    exec /usr/bin/git -c "safe.directory=${SRC}" -C "${SRC}" fetch origin
+    ;;
+  *)
+    die "unknown subcommand '${1:-}' — allowed: rev-parse, checkout, fetch"
+    ;;
+esac

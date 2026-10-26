@@ -46,11 +46,6 @@
 #     *)         echo "denied: $*" >&2; exit 1 ;;
 #   esac
 #
-# NOTE: deploy.sh currently calls /usr/bin/git directly via run_as_owner.
-# Before Fernando adds the grants below, deploy.sh must be updated to call
-# the wrapper instead — tracked as a separate code change. Adding the current
-# git calls to sudoers without the wrapper would restore an unrestricted grant.
-#
 # Exact entries (paths confirmed on Norstar):
 #
 #   Defaults:kat env_keep += "YUGO_IMAGE_TAG"
@@ -65,6 +60,7 @@
 #   YUGO_BUILD_IMAGE_ID                        skip tarball fetch and docker build;
 #                                              use this value as BUILT_IMAGE_ID
 #   YUGO_COMMIT_OVERRIDE                       skip resolve_to_sha; use this SHA directly
+#   YUGO_GIT_CHIS                              override yugo-git-chis wrapper path (chis only)
 
 set -euo pipefail
 
@@ -92,6 +88,7 @@ case "$BOT" in
     # chis .env is owned by luna. Compose client must run as luna to read it.
     SUDO_USER="${YUGO_SUDO_CHIS:-luna}"
     YUGO2_SRC_DIR="${YUGO_YUGO2_SRC:-/home/luna/bots/chis/yugo2-src}"
+    YUGO_GIT_CHIS="${YUGO_GIT_CHIS:-/home/luna/bots/chis/bin/yugo-git-chis}"
     ;;
   ion)
     IMAGE_NAME="ion-bot"
@@ -268,10 +265,7 @@ rollback() {
   if [[ -z "${PREV_YUGO2_SHA:-}" ]]; then
     echo "==> yugo2-src not mutated before failure — no source restore needed" >&2
   else
-    if ! run_as_owner git \
-        -c "safe.directory=${YUGO2_SRC_DIR}" \
-        -C "${YUGO2_SRC_DIR}" \
-        checkout "${PREV_YUGO2_SHA}" 2>/dev/null >&2; then
+    if ! run_as_owner "${YUGO_GIT_CHIS}" checkout "${PREV_YUGO2_SHA}" 2>/dev/null >&2; then
       echo "ERROR: yugo2-src checkout restore to ${PREV_YUGO2_SHA:0:12} failed — manual intervention required" >&2
       exit 1
     fi
@@ -283,7 +277,7 @@ rollback() {
     fi
     # Verify by reading back — a write returning 0 is not the same as the right value being there.
     local restored_head
-    restored_head="$(run_as_owner git -c "safe.directory=${YUGO2_SRC_DIR}" -C "${YUGO2_SRC_DIR}" rev-parse HEAD 2>/dev/null || true)"
+    restored_head="$(run_as_owner "${YUGO_GIT_CHIS}" rev-parse 2>/dev/null || true)"
     if [[ "$restored_head" != "$PREV_YUGO2_SHA" ]]; then
       echo "ERROR: yugo2-src rollback failed — git HEAD is ${restored_head:0:12}, expected ${PREV_YUGO2_SHA:0:12} — manual intervention required" >&2
       exit 1
@@ -360,9 +354,7 @@ fi
 #     https://github.com/bazfer/yugo.git
 
 if [[ "$BOT" == "chis" ]]; then
-  PREV_YUGO2_SHA="$(run_as_owner git \
-    -c "safe.directory=${YUGO2_SRC_DIR}" \
-    -C "${YUGO2_SRC_DIR}" rev-parse HEAD 2>/dev/null)" || {
+  PREV_YUGO2_SHA="$(run_as_owner "${YUGO_GIT_CHIS}" rev-parse 2>/dev/null)" || {
     echo "ERROR: yugo2-src: failed to read current HEAD — cannot deploy without rollback capability" >&2
     exit 1
   }
@@ -376,13 +368,9 @@ if [[ "$BOT" == "chis" ]]; then
   }
 
   echo "==> Updating yugo2-src to ${COMMIT:0:12}..."
-  run_as_owner git \
-    -c "safe.directory=${YUGO2_SRC_DIR}" \
-    -C "${YUGO2_SRC_DIR}" fetch origin \
-    || die "yugo2-src fetch failed (check remote: sudo -u luna git -C ${YUGO2_SRC_DIR} remote -v)"
-  run_as_owner git \
-    -c "safe.directory=${YUGO2_SRC_DIR}" \
-    -C "${YUGO2_SRC_DIR}" checkout "${COMMIT}" \
+  run_as_owner "${YUGO_GIT_CHIS}" fetch \
+    || die "yugo2-src fetch failed"
+  run_as_owner "${YUGO_GIT_CHIS}" checkout "${COMMIT}" \
     || die "yugo2-src checkout ${COMMIT:0:12} failed"
   printf 'SHA: %s\nDate: %s\nUpdated-by: deploy.sh\n' \
     "${COMMIT}" "$(date -u +%Y-%m-%d)" \
