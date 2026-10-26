@@ -145,6 +145,7 @@ WORK_DIR=""
 # chis rollback state — populated before yugo2-src is modified
 PREV_YUGO2_SHA=""
 PREV_PINNED_MD=""
+PINNED_CAPTURED=0
 
 if [[ -n "$PREV_IMAGE_ID" ]]; then
   docker tag "$PREV_IMAGE_ID" "$ROLLBACK_TAG"
@@ -191,7 +192,7 @@ rollback() {
     echo "ERROR: rollback compose returned 0 but ${CONTAINER_NAME} is not running — manual intervention required" >&2
     exit 1
   fi
-  if [[ -n "${PREV_IMAGE_ID:-}" && "$restored_image" != "$PREV_IMAGE_ID" ]]; then
+  if [[ "$restored_image" != "$PREV_IMAGE_ID" ]]; then
     echo "ERROR: rollback shows wrong image ${restored_image:0:12} (expected ${PREV_IMAGE_ID:0:12}) — manual intervention required" >&2
     exit 1
   fi
@@ -211,7 +212,7 @@ rollback() {
       echo "ERROR: yugo2-src checkout restore to ${PREV_YUGO2_SHA:0:12} failed — manual intervention required" >&2
       exit 1
     fi
-    if [[ -n "${PREV_PINNED_MD:-}" ]]; then
+    if [[ "$PINNED_CAPTURED" == "1" ]]; then
       if ! printf '%s' "${PREV_PINNED_MD}" | run_as_owner tee "${YUGO2_SRC_DIR}/PINNED.md" > /dev/null 2>/dev/null; then
         echo "ERROR: PINNED.md restore failed — manual intervention required" >&2
         exit 1
@@ -224,7 +225,7 @@ rollback() {
       echo "ERROR: yugo2-src rollback failed — git HEAD is ${restored_head:0:12}, expected ${PREV_YUGO2_SHA:0:12} — manual intervention required" >&2
       exit 1
     fi
-    if [[ -n "${PREV_PINNED_MD:-}" ]]; then
+    if [[ "$PINNED_CAPTURED" == "1" ]]; then
       local restored_pinned
       restored_pinned="$(run_as_owner cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null || true)"
       if [[ "$restored_pinned" != "$PREV_PINNED_MD" ]]; then
@@ -303,7 +304,7 @@ if [[ "$BOT" == "chis" ]]; then
     echo "ERROR: yugo2-src: rev-parse returned empty — cannot deploy" >&2
     exit 1
   }
-  PREV_PINNED_MD="$(run_as_owner cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null)" || {
+  PREV_PINNED_MD="$(run_as_owner cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null)" && PINNED_CAPTURED=1 || {
     echo "ERROR: yugo2-src: failed to read PINNED.md — cannot deploy without rollback capability" >&2
     exit 1
   }

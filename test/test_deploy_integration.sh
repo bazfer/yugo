@@ -817,7 +817,7 @@ test_chis_rollback_restores_source() {
   git -C "$yugo2_src" init -q 2>/dev/null || git -C "$yugo2_src" init 2>/dev/null
   git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
     commit --allow-empty -m "pre-deploy" -q 2>/dev/null
-  printf 'SHA: pre\nDate: 2026-01-01\n' > "$yugo2_src/PINNED.md"
+  > "$yugo2_src/PINNED.md"
   git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T add PINNED.md 2>/dev/null
   git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
     commit -m "add pinned" -q 2>/dev/null
@@ -912,7 +912,9 @@ STUBEOF
 }
 
 # ── deploy.sh: chis rollback must not claim success when restore fails ────────
-# PINS: immediate hard-fail when git checkout exits nonzero (not the read-back layer)
+# PINS: checkout exits nonzero → rollback fails with "manual intervention required".
+#       Assertion is satisfied by either the immediate hard-fail or the read-back path;
+#       the silent-checkout test above pins the read-back layer specifically.
 # MUTATION: Change the git checkout || { ... exit 1 } back to || echo WARNING
 # Expected colour: RED — "manual intervention required" absent from output
 
