@@ -784,6 +784,244 @@ STUBEOF
   fi
 }
 
+# ── deploy.sh: chis rollback restores yugo2-src ──────────────────────────────
+# MUTATION: Delete the chis restore-and-verify block from rollback() in
+#           scripts/deploy.sh (the "if [[ "$BOT" == "chis" ...fi" block before
+#           ROLLBACK COMPLETE, lines ~199-230)
+# Expected colour: RED — git HEAD stays at deploy SHA and PINNED.md has new
+#                  content because the rollback never ran the checkout
+
+test_chis_rollback_restores_source() {
+  local name="test_chis_rollback_restores_source"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local prev_commit="prevsha000000000000000000000000000000000"
+  local prev_id="sha256:oldbuild0000000000000000000000000000000000000000000000000000000000"
+  local build_id="sha256:newbuild1000000000000000000000000000000000000000000000000000000000"
+  local state="${tmpdir}/container_state"
+  local call_count="${tmpdir}/compose_call_count"
+  echo 0 > "$call_count"
+
+  # Real git repo: two commits so git checkout can move HEAD back to pre-deploy state.
+  local yugo2_src="${tmpdir}/yugo2-src"
+  mkdir -p "$yugo2_src"
+  git -C "$yugo2_src" init -q 2>/dev/null || git -C "$yugo2_src" init 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "pre-deploy" -q 2>/dev/null
+  printf 'SHA: pre\nDate: 2026-01-01\n' > "$yugo2_src/PINNED.md"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T add PINNED.md 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit -m "add pinned" -q 2>/dev/null
+  local prev_sha prev_pinned_content
+  prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  prev_pinned_content="$(cat "$yugo2_src/PINNED.md")"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "deploy-target" -q 2>/dev/null
+  local deploy_sha
+  deploy_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" checkout "$prev_sha" -q 2>/dev/null  # set starting state
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:?}
+    container_name: chis
+EOF
+
+  # git stub: intercepts fetch (no-op); passes everything else to real git
+  cat > "${tmpdir}/git" << 'STUBEOF'
+#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
+exec /usr/bin/git "$@"
+STUBEOF
+  chmod +x "${tmpdir}/git"
+
+  # docker stub: first compose up fails (deploy triggers rollback); second succeeds (rollback)
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+CALLS="${call_count}"
+STATE="${state}"
+PREV_ID="${prev_id}"
+PREV_COMMIT_SHA="${prev_commit}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    [[ "\$a" == "up" ]] || continue
+    count=\$(cat "\${CALLS}" 2>/dev/null || echo 0)
+    echo \$((count+1)) > "\${CALLS}"
+    if [[ \$((count+1)) -eq 1 ]]; then exit 1; fi
+    touch "\${STATE}"
+    exit 0
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ -f "\${STATE}" ]]; then
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+    else
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+    fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$deploy_sha" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
+    YUGO_SUDO_CHIS="none" \
+    YUGO_YUGO2_SRC="$yugo2_src" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>/dev/null || exit_code=$?
+
+  local actual_head actual_pinned
+  actual_head="$(git -C "$yugo2_src" rev-parse HEAD 2>/dev/null || true)"
+  actual_pinned="$(cat "$yugo2_src/PINNED.md" 2>/dev/null || true)"
+
+  if [[ $exit_code -ne 0 ]] \
+      && [[ "$actual_head" == "$prev_sha" ]] \
+      && [[ "$actual_pinned" == "$prev_pinned_content" ]]; then
+    pass "$name"
+  else
+    fail "$name" "chis rollback source restore wrong: exit=${exit_code}, head=${actual_head:0:12} (want ${prev_sha:0:12}), pinned_match=$([[ "$actual_pinned" == "$prev_pinned_content" ]] && echo yes || echo no)"
+  fi
+}
+
+# ── deploy.sh: chis rollback must not claim success when restore fails ────────
+# MUTATION: same as above — delete the chis restore-and-verify block
+# Expected colour: RED — script reaches ROLLBACK COMPLETE despite git checkout
+#                  never running (no restore, yet claims completion)
+
+test_chis_rollback_fails_on_restore_error() {
+  local name="test_chis_rollback_fails_on_restore_error"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local prev_commit="prevsha000000000000000000000000000000000"
+  local prev_id="sha256:oldbuild0000000000000000000000000000000000000000000000000000000000"
+  local build_id="sha256:newbuild1000000000000000000000000000000000000000000000000000000000"
+  local state="${tmpdir}/container_state"
+  local call_count="${tmpdir}/compose_call_count"
+  local checkout_count="${tmpdir}/checkout_count"
+  echo 0 > "$call_count"
+  echo 0 > "$checkout_count"
+
+  local yugo2_src="${tmpdir}/yugo2-src"
+  mkdir -p "$yugo2_src"
+  git -C "$yugo2_src" init -q 2>/dev/null || git -C "$yugo2_src" init 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "pre-deploy" -q 2>/dev/null
+  printf 'SHA: pre\nDate: 2026-01-01\n' > "$yugo2_src/PINNED.md"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T add PINNED.md 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit -m "add pinned" -q 2>/dev/null
+  local prev_sha
+  prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "deploy-target" -q 2>/dev/null
+  local deploy_sha
+  deploy_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" checkout "$prev_sha" -q 2>/dev/null
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:?}
+    container_name: chis
+EOF
+
+  # git stub: intercepts fetch (no-op); first checkout passes (deploy), second fails (rollback).
+  # Tracks checkout calls with a counter so only the rollback restore checkout fails.
+  cat > "${tmpdir}/git" << STUBEOF
+#!/usr/bin/env bash
+CKCOUNT="${checkout_count}"
+for a in "\$@"; do [[ "\$a" == "fetch" ]] && exit 0; done
+for a in "\$@"; do
+  if [[ "\$a" == "checkout" ]]; then
+    count=\$(cat "\${CKCOUNT}" 2>/dev/null || echo 0)
+    echo \$((count+1)) > "\${CKCOUNT}"
+    if [[ \$((count+1)) -ge 2 ]]; then exit 1; fi  # rollback checkout fails
+    break
+  fi
+done
+exec /usr/bin/git "\$@"
+STUBEOF
+  chmod +x "${tmpdir}/git"
+
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+CALLS="${call_count}"
+STATE="${state}"
+PREV_ID="${prev_id}"
+PREV_COMMIT_SHA="${prev_commit}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    [[ "\$a" == "up" ]] || continue
+    count=\$(cat "\${CALLS}" 2>/dev/null || echo 0)
+    echo \$((count+1)) > "\${CALLS}"
+    if [[ \$((count+1)) -eq 1 ]]; then exit 1; fi
+    touch "\${STATE}"
+    exit 0
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ -f "\${STATE}" ]]; then
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+    else
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+    fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  local output
+  output="$(PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$deploy_sha" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
+    YUGO_SUDO_CHIS="none" \
+    YUGO_YUGO2_SRC="$yugo2_src" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
+
+  if [[ $exit_code -ne 0 ]] && ! echo "$output" | grep -q "ROLLBACK COMPLETE"; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0 and no ROLLBACK COMPLETE; got exit=${exit_code}, rollback_complete_count=$(echo "$output" | grep -c "ROLLBACK COMPLETE" || echo 0)"
+  fi
+}
+
 # Run all tests
 test_preflight_rejects_build_form
 test_preflight_rejects_any_build_form
@@ -805,6 +1043,8 @@ test_compose_up_is_invoked
 test_compose_failure_triggers_rollback
 test_chis_deploy_updates_yugo2_src
 test_drift_check_fails_on_git_head_mismatch
+test_chis_rollback_restores_source
+test_chis_rollback_fails_on_restore_error
 
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
