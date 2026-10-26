@@ -227,7 +227,10 @@ rollback() {
     fi
     if [[ "$PINNED_CAPTURED" == "1" ]]; then
       local restored_pinned
-      restored_pinned="$(run_as_owner cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null || true)"
+      restored_pinned="$(run_as_owner cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null)" || {
+        echo "ERROR: PINNED.md rollback failed — cannot read back restored content — manual intervention required" >&2
+        exit 1
+      }
       if [[ "$restored_pinned" != "$PREV_PINNED_MD" ]]; then
         echo "ERROR: PINNED.md rollback failed — content mismatch — manual intervention required" >&2
         exit 1

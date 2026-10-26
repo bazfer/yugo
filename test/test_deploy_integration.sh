@@ -1282,6 +1282,152 @@ STUBEOF
   fi
 }
 
+# ── deploy.sh: chis rollback fails when PINNED.md read-back errors ────────────
+# PINS: the hard-fail on `restored_pinned=$(cat ...) || { exit 1 }` at the
+#       read-back in rollback(). PINNED_CAPTURED=1 so the cat is reached.
+#       cat succeeds on the first call (capture snapshot), fails on the second
+#       call (read-back verify), which is the unsafe case: an empty captured
+#       snapshot would have matched a failed read's empty result without this guard.
+# MUTATION: Change `|| { echo "ERROR: ... manual intervention required" >&2; exit 1 }`
+#           at the restored_pinned assignment back to `|| true`
+# Expected colour: RED — cat failure is swallowed; empty matches empty captured
+#                  snapshot; ROLLBACK COMPLETE fires despite unreadable file.
+
+test_chis_rollback_fails_when_pinned_readback_fails() {
+  local name="test_chis_rollback_fails_when_pinned_readback_fails"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local prev_commit="prevsha000000000000000000000000000000000"
+  local prev_id="sha256:oldbuild0000000000000000000000000000000000000000000000000000000000"
+  local build_id="sha256:newbuild1000000000000000000000000000000000000000000000000000000000"
+  local state="${tmpdir}/container_state"
+  local call_count="${tmpdir}/compose_call_count"
+  local cat_pinned_count="${tmpdir}/cat_pinned_count"
+  echo 0 > "$call_count"
+  echo 0 > "$cat_pinned_count"
+
+  # Real git repo: two commits so deploy can advance HEAD; rollback can request it back.
+  local yugo2_src="${tmpdir}/yugo2-src"
+  mkdir -p "$yugo2_src"
+  git -C "$yugo2_src" init -q 2>/dev/null || git -C "$yugo2_src" init 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "pre-deploy" -q 2>/dev/null
+  # Empty PINNED.md — worst case: failed read-back yields "" == "" without the guard
+  > "$yugo2_src/PINNED.md"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T add PINNED.md 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit -m "add pinned" -q 2>/dev/null
+  local prev_sha
+  prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "deploy-target" -q 2>/dev/null
+  local deploy_sha
+  deploy_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" checkout "$prev_sha" -q 2>/dev/null  # set starting state
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:?}
+    container_name: chis
+EOF
+
+  # cat stub: intercepts reads of PINNED.md; counts them.
+  # Call 1 (capture snapshot): succeeds, prints empty.
+  # Call 2 (read-back verify): exits 1 — simulates unreadable file after restore.
+  # All other cat calls pass through to /bin/cat.
+  cat > "${tmpdir}/cat" << STUBEOF
+#!/usr/bin/env bash
+COUNT_FILE="${cat_pinned_count}"
+PINNED_PATH="${yugo2_src}/PINNED.md"
+for a in "\$@"; do
+  if [[ "\$a" == "\${PINNED_PATH}" ]]; then
+    count=\$(cat "\${COUNT_FILE}" 2>/dev/null || echo 0)
+    echo \$((count+1)) > "\${COUNT_FILE}"
+    if [[ \$((count+1)) -ge 2 ]]; then
+      echo "cat: \${PINNED_PATH}: simulated read failure" >&2
+      exit 1
+    fi
+    exit 0  # first call: empty PINNED.md, exits 0
+  fi
+done
+exec /bin/cat "\$@"
+STUBEOF
+  chmod +x "${tmpdir}/cat"
+
+  # git stub: fetch=no-op; everything else passes to real git
+  cat > "${tmpdir}/git" << 'STUBEOF'
+#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
+exec /usr/bin/git "$@"
+STUBEOF
+  chmod +x "${tmpdir}/git"
+
+  # docker stub: first compose up fails (triggers rollback); second succeeds (rollback image restore)
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+CALLS="${call_count}"
+STATE="${state}"
+PREV_ID="${prev_id}"
+PREV_COMMIT_SHA="${prev_commit}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    [[ "\$a" == "up" ]] || continue
+    count=\$(cat "\${CALLS}" 2>/dev/null || echo 0)
+    echo \$((count+1)) > "\${CALLS}"
+    if [[ \$((count+1)) -eq 1 ]]; then exit 1; fi
+    touch "\${STATE}"
+    exit 0
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ -f "\${STATE}" ]]; then
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+    else
+      if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+      if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+      if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+      if [[ "\$fmt" == *"State.Running"* ]]; then echo "true"; exit 0; fi
+    fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  local output
+  output="$(PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$deploy_sha" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
+    YUGO_SUDO_CHIS="none" \
+    YUGO_YUGO2_SRC="$yugo2_src" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
+
+  # PINNED.md read-back fails → must exit nonzero with "manual intervention required".
+  # ROLLBACK COMPLETE must be absent — announcing success when the file is unreadable is wrong.
+  if [[ $exit_code -ne 0 ]] \
+      && echo "$output" | grep -qi "manual intervention required" \
+      && ! echo "$output" | grep -q "ROLLBACK COMPLETE"; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0, 'manual intervention required', no 'ROLLBACK COMPLETE'; got exit=${exit_code}, rollback_complete=$(echo "$output" | grep -c "ROLLBACK COMPLETE" || echo 0), output=${output}"
+  fi
+}
+
 # Run all tests
 test_preflight_rejects_build_form
 test_preflight_rejects_any_build_form
@@ -1307,6 +1453,7 @@ test_chis_rollback_restores_source
 test_chis_rollback_fails_on_restore_error
 test_chis_rollback_detects_silent_checkout_failure
 test_chis_deploy_refuses_when_snapshot_fails
+test_chis_rollback_fails_when_pinned_readback_fails
 
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
