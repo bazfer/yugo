@@ -1162,9 +1162,13 @@ STUBEOF
 }
 
 # ── deploy.sh: deploy refuses when yugo2-src snapshot cannot be captured ─────
-# MUTATION: Remove the hard-fail from PREV_YUGO2_SHA capture in deploy.sh
-#           (restore `|| true` so a failed rev-parse is swallowed instead of aborting)
-# Expected colour: RED — deploy proceeds instead of refusing; exit_code becomes 0
+# MUTATION: Replace all three `exit 1` in the snapshot section of deploy.sh
+#           (PREV_YUGO2_SHA capture, [[ -n ]] guard, and PINNED.md capture)
+#           with `:`, leaving the echoes intact.
+# Expected colour: RED — deploy proceeds to mutation phase; git checkout appears
+#                  in call log and actual_head moves to deploy_sha.
+# A string match on the error message would stay GREEN (echo is preserved);
+# this test asserts STATE (actual_head, call logs) so it does not.
 
 test_chis_deploy_refuses_when_snapshot_fails() {
   local name="test_chis_deploy_refuses_when_snapshot_fails"
@@ -1175,11 +1179,29 @@ test_chis_deploy_refuses_when_snapshot_fails() {
   local prev_commit="prevsha000000000000000000000000000000000"
   local prev_id="sha256:oldbuild0000000000000000000000000000000000000000000000000000000000"
   local build_id="sha256:newbuild1000000000000000000000000000000000000000000000000000000000"
-  local deploy_sha="deploysha00000000000000000000000000000000"
+  local git_log="${tmpdir}/git_calls"
+  local compose_log="${tmpdir}/compose_calls"
+  touch "$git_log" "$compose_log"
 
+  # Real git repo: two commits so actual_head is meaningful evidence.
+  # With the hard-fail intact: HEAD stays at prev_sha (deploy refused before checkout).
+  # With the mutation (exit 1 → :): deploy proceeds, checkout moves HEAD to deploy_sha.
   local yugo2_src="${tmpdir}/yugo2-src"
   mkdir -p "$yugo2_src"
-  printf 'SHA: %s\nDate: 2026-01-01\n' "$prev_commit" > "$yugo2_src/PINNED.md"
+  git -C "$yugo2_src" init -q 2>/dev/null || git -C "$yugo2_src" init 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "pre-deploy" -q 2>/dev/null
+  printf 'SHA: pre\nDate: 2026-01-01\n' > "$yugo2_src/PINNED.md"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T add PINNED.md 2>/dev/null
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit -m "add pinned" -q 2>/dev/null
+  local prev_sha
+  prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=T \
+    commit --allow-empty -m "deploy-target" -q 2>/dev/null
+  local deploy_sha
+  deploy_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" checkout "$prev_sha" -q 2>/dev/null  # HEAD at pre-deploy state
 
   cat > "${tmpdir}/compose.yml" << 'EOF'
 services:
@@ -1188,19 +1210,31 @@ services:
     container_name: chis
 EOF
 
-  # git stub: rev-parse always fails — snapshot capture must abort the deploy
-  cat > "${tmpdir}/git" << 'STUBEOF'
+  # git stub: fail rev-parse (forces snapshot abort); no-op fetch; log all calls;
+  # pass checkout and everything else to real git.
+  # This way: if deploy proceeds past the snapshot (mutation), checkout moves HEAD
+  # to deploy_sha and the call log records it — both are caught by assertions below.
+  cat > "${tmpdir}/git" << STUBEOF
 #!/usr/bin/env bash
-for a in "$@"; do [[ "$a" == "rev-parse" ]] && exit 1; done
-exec /usr/bin/git "$@"
+echo "git \$*" >> "${git_log}"
+for a in "\$@"; do [[ "\$a" == "rev-parse" ]] && exit 1; done
+for a in "\$@"; do [[ "\$a" == "fetch" ]] && exit 0; done
+exec /usr/bin/git "\$@"
 STUBEOF
   chmod +x "${tmpdir}/git"
 
-  # docker stub: container exists, compose-managed, at a different commit
+  # docker stub: container exists, compose-managed; logs compose up calls.
   cat > "${tmpdir}/docker" << STUBEOF
 #!/usr/bin/env bash
 PREV_ID="${prev_id}"
 PREV_COMMIT_SHA="${prev_commit}"
+COMPOSE_LOG="${compose_log}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    if [[ "\$a" == "up" ]]; then echo "compose up" >> "\${COMPOSE_LOG}"; exit 0; fi
+  done
+  exit 0
+fi
 [[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
 args=("\$@")
 for i in "\${!args[@]}"; do
@@ -1230,11 +1264,19 @@ STUBEOF
   local actual_head
   actual_head="$(git -C "$yugo2_src" rev-parse HEAD 2>/dev/null || echo "no-git")"
 
+  # Primary assertions — state, not exit code or message text:
+  # 1. git HEAD must still be at prev_sha — no mutation occurred
+  # 2. No git checkout in call log — deploy never reached the mutation phase
+  # 3. No docker compose up logged — deploy never reached restart
+  # Exit code is supporting evidence but not load-bearing: a script that swallows the
+  # hard-fail and then crashes elsewhere still exits nonzero.
   if [[ $exit_code -ne 0 ]] \
-      && echo "$output" | grep -qi "cannot deploy without rollback capability"; then
+      && [[ "$actual_head" == "$prev_sha" ]] \
+      && ! grep -q "checkout" "${git_log}" 2>/dev/null \
+      && ! grep -q "compose up" "${compose_log}" 2>/dev/null; then
     pass "$name"
   else
-    fail "$name" "expected refuse with rollback-capability error; got exit=${exit_code}, output=${output}"
+    fail "$name" "expected refuse before mutation: exit=${exit_code}, actual_head=${actual_head:0:12} (want ${prev_sha:0:12}), git_checkout=$(grep -c "checkout" "${git_log}" 2>/dev/null || echo 0), compose_up=$(grep -c "compose up" "${compose_log}" 2>/dev/null || echo 0)"
   fi
 }
 
