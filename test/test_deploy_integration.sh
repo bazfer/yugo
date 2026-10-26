@@ -1852,6 +1852,72 @@ test_yugo_git_chis_rejects_rev_parse_with_arg
 test_yugo_git_chis_rejects_fetch_with_arg
 test_yugo_git_chis_rejects_unknown_subcommand
 
+# ── scripts/yugo-git-chis: passing-path coverage ─────────────────────────────
+# These tests invoke the SHIPPED wrapper against a real git repository.
+# MUTATION CONTROL: replace scripts/yugo-git-chis with a deny-everything script
+# and all three must go RED — proving the real wrapper is under test, not a stub.
+
+test_yugo_git_chis_rev_parse_returns_head() {
+  local name="test_yugo_git_chis_rev_parse_returns_head"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  local src="${tmpdir}/src"
+  git -C "$tmpdir" init -q src
+  git -C "$src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "init"
+  local expected_sha; expected_sha="$(git -C "$src" rev-parse HEAD)"
+  local output exit_code=0
+  output="$(YUGO2_SRC_DIR="$src" bash "${SCRIPT_DIR}/scripts/yugo-git-chis" rev-parse 2>&1)" || exit_code=$?
+  if [[ $exit_code -eq 0 && "$output" == "$expected_sha" ]]; then
+    pass "$name"
+  else
+    fail "$name" "expected exit=0 and SHA ${expected_sha:0:12}; got exit=${exit_code}, output=${output}"
+  fi
+}
+
+test_yugo_git_chis_checkout_moves_head() {
+  local name="test_yugo_git_chis_checkout_moves_head"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  local src="${tmpdir}/src"
+  git -C "$tmpdir" init -q src
+  git -C "$src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "first"
+  local first_sha; first_sha="$(git -C "$src" rev-parse HEAD)"
+  git -C "$src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "second"
+  local second_sha; second_sha="$(git -C "$src" rev-parse HEAD)"
+  git -C "$src" checkout -q "$first_sha"
+  local exit_code=0
+  YUGO2_SRC_DIR="$src" bash "${SCRIPT_DIR}/scripts/yugo-git-chis" checkout "$second_sha" 2>/dev/null || exit_code=$?
+  local actual_head; actual_head="$(git -C "$src" rev-parse HEAD)"
+  if [[ $exit_code -eq 0 && "$actual_head" == "$second_sha" ]]; then
+    pass "$name"
+  else
+    fail "$name" "expected exit=0 and HEAD at ${second_sha:0:12}; got exit=${exit_code}, HEAD=${actual_head:0:12}"
+  fi
+}
+
+test_yugo_git_chis_fetch_succeeds() {
+  local name="test_yugo_git_chis_fetch_succeeds"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+  # Bare local origin so fetch has a reachable remote
+  git -C "$tmpdir" init -q --bare origin.git
+  local src="${tmpdir}/src"
+  git clone -q "${tmpdir}/origin.git" "$src"
+  git -C "$src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "init"
+  git -C "$src" push -q origin HEAD:main
+  local exit_code=0
+  YUGO2_SRC_DIR="$src" bash "${SCRIPT_DIR}/scripts/yugo-git-chis" fetch 2>/dev/null || exit_code=$?
+  if [[ $exit_code -eq 0 ]]; then
+    pass "$name"
+  else
+    fail "$name" "expected exit=0; got exit=${exit_code}"
+  fi
+}
+
+test_yugo_git_chis_rev_parse_returns_head
+test_yugo_git_chis_checkout_moves_head
+test_yugo_git_chis_fetch_succeeds
+
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"
 [[ $FAIL_COUNT -eq 0 ]] || exit 1
