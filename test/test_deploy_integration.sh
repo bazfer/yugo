@@ -527,8 +527,9 @@ for i in "\${!args[@]}"; do
       if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${COMMIT_SHA}"; exit 0; fi
       if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${BUILD_ID}"; exit 0; fi
       if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "yugo"; exit 0; fi
+    else
+      echo "Error: No such object: yugo-coordinator" >&2; exit 1
     fi
-    echo ""; exit 0
   fi
 done
 exit 0
@@ -705,8 +706,9 @@ for i in "\${!args[@]}"; do
       if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${COMMIT_SHA}"; exit 0; fi
       if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${BUILD_ID}"; exit 0; fi
       if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+    else
+      echo "Error: No such object: chis" >&2; exit 1
     fi
-    echo ""; exit 0
   fi
 done
 exit 0
@@ -1428,6 +1430,90 @@ STUBEOF
   fi
 }
 
+# ── deploy.sh: docker inspect daemon error refuses before mutating ─────────────
+# MUTATION: Restore `|| true` on the PREV_IMAGE_ID capture (replace the
+#           IMAGE_CAPTURED block with the original single-line capture).
+# Expected colour: RED — daemon error is swallowed, IMAGE_CAPTURED stays unset,
+#                  `set -u` fires on the first-cutover guard with an unbound-variable
+#                  error rather than the specific "docker inspect ... failed" message
+#                  this test requires. The error-message assertion is the discriminator.
+#
+# Docker stub: the initial inspect (--format {{.Image}}) exits 1 with a daemon error
+# that does NOT contain "No such object". All other calls succeed.
+# Assertions:
+#   1. exit_code != 0
+#   2. output contains "docker inspect.*failed" — the specific guard message
+#   3. no compose up in call log
+
+test_chis_deploy_refuses_on_docker_inspect_failure() {
+  local name="test_chis_deploy_refuses_on_docker_inspect_failure"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local build_id="sha256:chisbuild00000000000000000000000000000000000000000000000000000000"
+  local commit="dddddddddddddddddddddddddddddddddddddddd"
+  local compose_log="${tmpdir}/compose_calls"
+  local yugo2_src="${tmpdir}/yugo2-src"
+  mkdir -p "$yugo2_src"
+  touch "$compose_log"
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:-latest}
+    container_name: chis
+EOF
+
+  # Docker stub: initial inspect (--format {{.Image}}) exits 1 with daemon error.
+  # All other docker calls (tag, rmi, compose, other inspect formats) succeed.
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+COMPOSE_LOG="${compose_log}"
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    if [[ "\$a" == "up" ]]; then echo "compose up" >> "\${COMPOSE_LOG}"; exit 0; fi
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then
+      echo "Error: docker daemon timeout" >&2
+      exit 1
+    fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  local output
+  output="$(PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$commit" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
+    YUGO_SUDO_CHIS="none" \
+    YUGO_YUGO2_SRC="$yugo2_src" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
+
+  # Assertion 2 (error message) is the discriminating control: with the mutation
+  # (|| true), `set -u` fires on IMAGE_CAPTURED before this message can be emitted.
+  if [[ $exit_code -ne 0 ]] \
+      && echo "$output" | grep -q "docker inspect.*failed" \
+      && ! grep -q "compose up" "${compose_log}" 2>/dev/null; then
+    pass "$name"
+  else
+    fail "$name" "expected exit!=0, 'docker inspect.*failed' in output, no compose up; got exit=${exit_code}, compose_up=$(grep -c 'compose up' "${compose_log}" 2>/dev/null || echo 0), output=${output}"
+  fi
+}
+
 # Run all tests
 test_preflight_rejects_build_form
 test_preflight_rejects_any_build_form
@@ -1454,6 +1540,7 @@ test_chis_rollback_fails_on_restore_error
 test_chis_rollback_detects_silent_checkout_failure
 test_chis_deploy_refuses_when_snapshot_fails
 test_chis_rollback_fails_when_pinned_readback_fails
+test_chis_deploy_refuses_on_docker_inspect_failure
 
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

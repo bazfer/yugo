@@ -12,8 +12,14 @@
 # bazfer/yugo already granted by the workflow permissions block). For manual
 # or cron use, set a PAT with contents:read on bazfer/yugo.
 #
-# Requires sudoers rules for compose restart and git/tee operations.
-# See PR description for the exact rules required before running.
+# Requires sudoers rules for compose restart and git/tee/cat operations.
+# These grants are ABSENT as of 2026-10-26 (kat only has /usr/bin/apt-get).
+# All three deploys will fail-closed until they are added.
+# Exact entries (run `which cat` on Norstar to confirm /usr/bin/cat vs /bin/cat):
+#
+#   kat ALL=(root) NOPASSWD: /usr/bin/env
+#   kat ALL=(luna) NOPASSWD: /usr/bin/env, /usr/bin/git, /usr/bin/tee, /usr/bin/cat
+#   kat ALL=(deet) NOPASSWD: /usr/bin/env
 #
 # Environment overrides (testing):
 #   YUGO_COMPOSE_COORDINATOR / _CHIS / _ION   override compose file path
@@ -96,13 +102,28 @@ run_as_owner() {
 # exists but carries no compose project label, it was started outside compose.
 # The operator must stop and remove the old container manually once.
 
-PREV_IMAGE_ID="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}' 2>/dev/null || true)"
+IMAGE_CAPTURED=0
+PREV_IMAGE_ID=""
+_docker_inspect_err="$(mktemp)"
+if _img="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}' 2>"$_docker_inspect_err")"; then
+  PREV_IMAGE_ID="$_img"
+  IMAGE_CAPTURED=1
+else
+  _err="$(cat "$_docker_inspect_err")"
+  if ! echo "$_err" | grep -q "No such object"; then
+    echo "ERROR: docker inspect ${CONTAINER_NAME} --format {{.Image}} failed: ${_err}" >&2
+    rm -f "$_docker_inspect_err"
+    exit 1
+  fi
+  # Container does not exist — legitimate first deploy; IMAGE_CAPTURED stays 0.
+fi
+rm -f "$_docker_inspect_err"
 PREV_COMMIT="$(docker inspect "$CONTAINER_NAME" \
   --format '{{index .Config.Labels "codex.commit"}}' 2>/dev/null || true)"
 COMPOSE_PROJECT="$(docker inspect "$CONTAINER_NAME" \
   --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null || true)"
 
-if [[ -n "$PREV_IMAGE_ID" && -z "$COMPOSE_PROJECT" ]]; then
+if [[ "$IMAGE_CAPTURED" == "1" && -z "$COMPOSE_PROJECT" ]]; then
   echo "ERROR: ${CONTAINER_NAME} is running but was not started by docker compose." >&2
   echo "       Outgoing image: ${PREV_IMAGE_ID:0:12} (${PREV_COMMIT:-unlabeled})" >&2
   echo "       Before the first compose-managed deploy, record that image ref" >&2
@@ -147,7 +168,7 @@ PREV_YUGO2_SHA=""
 PREV_PINNED_MD=""
 PINNED_CAPTURED=0
 
-if [[ -n "$PREV_IMAGE_ID" ]]; then
+if [[ "$IMAGE_CAPTURED" == "1" ]]; then
   docker tag "$PREV_IMAGE_ID" "$ROLLBACK_TAG"
   echo "==> Rollback snapshot saved: ${PREV_COMMIT:-unlabeled} (${PREV_IMAGE_ID:0:12})"
 else
@@ -161,7 +182,7 @@ rollback() {
   trap - ERR
   echo "" >&2
   echo "ERROR: deploy failed — rolling back ${BOT}..." >&2
-  if [[ -z "${PREV_IMAGE_ID:-}" ]]; then
+  if [[ "$IMAGE_CAPTURED" != "1" ]]; then
     echo "ERROR: no rollback image available (bot was not running before deploy)" >&2
     exit 1
   fi
