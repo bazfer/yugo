@@ -28,23 +28,14 @@
 #
 # /usr/bin/git cannot be safely argument-restricted in sudoers: checkout
 # requires a variable SHA argument, and git runs arbitrary shell through
-# -c alias.x='!sh' x on any unrestricted call. Use a wrapper script owned
-# by luna (mode 0755) that validates the argument vector before delegating:
+# -c alias.x='!sh' x on any unrestricted call. A validation wrapper is used:
 #
-#   /home/luna/bots/chis/bin/yugo-git-chis:
-#   #!/usr/bin/env bash
-#   set -euo pipefail
-#   SRC=/home/luna/bots/chis/yugo2-src
-#   SAFE="-c safe.directory=${SRC} -C ${SRC}"
-#   case "${1:-}" in
-#     rev-parse) [[ $# -eq 2 && "$2" == "HEAD" ]] || exit 1
-#                exec /usr/bin/git ${SAFE} rev-parse HEAD ;;
-#     checkout)  [[ $# -eq 2 && "$2" =~ ^[0-9a-f]{7,40}$ ]] || exit 1
-#                exec /usr/bin/git ${SAFE} checkout "$2" ;;
-#     fetch)     [[ $# -eq 1 ]] || exit 1
-#                exec /usr/bin/git ${SAFE} fetch origin ;;
-#     *)         echo "denied: $*" >&2; exit 1 ;;
-#   esac
+# Wrapper source: scripts/yugo-git-chis (version 1) in this repo.
+# Install: copy to /home/luna/bots/chis/bin/yugo-git-chis, chown luna:luna,
+# chmod 0755. The installed file MUST be owned by luna and must NOT be
+# group- or world-writable — a wrapper that kat (the granted user) can
+# rewrite is not a restriction. Re-copy when the repo version changes;
+# the sudoers grant pins the path, not the content.
 #
 # Exact entries (paths confirmed on Norstar):
 #
