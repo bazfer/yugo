@@ -660,6 +660,9 @@ test_chis_deploy_updates_yugo2_src() {
   local state="${tmpdir}/container_state"
   local git_log="${tmpdir}/git_calls"
   mkdir -p "$yugo2_src"
+  # PINNED.md must exist so snapshot preflight does not abort the deploy.
+  printf 'SHA: prevsha0000000000000000000000000000000000\nDate: 2026-01-01\n' \
+    > "$yugo2_src/PINNED.md"
 
   cat > "${tmpdir}/compose.yml" << 'EOF'
 services:
@@ -787,9 +790,13 @@ STUBEOF
 # ── deploy.sh: chis rollback restores yugo2-src ──────────────────────────────
 # MUTATION: Delete the chis restore-and-verify block from rollback() in
 #           scripts/deploy.sh (the "if [[ "$BOT" == "chis" ...fi" block before
-#           ROLLBACK COMPLETE, lines ~199-230)
+#           ROLLBACK COMPLETE, lines ~199-235)
 # Expected colour: RED — git HEAD stays at deploy SHA and PINNED.md has new
-#                  content because the rollback never ran the checkout
+#                  content because the rollback never ran the checkout.
+#
+# Also pins: ROLLBACK COMPLETE must be announced only on verified success.
+# MUTATION: Delete the `echo "ROLLBACK COMPLETE: ..."` line from rollback()
+# Expected colour: RED — ROLLBACK COMPLETE absent from output
 
 test_chis_rollback_restores_source() {
   local name="test_chis_rollback_restores_source"
@@ -880,14 +887,15 @@ STUBEOF
   chmod +x "${tmpdir}/docker"
 
   local exit_code=0
-  PATH="${tmpdir}:${PATH}" \
+  local output
+  output="$(PATH="${tmpdir}:${PATH}" \
     GH_TOKEN="fake" \
     YUGO_COMMIT_OVERRIDE="$deploy_sha" \
     YUGO_BUILD_IMAGE_ID="$build_id" \
     YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
     YUGO_SUDO_CHIS="none" \
     YUGO_YUGO2_SRC="$yugo2_src" \
-    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>/dev/null || exit_code=$?
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   local actual_head actual_pinned
   actual_head="$(git -C "$yugo2_src" rev-parse HEAD 2>/dev/null || true)"
@@ -895,17 +903,18 @@ STUBEOF
 
   if [[ $exit_code -ne 0 ]] \
       && [[ "$actual_head" == "$prev_sha" ]] \
-      && [[ "$actual_pinned" == "$prev_pinned_content" ]]; then
+      && [[ "$actual_pinned" == "$prev_pinned_content" ]] \
+      && echo "$output" | grep -q "ROLLBACK COMPLETE"; then
     pass "$name"
   else
-    fail "$name" "chis rollback source restore wrong: exit=${exit_code}, head=${actual_head:0:12} (want ${prev_sha:0:12}), pinned_match=$([[ "$actual_pinned" == "$prev_pinned_content" ]] && echo yes || echo no)"
+    fail "$name" "chis rollback source restore wrong: exit=${exit_code}, head=${actual_head:0:12} (want ${prev_sha:0:12}), pinned_match=$([[ "$actual_pinned" == "$prev_pinned_content" ]] && echo yes || echo no), rollback_complete=$(echo "$output" | grep -c "ROLLBACK COMPLETE" || echo 0)"
   fi
 }
 
 # ── deploy.sh: chis rollback must not claim success when restore fails ────────
-# MUTATION: same as above — delete the chis restore-and-verify block
-# Expected colour: RED — script reaches ROLLBACK COMPLETE despite git checkout
-#                  never running (no restore, yet claims completion)
+# PINS: immediate hard-fail when git checkout exits nonzero (not the read-back layer)
+# MUTATION: Change the git checkout || { ... exit 1 } back to || echo WARNING
+# Expected colour: RED — "manual intervention required" absent from output
 
 test_chis_rollback_fails_on_restore_error() {
   local name="test_chis_rollback_fails_on_restore_error"
@@ -1015,14 +1024,16 @@ STUBEOF
     YUGO_YUGO2_SRC="$yugo2_src" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
-  if [[ $exit_code -ne 0 ]] && ! echo "$output" | grep -q "ROLLBACK COMPLETE"; then
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -qi "manual intervention required"; then
     pass "$name"
   else
-    fail "$name" "expected exit!=0 and no ROLLBACK COMPLETE; got exit=${exit_code}, rollback_complete_count=$(echo "$output" | grep -c "ROLLBACK COMPLETE" || echo 0)"
+    fail "$name" "expected exit!=0 and 'manual intervention required' in output; got exit=${exit_code}, output=${output}"
   fi
 }
 
 # ── deploy.sh: chis rollback detects silent checkout (reads back actual state) ──
+# PINS: read-back layer — catches a checkout that exits 0 but leaves the wrong HEAD
+# (an explicit checkout failure is also caught by this test, but the test above pins that path)
 # MUTATION: Delete only the "# Verify by reading back" block from rollback() in
 #           scripts/deploy.sh — the restored_head/restored_pinned comparisons and
 #           their exit-1 blocks, NOT the restore commands themselves.
@@ -1142,11 +1153,88 @@ STUBEOF
     bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
 
   # Checkout stub exits 0 but HEAD stays at deploy_sha.
-  # The read-back catches the mismatch and must exit 1 without printing ROLLBACK COMPLETE.
-  if [[ $exit_code -ne 0 ]] && ! echo "$output" | grep -q "ROLLBACK COMPLETE"; then
+  # The read-back catches the mismatch and must exit 1 with "manual intervention required".
+  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -qi "manual intervention required"; then
     pass "$name"
   else
-    fail "$name" "expected exit!=0 and no ROLLBACK COMPLETE (silent checkout should be caught by read-back); got exit=${exit_code}, rollback_complete=$(echo "$output" | grep -c "ROLLBACK COMPLETE" || echo 0)"
+    fail "$name" "expected exit!=0 and 'manual intervention required' in output (read-back should catch HEAD mismatch); got exit=${exit_code}, output=${output}"
+  fi
+}
+
+# ── deploy.sh: deploy refuses when yugo2-src snapshot cannot be captured ─────
+# MUTATION: Remove the hard-fail from PREV_YUGO2_SHA capture in deploy.sh
+#           (restore `|| true` so a failed rev-parse is swallowed instead of aborting)
+# Expected colour: RED — deploy proceeds instead of refusing; exit_code becomes 0
+
+test_chis_deploy_refuses_when_snapshot_fails() {
+  local name="test_chis_deploy_refuses_when_snapshot_fails"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local prev_commit="prevsha000000000000000000000000000000000"
+  local prev_id="sha256:oldbuild0000000000000000000000000000000000000000000000000000000000"
+  local build_id="sha256:newbuild1000000000000000000000000000000000000000000000000000000000"
+  local deploy_sha="deploysha00000000000000000000000000000000"
+
+  local yugo2_src="${tmpdir}/yugo2-src"
+  mkdir -p "$yugo2_src"
+  printf 'SHA: %s\nDate: 2026-01-01\n' "$prev_commit" > "$yugo2_src/PINNED.md"
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:?}
+    container_name: chis
+EOF
+
+  # git stub: rev-parse always fails — snapshot capture must abort the deploy
+  cat > "${tmpdir}/git" << 'STUBEOF'
+#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == "rev-parse" ]] && exit 1; done
+exec /usr/bin/git "$@"
+STUBEOF
+  chmod +x "${tmpdir}/git"
+
+  # docker stub: container exists, compose-managed, at a different commit
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+PREV_ID="${prev_id}"
+PREV_COMMIT_SHA="${prev_commit}"
+[[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${PREV_ID}"; exit 0; fi
+    if [[ "\$fmt" == *"codex.commit"* ]]; then echo "\${PREV_COMMIT_SHA}"; exit 0; fi
+    if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
+    echo ""; exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  local exit_code=0
+  local output
+  output="$(PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$deploy_sha" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
+    YUGO_SUDO_CHIS="none" \
+    YUGO_YUGO2_SRC="$yugo2_src" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>&1)" || exit_code=$?
+
+  local actual_head
+  actual_head="$(git -C "$yugo2_src" rev-parse HEAD 2>/dev/null || echo "no-git")"
+
+  if [[ $exit_code -ne 0 ]] \
+      && echo "$output" | grep -qi "cannot deploy without rollback capability"; then
+    pass "$name"
+  else
+    fail "$name" "expected refuse with rollback-capability error; got exit=${exit_code}, output=${output}"
   fi
 }
 
@@ -1174,6 +1262,7 @@ test_drift_check_fails_on_git_head_mismatch
 test_chis_rollback_restores_source
 test_chis_rollback_fails_on_restore_error
 test_chis_rollback_detects_silent_checkout_failure
+test_chis_deploy_refuses_when_snapshot_fails
 
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

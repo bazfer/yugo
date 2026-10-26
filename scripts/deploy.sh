@@ -196,9 +196,14 @@ rollback() {
     exit 1
   fi
 
-  # chis: restore yugo2-src to its pre-deploy state
-  # Image and source are one transition — same failure policy as the image check above.
-  if [[ "$BOT" == "chis" && -n "${PREV_YUGO2_SHA:-}" ]]; then
+  # chis: restore yugo2-src to its pre-deploy state.
+  # PREV_YUGO2_SHA is empty only when rollback fires before the snapshot section
+  # (e.g. build failed) — the source was not mutated in that case, so skip.
+  # If set, full restore with verification. Both halves are checked; a mismatch is manual.
+  if [[ "$BOT" == "chis" ]]; then
+  if [[ -z "${PREV_YUGO2_SHA:-}" ]]; then
+    echo "==> yugo2-src not mutated before failure — no source restore needed" >&2
+  else
     if ! run_as_owner git \
         -c "safe.directory=${YUGO2_SRC_DIR}" \
         -C "${YUGO2_SRC_DIR}" \
@@ -227,6 +232,7 @@ rollback() {
         exit 1
       fi
     fi
+  fi
   fi
 
   echo "ROLLBACK COMPLETE: ${BOT} restored to ${PREV_COMMIT:-unlabeled}" >&2
@@ -289,8 +295,18 @@ fi
 if [[ "$BOT" == "chis" ]]; then
   PREV_YUGO2_SHA="$(run_as_owner git \
     -c "safe.directory=${YUGO2_SRC_DIR}" \
-    -C "${YUGO2_SRC_DIR}" rev-parse HEAD 2>/dev/null || true)"
-  PREV_PINNED_MD="$(cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null || true)"
+    -C "${YUGO2_SRC_DIR}" rev-parse HEAD 2>/dev/null)" || {
+    echo "ERROR: yugo2-src: failed to read current HEAD — cannot deploy without rollback capability" >&2
+    exit 1
+  }
+  [[ -n "$PREV_YUGO2_SHA" ]] || {
+    echo "ERROR: yugo2-src: rev-parse returned empty — cannot deploy" >&2
+    exit 1
+  }
+  PREV_PINNED_MD="$(run_as_owner cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null)" || {
+    echo "ERROR: yugo2-src: failed to read PINNED.md — cannot deploy without rollback capability" >&2
+    exit 1
+  }
 
   echo "==> Updating yugo2-src to ${COMMIT:0:12}..."
   run_as_owner git \
