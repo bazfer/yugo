@@ -14,17 +14,48 @@
 #
 # Requires sudoers rules for compose restart and git/tee/cat operations.
 # These grants are ABSENT as of 2026-10-26 (kat only has /usr/bin/apt-get).
-# All three deploys will fail-closed until they are added.
+# All three deploys fail-closed until they are added.
 #
-# WARNING: env, sh, bash, find, vi and similar must NEVER appear in a sudoers
-# grant — each can launch arbitrary commands, making any such grant equivalent
-# to unrestricted access as the target user. Grant only exact binary paths.
+# WARNING: a sudoers entry is only as narrow as the most capable thing on it.
+# "Capable" means: can it start another program? env, sh, bash, find, vi, git,
+# awk, perl, python and docker can all launch arbitrary commands and must NEVER
+# appear as unrestricted grants. Grant only exact binary paths with pinned args.
+#
+# /usr/bin/docker cannot be meaningfully narrowed — docker as root is
+# root-equivalent by design (bind-mount of / reaches everything). The deploy
+# genuinely needs compose, so this grant is intentionally broad. State it
+# plainly so nobody later mistakes it for a scoped entry.
+#
+# /usr/bin/git cannot be safely argument-restricted in sudoers: checkout
+# requires a variable SHA argument, and git runs arbitrary shell through
+# -c alias.x='!sh' x on any unrestricted call. Use a wrapper script owned
+# by luna (mode 0755) that validates the argument vector before delegating:
+#
+#   /home/luna/bots/chis/bin/yugo-git-chis:
+#   #!/usr/bin/env bash
+#   set -euo pipefail
+#   SRC=/home/luna/bots/chis/yugo2-src
+#   SAFE="-c safe.directory=${SRC} -C ${SRC}"
+#   case "${1:-}" in
+#     rev-parse) [[ $# -eq 2 && "$2" == "HEAD" ]] || exit 1
+#                exec /usr/bin/git ${SAFE} rev-parse HEAD ;;
+#     checkout)  [[ $# -eq 2 && "$2" =~ ^[0-9a-f]{7,40}$ ]] || exit 1
+#                exec /usr/bin/git ${SAFE} checkout "$2" ;;
+#     fetch)     [[ $# -eq 1 ]] || exit 1
+#                exec /usr/bin/git ${SAFE} fetch origin ;;
+#     *)         echo "denied: $*" >&2; exit 1 ;;
+#   esac
+#
+# NOTE: deploy.sh currently calls /usr/bin/git directly via run_as_owner.
+# Before Fernando adds the grants below, deploy.sh must be updated to call
+# the wrapper instead — tracked as a separate code change. Adding the current
+# git calls to sudoers without the wrapper would restore an unrestricted grant.
 #
 # Exact entries (paths confirmed on Norstar):
 #
 #   Defaults:kat env_keep += "YUGO_IMAGE_TAG"
 #   kat ALL=(root) NOPASSWD: /usr/bin/docker
-#   kat ALL=(luna) NOPASSWD: /usr/bin/docker, /usr/bin/git, /usr/bin/tee /home/luna/bots/chis/yugo2-src/PINNED.md, /usr/bin/cat /home/luna/bots/chis/yugo2-src/PINNED.md
+#   kat ALL=(luna) NOPASSWD: /usr/bin/docker, /home/luna/bots/chis/bin/yugo-git-chis, /usr/bin/tee /home/luna/bots/chis/yugo2-src/PINNED.md, /usr/bin/cat /home/luna/bots/chis/yugo2-src/PINNED.md
 #   kat ALL=(deet) NOPASSWD: /usr/bin/docker
 #
 # Environment overrides (testing):
