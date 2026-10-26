@@ -528,7 +528,7 @@ for i in "\${!args[@]}"; do
       if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${BUILD_ID}"; exit 0; fi
       if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "yugo"; exit 0; fi
     else
-      echo "Error: No such object: yugo-coordinator" >&2; exit 1
+      echo "error: no such object: yugo-coordinator" >&2; exit 1
     fi
   fi
 done
@@ -707,7 +707,7 @@ for i in "\${!args[@]}"; do
       if [[ "\$fmt" == *".Image"* && "\$fmt" != *"Labels"* ]]; then echo "\${BUILD_ID}"; exit 0; fi
       if [[ "\$fmt" == *"com.docker.compose.project"* ]]; then echo "chis"; exit 0; fi
     else
-      echo "Error: No such object: chis" >&2; exit 1
+      echo "error: no such object: chis" >&2; exit 1
     fi
   fi
 done
@@ -1439,7 +1439,7 @@ STUBEOF
 #                  this test requires. The error-message assertion is the discriminator.
 #
 # Docker stub: the initial inspect (--format {{.Image}}) exits 1 with a daemon error
-# that does NOT contain "No such object". All other calls succeed.
+# that does NOT contain "no such object". All other calls succeed.
 # Assertions:
 #   1. exit_code != 0
 #   2. output contains "docker inspect.*failed" — the specific guard message
@@ -1514,6 +1514,111 @@ STUBEOF
   fi
 }
 
+# MUTATION CONTROL for test_chis_deploy_refuses_on_docker_inspect_failure:
+# Stub emits docker's real lowercase "error: no such object: chis" text →
+# deploy must treat this as absent-container (not daemon-error) and proceed.
+# Expected colour: GREEN (first deploy allowed); mutant (grep without -i): RED.
+#
+# Stub is stateful: pre-compose-up all inspects simulate absent container
+# (Image exits 1 "no such object", others return ""). Post-compose-up the
+# container is running at the deployed commit. This prevents the idempotency
+# check (PREV_COMMIT == COMMIT) from short-circuiting before compose up runs.
+test_chis_first_deploy_allowed_on_no_such_object() {
+  local name="test_chis_first_deploy_allowed_on_no_such_object"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap "rm -rf '$tmpdir'" RETURN
+
+  local build_id="sha256:chisfirst00000000000000000000000000000000000000000000000000000000"
+  local compose_log="${tmpdir}/compose_calls"
+  local yugo2_src="${tmpdir}/yugo2-src"
+  touch "$compose_log"
+
+  # Real git repo: two commits — HEAD at prev_sha, deploy_sha one ahead
+  mkdir -p "$yugo2_src"
+  git -C "$yugo2_src" init -q
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "a"
+  local prev_sha; prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  printf 'SHA: %s\n' "$prev_sha" > "$yugo2_src/PINNED.md"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t add PINNED.md
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t commit -m "pin"
+  prev_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" -c user.email=t@t.com -c user.name=t commit --allow-empty -m "b"
+  local deploy_sha; deploy_sha="$(git -C "$yugo2_src" rev-parse HEAD)"
+  git -C "$yugo2_src" checkout -q "$prev_sha"
+  # commit = deploy_sha: the actual SHA that deploy.sh will checkout in yugo2-src
+  local commit="$deploy_sha"
+
+  cat > "${tmpdir}/compose.yml" << 'EOF'
+services:
+  bot:
+    image: chis-bot:${YUGO_IMAGE_TAG:?}
+    container_name: chis
+EOF
+
+  # Stateful docker stub: pre-compose-up, no container exists.
+  # After compose up writes to compose_log, container is running at commit.
+  cat > "${tmpdir}/docker" << STUBEOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "compose" ]]; then
+  for a in "\$@"; do
+    if [[ "\$a" == "up" ]]; then echo "compose up" >> "${compose_log}"; fi
+  done
+  exit 0
+fi
+[[ "\${1:-}" == "tag" || "\${1:-}" == "rmi" ]] && exit 0
+args=("\$@")
+for i in "\${!args[@]}"; do
+  if [[ "\${args[\$i]}" == "--format" ]]; then
+    fmt="\${args[\$((\$i+1))]}"
+    # Pre-deploy: no container. Post-deploy (compose up ran): container live.
+    if grep -q "compose up" "${compose_log}" 2>/dev/null; then
+      case "\$fmt" in
+        *".Image"*)   echo "${build_id}" ;;
+        *"State.Running"*) echo "true" ;;
+        *"codex.commit"*) echo "${commit}" ;;
+        *) echo "" ;;
+      esac
+    else
+      case "\$fmt" in
+        *".Image"*)   echo "error: no such object: chis" >&2; exit 1 ;;
+        *) echo "" ;;
+      esac
+    fi
+    exit 0
+  fi
+done
+exit 0
+STUBEOF
+  chmod +x "${tmpdir}/docker"
+
+  # Git stub: no-op fetch, real git otherwise
+  cat > "${tmpdir}/git" << 'STUBEOF'
+#!/usr/bin/env bash
+for a in "$@"; do [[ "$a" == "fetch" ]] && exit 0; done
+exec /usr/bin/git "$@"
+STUBEOF
+  chmod +x "${tmpdir}/git"
+
+  local exit_code=0
+  PATH="${tmpdir}:${PATH}" \
+    GH_TOKEN="fake" \
+    YUGO_COMMIT_OVERRIDE="$commit" \
+    YUGO_BUILD_IMAGE_ID="$build_id" \
+    YUGO_COMPOSE_CHIS="${tmpdir}/compose.yml" \
+    YUGO_SUDO_CHIS="none" \
+    YUGO_YUGO2_SRC="$yugo2_src" \
+    bash "${SCRIPT_DIR}/scripts/deploy.sh" chis 2>/dev/null || exit_code=$?
+
+  local compose_reached=0
+  grep -q "compose up" "${compose_log}" 2>/dev/null && compose_reached=1 || true
+  if [[ $exit_code -eq 0 && $compose_reached -eq 1 ]]; then
+    pass "$name"
+  else
+    fail "$name" "expected exit=0 and compose up reached; got exit=${exit_code}, compose_reached=${compose_reached}"
+  fi
+}
+
 # Run all tests
 test_preflight_rejects_build_form
 test_preflight_rejects_any_build_form
@@ -1541,6 +1646,7 @@ test_chis_rollback_detects_silent_checkout_failure
 test_chis_deploy_refuses_when_snapshot_fails
 test_chis_rollback_fails_when_pinned_readback_fails
 test_chis_deploy_refuses_on_docker_inspect_failure
+test_chis_first_deploy_allowed_on_no_such_object
 
 echo ""
 echo "Results: ${PASS_COUNT} passed, ${FAIL_COUNT} failed"

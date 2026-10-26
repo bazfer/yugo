@@ -110,7 +110,9 @@ if _img="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}' 2>"$_docker_in
   IMAGE_CAPTURED=1
 else
   _err="$(cat "$_docker_inspect_err")"
-  if ! echo "$_err" | grep -q "No such object"; then
+  # Pattern matched against docker's actual stderr — must be re-verified on Docker upgrade.
+  # Docker 29.x writes: "error: no such object: <name>" (all lowercase).
+  if ! echo "$_err" | grep -qi "no such object"; then
     echo "ERROR: docker inspect ${CONTAINER_NAME} --format {{.Image}} failed: ${_err}" >&2
     rm -f "$_docker_inspect_err"
     exit 1
