@@ -552,7 +552,9 @@ STUBEOF
 }
 
 # ── deploy.sh: compose failure triggers rollback ──────────────────────────────
-# Mutation: make rollback() a no-op → test goes RED (no ROLLBACK in output).
+# MUTATION: Replace the body of rollback() with `echo "ROLLBACK COMPLETE" >&2; exit 1`
+# Expected colour: RED — no compose up is called, STATE file never created, state
+# assertion fails. A string match on "ROLLBACK" would stay GREEN; this test does not.
 
 test_compose_failure_triggers_rollback() {
   local name="test_compose_failure_triggers_rollback"
@@ -624,10 +626,22 @@ STUBEOF
     YUGO_SUDO_COORDINATOR="none" \
     bash "${SCRIPT_DIR}/scripts/deploy.sh" coordinator 2>&1)" || exit_code=$?
 
-  if [[ $exit_code -ne 0 ]] && echo "$output" | grep -qi "ROLLBACK"; then
+  # Assert restored STATE, not output strings:
+  # 1. Script exited nonzero (deploy reported failure)
+  # 2. STATE file exists — rollback's compose up ran (stub only sets it on 2nd up call)
+  # 3. Container is "running" with the prev image ID (from stub when STATE exists)
+  local final_image=""
+  if [[ -f "${state}" ]]; then
+    # Read image from stub: when STATE exists, stub returns PREV_ID for .Image queries
+    final_image="$(PATH="${tmpdir}:${PATH}" docker inspect yugo-coordinator \
+      --format '{{.Image}}' 2>/dev/null || true)"
+  fi
+  if [[ $exit_code -ne 0 ]] \
+      && [[ -f "${state}" ]] \
+      && [[ "$final_image" == "$prev_id" ]]; then
     pass "$name"
   else
-    fail "$name" "expected non-zero exit with ROLLBACK in output; got exit=${exit_code}, output=${output}"
+    fail "$name" "rollback state wrong: exit=${exit_code}, state_file=$(ls "${state}" 2>/dev/null || echo MISSING), final_image=${final_image:-NONE} (want prev_id=${prev_id:0:16})"
   fi
 }
 

@@ -197,15 +197,35 @@ rollback() {
   fi
 
   # chis: restore yugo2-src to its pre-deploy state
+  # Image and source are one transition — same failure policy as the image check above.
   if [[ "$BOT" == "chis" && -n "${PREV_YUGO2_SHA:-}" ]]; then
-    run_as_owner git \
-      -c "safe.directory=${YUGO2_SRC_DIR}" \
-      -C "${YUGO2_SRC_DIR}" \
-      checkout "${PREV_YUGO2_SHA}" 2>/dev/null >&2 || \
-      echo "WARNING: yugo2-src restore to ${PREV_YUGO2_SHA:0:12} failed — manual check required" >&2
+    if ! run_as_owner git \
+        -c "safe.directory=${YUGO2_SRC_DIR}" \
+        -C "${YUGO2_SRC_DIR}" \
+        checkout "${PREV_YUGO2_SHA}" 2>/dev/null >&2; then
+      echo "ERROR: yugo2-src checkout restore to ${PREV_YUGO2_SHA:0:12} failed — manual intervention required" >&2
+      exit 1
+    fi
     if [[ -n "${PREV_PINNED_MD:-}" ]]; then
-      printf '%s' "${PREV_PINNED_MD}" | run_as_owner tee "${YUGO2_SRC_DIR}/PINNED.md" > /dev/null 2>/dev/null || \
-        echo "WARNING: PINNED.md restore failed" >&2
+      if ! printf '%s' "${PREV_PINNED_MD}" | run_as_owner tee "${YUGO2_SRC_DIR}/PINNED.md" > /dev/null 2>/dev/null; then
+        echo "ERROR: PINNED.md restore failed — manual intervention required" >&2
+        exit 1
+      fi
+    fi
+    # Verify by reading back — a write returning 0 is not the same as the right value being there.
+    local restored_head
+    restored_head="$(run_as_owner git -c "safe.directory=${YUGO2_SRC_DIR}" -C "${YUGO2_SRC_DIR}" rev-parse HEAD 2>/dev/null || true)"
+    if [[ "$restored_head" != "$PREV_YUGO2_SHA" ]]; then
+      echo "ERROR: yugo2-src rollback failed — git HEAD is ${restored_head:0:12}, expected ${PREV_YUGO2_SHA:0:12} — manual intervention required" >&2
+      exit 1
+    fi
+    if [[ -n "${PREV_PINNED_MD:-}" ]]; then
+      local restored_pinned
+      restored_pinned="$(run_as_owner cat "${YUGO2_SRC_DIR}/PINNED.md" 2>/dev/null || true)"
+      if [[ "$restored_pinned" != "$PREV_PINNED_MD" ]]; then
+        echo "ERROR: PINNED.md rollback failed — content mismatch — manual intervention required" >&2
+        exit 1
+      fi
     fi
   fi
 
