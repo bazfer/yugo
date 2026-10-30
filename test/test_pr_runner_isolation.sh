@@ -7,9 +7,20 @@
 # mutation that would make it fail.
 #
 # Run:  bash test/test_pr_runner_isolation.sh
-# >>> VENDOR-LOCAL BEGIN — this block is repo-specific; see the note below
+# >>> VENDOR-LOCAL BEGIN
 # CI:   invoked by .github/workflows/ci.yml (pr-runner-isolation job)
 # <<< VENDOR-LOCAL END
+#
+# The two sentinel lines above are deliberately SHORT and PURE ASCII, and
+# carry no prose. An earlier revision put an explanation on the BEGIN line and
+# used an em dash (U+2014, three bytes of UTF-8) inside it. A sentinel that
+# must be byte-identical across repositories should not contain a character
+# that re-encoding, an editor's smart-punctuation substitution, a
+# locale-dependent tool or a copy-paste through a normaliser can alter, and it
+# should not contain a sentence anybody might be tempted to reword. The
+# failure would not be a security hole — a validator that fails closed reads a
+# mangled sentinel as missing and refuses — but it would present as an
+# unexplained CI failure in a file nobody touched. Ohm proposed this shape.
 #
 # Everything OUTSIDE the VENDOR-LOCAL block above is governed by the canonical
 # upstream, artifice-ia/codex-container, and must not be edited in a vendored
@@ -27,6 +38,7 @@
 # the region outside the markers covers all the logic and ignores exactly the
 # part meant to differ. Keep the marker lines byte-identical across copies, or
 # the region cannot be located.
+
 
 set -uo pipefail
 
