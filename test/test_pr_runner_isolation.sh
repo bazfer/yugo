@@ -7,7 +7,7 @@
 # mutation that would make it fail.
 #
 # Run:  bash test/test_pr_runner_isolation.sh
-# CI:   invoked by .github/workflows/test.yml
+# CI:   invoked by .github/workflows/ci.yml (pr-runner-isolation job)
 
 set -uo pipefail
 
