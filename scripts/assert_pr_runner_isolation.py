@@ -124,6 +124,24 @@ except ModuleNotFoundError:
 # enumerated, dated, and cited, and the rule for changing it is in
 # MAINTENANCE below.
 #
+# THIS FILE IS CANONICAL. It is vendored into other repositories, currently
+# bazfer/yugo, as a reviewed copy. The rule, decided by Ohm on 2026-10-30 when
+# the second copy appeared:
+#
+#   - This repository is the single upstream. A behaviour change lands HERE
+#     first, reviewed, and reaches the other copies as a sync PR that is also
+#     reviewed. Do not edit a vendored copy directly; the divergence is
+#     invisible until the two disagree about a real workflow.
+#   - The catalogue stays VENDORED, never fetched at run time. Reading GitHub's
+#     published list during CI would make an external page a build dependency,
+#     so a documentation edit or an outage could break or silently weaken every
+#     pull request. A dated copy that fails loudly when stale is the better
+#     trade.
+#   - A sync PR says which upstream commit it carries, so the copy's provenance
+#     is readable without a diff.
+#
+# Known copies, to update when syncing: bazfer/yugo scripts/assert_pr_runner_isolation.py
+#
 # MAINTENANCE. When GitHub publishes a new image, add its label here and move
 # the date. Read it off one of the two URLs above; do not infer it from a
 # pattern and do not add a label because a workflow wants one. A label absent
