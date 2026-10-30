@@ -432,7 +432,7 @@ jobs:
       - name: Install PyYAML
         run: pip install pyyaml
       - name: Assert PR workflows use GitHub-hosted runners
-        run: python3 scripts/assert_pr_runner_isolation.py .github/workflows/
+        run: python3 scripts/assert_pr_runner_isolation.py
 
   fleet-bus-docs:
     # The deploy doc shipped with three double-backslash line continuations, which is
