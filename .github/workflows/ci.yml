@@ -409,6 +409,26 @@ jobs:
       - name: Run deploy integration tests
         run: bash test/test_deploy_integration.sh
 
+  pr-runner-isolation:
+    # Refuses any pull_request or pull_request_target workflow whose job does
+    # not positively select a GitHub-hosted runner. runner-3 (norstar-yugo-1)
+    # runs as kat in the docker group — root-equivalent access to norstar and
+    # the fleet's secrets. A self-hosted runner on a PR job would let untrusted
+    # fork code reach that access. This is a fail-closed allowlist, so an
+    # unrecognised label is UNVERIFIED and refused rather than assumed safe.
+    # Runs unconditionally on every PR — a new workflow file in any commit
+    # must pass this check regardless of which paths changed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PyYAML
+        run: pip install pyyaml
+      - name: Assert PR workflows use GitHub-hosted runners
+        run: python3 scripts/assert_pr_runner_isolation.py .github/workflows/
+
   fleet-bus-docs:
     # The deploy doc shipped with three double-backslash line continuations, which is
     # broken shell: the central deploy command would not have run. Two reviewers read it
