@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, norstar]
+    runs-on: [self-hosted, norstar, yugo]
     # GH_TOKEN: automatic job token (github.token). All pipeline calls target
     # bazfer/yugo with contents:read — already granted above. No repo secret
     # needed. Scripts keep reading GH_TOKEN from env so manual/cron runs still
