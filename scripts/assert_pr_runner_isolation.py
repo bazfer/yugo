@@ -124,6 +124,39 @@ except ModuleNotFoundError:
 # enumerated, dated, and cited, and the rule for changing it is in
 # MAINTENANCE below.
 #
+# CANONICAL SOURCE: artifice-ia/codex-container, path
+# scripts/assert_pr_runner_isolation.py. Named absolutely, never as "this file"
+# or "this repository" — the previous wording said "THIS FILE IS CANONICAL" and
+# "a change lands HERE", which is true in the upstream repository and becomes
+# FALSE the moment the file is vendored, because the copy then claims to be
+# canonical. Ohm caught that, and it is the same defect as the CI-reference
+# header below: a repository-relative claim inside a file designed to be
+# copied. I committed it in the very change that fixed the other instance.
+#
+# The rule, decided by Ohm on 2026-10-30 when the second copy appeared:
+#
+#   - artifice-ia/codex-container is the single upstream. A behaviour change
+#     lands there first, reviewed, and reaches the copies as a reviewed sync PR
+#     that names the upstream commit it carries. Do not edit a vendored copy
+#     directly; the divergence is invisible until the two disagree about a real
+#     workflow.
+#   - THE ONLY PERMITTED LOCAL EXCEPTION is the block between the
+#     `VENDOR-LOCAL BEGIN` and `VENDOR-LOCAL END` markers in the test suites,
+#     which names the workflow that runs them and cannot be shared between
+#     repositories. That region is comments only. Nothing else in a vendored
+#     copy may differ, and no new exception is created by editing a copy.
+#   - The catalogue stays VENDORED, never fetched at run time. Reading GitHub's
+#     published list during CI would make an external page a build dependency,
+#     so a documentation edit or an outage could break or silently weaken every
+#     pull request. A dated copy that fails loudly when stale is the better
+#     trade.
+#   - An integrity manifest in a vendored repository hashes this checker whole,
+#     and hashes the test suites over the region OUTSIDE the markers. It
+#     detects unacknowledged edits. It does NOT detect staleness, and it does
+#     not defend against a change that edits the manifest in the same commit.
+#
+# Known copies, to update when syncing: bazfer/yugo scripts/assert_pr_runner_isolation.py
+#
 # MAINTENANCE. When GitHub publishes a new image, add its label here and move
 # the date. Read it off one of the two URLs above; do not infer it from a
 # pattern and do not add a label because a workflow wants one. A label absent

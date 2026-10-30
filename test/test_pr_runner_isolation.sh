@@ -7,7 +7,26 @@
 # mutation that would make it fail.
 #
 # Run:  bash test/test_pr_runner_isolation.sh
+# >>> VENDOR-LOCAL BEGIN — this block is repo-specific; see the note below
 # CI:   invoked by .github/workflows/ci.yml (pr-runner-isolation job)
+# <<< VENDOR-LOCAL END
+#
+# Everything OUTSIDE the VENDOR-LOCAL block above is governed by the canonical
+# upstream, artifice-ia/codex-container, and must not be edited in a vendored
+# copy — a change lands upstream first and arrives as a reviewed sync PR. See
+# the canonical-source block in scripts/assert_pr_runner_isolation.py.
+#
+# The block INSIDE the markers is local by design, because it names a workflow
+# in the repository that holds this file and that name cannot be shared. A
+# vendored copy edits it and only it.
+#
+# WHY THE MARKERS EXIST. An integrity manifest that hashes this file whole
+# would flag that one necessarily-different line on every run, forever, and the
+# natural response to a check that cries wolf is to drop the file from the
+# manifest — losing the guard on every other line to tolerate one. Hashing
+# the region outside the markers covers all the logic and ignores exactly the
+# part meant to differ. Keep the marker lines byte-identical across copies, or
+# the region cannot be located.
 
 set -uo pipefail
 
