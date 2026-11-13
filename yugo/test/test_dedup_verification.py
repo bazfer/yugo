@@ -1129,31 +1129,53 @@ def test_resolve_uuids_falls_back_to_run_udev_when_dev_disk_is_empty(environment
 
 
 def test_resolve_uuids_primary_wins_over_fallback(environment, monkeypatch, tmp_path):
-    """Primary returns a UUID → fallback not consulted (same UUID either way, but
-    we prove the order by giving them DIFFERENT UUIDs and asserting we got the
-    primary's)."""
+    """When the primary /dev/disk/by-uuid scan DOES return a match, the
+    /run/udev fallback must not be consulted.
+
+    Fixtures are set so primary and fallback would return DIFFERENT UUIDs
+    — if the fallback ever ran, we'd see the fallback UUID in the result.
+    Primary is simulated by patching `Path.iterdir` and the mock entry's
+    `.stat().st_rdev` so the resolver's existing kernel-identity check
+    (`entry.stat().st_rdev == device`) fires against the production code
+    path. We do NOT replace resolve_uuids itself; we feed its primary
+    branch inputs that make it return a match.
+    """
     e = environment
-    stat = os.stat(e.store)
-    major, minor = os.major(stat.st_dev), os.minor(stat.st_dev)
-    # Primary: a fake /dev/disk/by-uuid-style directory with a symlink that
-    # resolves to a st_rdev we control via monkeypatch is awkward. Simpler:
-    # patch resolve_uuids internals by replacing UUID_DIRECTORY scanning via
-    # monkeypatch of Path.iterdir is heavy; instead, stub resolve_uuids
-    # indirectly by setting UUID_DIRECTORY to a dir whose single entry's
-    # stat().st_rdev MATCHES the store's st_dev.
+    stat_store = os.stat(e.store)
+    major, minor = os.major(stat_store.st_dev), os.minor(stat_store.st_dev)
+
+    class _FakeStat:
+        def __init__(self, rdev): self.st_rdev = rdev
+
+    class _FakeEntry:
+        def __init__(self, name, rdev):
+            self.name = name
+            self._rdev = rdev
+        def stat(self):
+            return _FakeStat(self._rdev)
+
+    primary_hit = "11111111-1111-4111-8111-111111111111"
+    fallback_hit = "fb000000-0000-4000-8000-000000000001"
+
     primary_root = tmp_path / "by-uuid"
     primary_root.mkdir()
-    primary_entry = primary_root / "11111111-1111-4111-8111-111111111111"
-    # Make the entry a hardlink to the store so stat().st_rdev shares st_dev.
-    # BUT st_rdev of a regular file is 0, not the device number. So to make
-    # the primary path return anything, we'd need a device node. That's
-    # privileged. Instead, assert the fallback path WHEN primary is empty.
     monkeypatch.setattr(v, "UUID_DIRECTORY", str(primary_root))
+
+    # Only yield the fake entry for scans of the patched UUID_DIRECTORY.
+    real_iterdir = Path.iterdir
+    def fake_iterdir(self):
+        if str(self) == str(primary_root):
+            return iter([_FakeEntry(primary_hit, stat_store.st_dev)])
+        return real_iterdir(self)
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+    # Fallback would report a DIFFERENT UUID if it were consulted.
     udev_root = tmp_path / "run-udev"
-    _write_udev_record(udev_root, major, minor, "fb000000-0000-4000-8000-000000000001")
+    _write_udev_record(udev_root, major, minor, fallback_hit)
     monkeypatch.setattr(v, "UDEV_DATA_DIRECTORY", str(udev_root / "data"))
-    # Primary dir exists but has no entry matching st_rdev → fallback fires.
-    assert v.resolve_uuids(stat.st_dev) == ["fb000000-0000-4000-8000-000000000001"]
+
+    assert v.resolve_uuids(stat_store.st_dev) == [primary_hit], \
+        "fallback must not be consulted when primary returns a match"
 
 
 def test_check_device_no_udev_record_names_the_bind_mount(environment, monkeypatch, tmp_path):
@@ -1209,9 +1231,18 @@ def test_provision_binding_uuid_refuses_when_no_uuid_resolvable(environment, mon
 
 
 def test_provision_binding_devno_pins_to_boot_id_even_if_uuid_resolvable(environment, monkeypatch, tmp_path):
-    """--binding devno is an explicit opt-out from uuid binding."""
+    """--binding devno is an explicit opt-out from uuid binding.
+
+    `admin` imports `resolve_uuids` by name (`from dedup_verification
+    import ... resolve_uuids`), so admin holds its OWN binding and a
+    `monkeypatch.setattr(v, "resolve_uuids", ...)` does not affect it.
+    Patch `admin.resolve_uuids` directly so the production binding
+    the provisioning code calls really returns a UUID — otherwise
+    this test passes vacuously (no UUID reaches provisioning, devno
+    is what would've emitted anyway).
+    """
     stub_uuid = "abcd1234-5678-4abc-9def-000011112222"
-    monkeypatch.setattr(v, "resolve_uuids", lambda dev: [stub_uuid])
+    monkeypatch.setattr(admin, "resolve_uuids", lambda dev: [stub_uuid])
     store = tmp_path / "s.sqlite"
     record = tmp_path / "r.json"
     evidence = dict(environment.evidence)
@@ -1222,6 +1253,48 @@ def test_provision_binding_devno_pins_to_boot_id_even_if_uuid_resolvable(environ
     assert data["device"]["binding"] == "devno"
     assert "fs_uuid" not in data["device"]
     assert data["device"]["attested_boot_id"] == BOOT
+
+
+def test_provision_binding_uuid_round_trip_via_udev_fixture(environment, monkeypatch, tmp_path):
+    """Positive end-to-end: provision `--binding uuid` while the production
+    /run/udev fixture resolves a UUID → record is written with
+    binding=uuid, and open_verified_store accepts the resulting pair.
+
+    This exercises the resolver's actual module constant (not a
+    patched `resolve_uuids` stub) + the full provision → write →
+    open_verified_store path. Per Ohm's PR #101 review: a refusal-only
+    test set would miss the happy case regressing."""
+    store = tmp_path / "s.sqlite"
+    record = tmp_path / "r.json"
+    # Write a /run/udev record whose major:minor matches the store's
+    # st_dev. admin.provision() will stat the store (post-creation) to
+    # derive st_dev, then resolve_uuids() will read the fixture.
+    # We have to touch the store first because stat needs an inode.
+    store.touch()
+    store_stat = os.stat(store)
+    major, minor = os.major(store_stat.st_dev), os.minor(store_stat.st_dev)
+    store.unlink()  # provision() recreates it with O_EXCL
+    expected_uuid = "cafed00d-c0de-4f00-b000-0123456789ab"
+    udev_root = tmp_path / "run-udev"
+    _write_udev_record(udev_root, major, minor, expected_uuid)
+    monkeypatch.setattr(v, "UDEV_DATA_DIRECTORY", str(udev_root / "data"))
+    # Also patch admin's own binding — admin imported resolve_uuids
+    # by name. Admin's reference needs to see the same module-level
+    # UDEV_DATA_DIRECTORY constant. Simplest: patch admin.resolve_uuids
+    # to the same function (which the module constant has already
+    # been monkeypatched into), forcing admin to pick up the change.
+    monkeypatch.setattr(admin, "resolve_uuids", v.resolve_uuids)
+    evidence = dict(environment.evidence)
+    inventory = [dict(environment.inventory[0], path=str(store))]
+    data = admin.provision(str(store), str(record), "python", "test",
+                           evidence, inventory, binding="uuid")
+    assert data["device"]["binding"] == "uuid"
+    assert data["device"]["fs_uuid"] == expected_uuid
+    # Now open it — verifies check_device() accepts the record given
+    # the same udev fixture.
+    db = v.open_verified_store(str(store), str(record))
+    assert v.fingerprint(db) == v.SCHEMAS["python"]
+    db.close()
 
 
 def test_provision_binding_auto_preserves_historical_behaviour(environment, monkeypatch, tmp_path):
