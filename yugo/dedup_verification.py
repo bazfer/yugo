@@ -17,6 +17,7 @@ from typing import Any, NoReturn
 BOOT_PATH = "/proc/sys/kernel/random/boot_id"
 TIMENS_PATH = "/proc/self/timens_offsets"
 UUID_DIRECTORY = "/dev/disk/by-uuid"
+UDEV_DATA_DIRECTORY = "/run/udev/data"
 PORT = "python"
 PROVISION_HINT = "run yugo dedup provision"
 BOOT_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.ASCII)
@@ -172,14 +173,46 @@ def load_record(path: str) -> dict:
 
 
 def resolve_uuids(device: int) -> list[str]:
-    """No mountinfo/path matching. Kernel-resolved st_dev vs target st_rdev."""
-    matches = []
-    for entry in Path(UUID_DIRECTORY).iterdir():
-        try:
-            if entry.stat().st_rdev == device:
-                matches.append(entry.name)
-        except OSError:
-            continue
+    """Kernel-resolved st_dev vs target st_rdev, with a /run/udev
+    fallback for containers that lack /dev/disk/by-uuid.
+
+    Primary path scans /dev/disk/by-uuid and compares st_rdev — works
+    on the host, where udev populates those symlinks.
+
+    Fallback path reads /run/udev/data/b<major>:<minor> and extracts
+    `ID_FS_UUID=` — works from inside containers that bind-mount
+    /run/udev:ro. No raw block device access required, so hardened
+    reviewer bots can resolve the filesystem UUID without being
+    granted /dev/sda.
+
+    Primary wins when it returns anything. Fallback only fires when
+    the primary pass yields no matches. Both agree on a healthy host
+    because they both ultimately observe the same udev probe of the
+    same device.
+    """
+    matches: list[str] = []
+    try:
+        for entry in Path(UUID_DIRECTORY).iterdir():
+            try:
+                if entry.stat().st_rdev == device:
+                    matches.append(entry.name)
+            except OSError:
+                continue
+    except (FileNotFoundError, PermissionError):
+        pass
+    if matches:
+        return matches
+    # Fallback: /run/udev/data/b<major>:<minor>.
+    major, minor = os.major(device), os.minor(device)
+    udev_record = Path(UDEV_DATA_DIRECTORY) / f"b{major}:{minor}"
+    try:
+        content = udev_record.read_text()
+    except (FileNotFoundError, PermissionError):
+        return matches  # empty; check_device will pick the right message
+    for line in content.splitlines():
+        if line.startswith("E:ID_FS_UUID="):
+            matches.append(line.split("=", 1)[1])
+            break
     return matches
 
 
@@ -190,6 +223,26 @@ def check_device(record: dict, stat: os.stat_result) -> None:
             uuids = resolve_uuids(stat.st_dev)
         except OSError:
             uuids = []
+        if not uuids:
+            # Two distinct operator fixes — be explicit about which:
+            #   "no udev record" → forgot /run/udev bind
+            #   "udev record present but no ID_FS_UUID" → filesystem
+            #                                              has no UUID
+            #                                              or udev
+            #                                              did not probe
+            # Both still fail closed; split is for diagnosis only.
+            major, minor = os.major(stat.st_dev), os.minor(stat.st_dev)
+            udev_record = Path(UDEV_DATA_DIRECTORY) / f"b{major}:{minor}"
+            if udev_record.exists():
+                refuse(
+                    f"udev record present but no ID_FS_UUID: filesystem on "
+                    f"{major}:{minor} may have no UUID or udev did not probe it"
+                )
+            refuse(
+                f"no udev record for b{major}:{minor}; if this is early boot, "
+                f"udev may not have settled — retry, or check /run/udev is "
+                f"mounted into this container"
+            )
         require(device["fs_uuid"].lower() in [v.lower() for v in uuids], "unresolved or changed filesystem UUID")
     else:
         require((device["major"], device["minor"]) == (os.major(stat.st_dev), os.minor(stat.st_dev)), "device mismatch")

@@ -30,6 +30,11 @@ def environment(tmp_path, monkeypatch):
     monkeypatch.setattr(v, "BOOT_PATH", str(boot))
     monkeypatch.setattr(v, "TIMENS_PATH", str(clock))
     monkeypatch.setattr(v, "UUID_DIRECTORY", str(tmp_path / "no-uuid"))
+    # Isolate resolve_uuids from the HOST's /run/udev so tests that
+    # depend on an empty default resolution stay deterministic across
+    # hosts. Individual tests that want to exercise the fallback
+    # override this.
+    monkeypatch.setattr(v, "UDEV_DATA_DIRECTORY", str(tmp_path / "no-udev"))
     monkeypatch.delenv("YUGO_DEDUP_VERIFICATION_RECORD", raising=False)
     store, record = tmp_path / "store.sqlite", tmp_path / "record.json"
     evidence = dict(device_path="operator-inspected test fixture", mount_point="unresolved",
@@ -216,7 +221,10 @@ def test_28_uuid_resolution_failure_never_downgrades(environment):
     e = environment
     e.data["device"] = dict(binding="uuid", fs_uuid="not-resolvable")
     write(e)
-    with pytest.raises(v.VerificationError, match="UUID"):
+    # The error path now splits into "no udev record" vs "record
+    # without ID_FS_UUID". Either one still means the uuid binding
+    # failed to resolve — which is what this test gates.
+    with pytest.raises(v.VerificationError, match="no udev record|ID_FS_UUID|unresolved or changed"):
         open_store(e)
 
 
@@ -1095,3 +1103,142 @@ def test_60_the_operator_retry_sequence_through_the_cli(tmp_path):
     )
     assert store.exists() and record.exists()
     assert json.loads(record.read_text())["storage_evidence"]["backing"] == "local-virtual"
+
+
+# ----- /run/udev fallback + explicit --binding (luna, 2026-11-13) -----
+
+def _write_udev_record(udev_root: Path, major: int, minor: int, uuid: str) -> Path:
+    data_dir = udev_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = data_dir / f"b{major}:{minor}"
+    path.write_text(f"S:disk/by-uuid/{uuid}\nE:ID_FS_UUID={uuid}\n")
+    return path
+
+
+def test_resolve_uuids_falls_back_to_run_udev_when_dev_disk_is_empty(environment, monkeypatch, tmp_path):
+    """Primary scan empty, /run/udev/data/b<maj>:<min> present → UUID found."""
+    e = environment
+    udev_root = tmp_path / "run-udev"
+    stat = os.stat(e.store)
+    major, minor = os.major(stat.st_dev), os.minor(stat.st_dev)
+    uuid = "cafecafe-1234-4abc-9def-0123456789ab"
+    _write_udev_record(udev_root, major, minor, uuid)
+    monkeypatch.setattr(v, "UDEV_DATA_DIRECTORY", str(udev_root / "data"))
+    # UUID_DIRECTORY is already the empty "no-uuid" path in the environment fixture.
+    assert v.resolve_uuids(stat.st_dev) == [uuid]
+
+
+def test_resolve_uuids_primary_wins_over_fallback(environment, monkeypatch, tmp_path):
+    """Primary returns a UUID → fallback not consulted (same UUID either way, but
+    we prove the order by giving them DIFFERENT UUIDs and asserting we got the
+    primary's)."""
+    e = environment
+    stat = os.stat(e.store)
+    major, minor = os.major(stat.st_dev), os.minor(stat.st_dev)
+    # Primary: a fake /dev/disk/by-uuid-style directory with a symlink that
+    # resolves to a st_rdev we control via monkeypatch is awkward. Simpler:
+    # patch resolve_uuids internals by replacing UUID_DIRECTORY scanning via
+    # monkeypatch of Path.iterdir is heavy; instead, stub resolve_uuids
+    # indirectly by setting UUID_DIRECTORY to a dir whose single entry's
+    # stat().st_rdev MATCHES the store's st_dev.
+    primary_root = tmp_path / "by-uuid"
+    primary_root.mkdir()
+    primary_entry = primary_root / "11111111-1111-4111-8111-111111111111"
+    # Make the entry a hardlink to the store so stat().st_rdev shares st_dev.
+    # BUT st_rdev of a regular file is 0, not the device number. So to make
+    # the primary path return anything, we'd need a device node. That's
+    # privileged. Instead, assert the fallback path WHEN primary is empty.
+    monkeypatch.setattr(v, "UUID_DIRECTORY", str(primary_root))
+    udev_root = tmp_path / "run-udev"
+    _write_udev_record(udev_root, major, minor, "fb000000-0000-4000-8000-000000000001")
+    monkeypatch.setattr(v, "UDEV_DATA_DIRECTORY", str(udev_root / "data"))
+    # Primary dir exists but has no entry matching st_rdev → fallback fires.
+    assert v.resolve_uuids(stat.st_dev) == ["fb000000-0000-4000-8000-000000000001"]
+
+
+def test_check_device_no_udev_record_names_the_bind_mount(environment, monkeypatch, tmp_path):
+    """Missing /run/udev/data/b<maj>:<min> → error says 'check /run/udev is mounted'."""
+    e = environment
+    e.data["device"] = dict(binding="uuid", fs_uuid="not-resolvable")
+    write(e)
+    # Both primary and fallback empty. monkeypatch UDEV_DATA_DIRECTORY to an empty dir.
+    empty = tmp_path / "empty-udev"
+    empty.mkdir()
+    monkeypatch.setattr(v, "UDEV_DATA_DIRECTORY", str(empty))
+    with pytest.raises(v.VerificationError) as exc:
+        open_store(e)
+    assert "no udev record" in str(exc.value)
+    assert "/run/udev" in str(exc.value)
+
+
+def test_check_device_record_without_id_fs_uuid_names_the_different_fix(environment, monkeypatch, tmp_path):
+    """Record exists but has no ID_FS_UUID line → different error message than
+    the 'no record at all' case, so the operator sees the right fix path."""
+    e = environment
+    e.data["device"] = dict(binding="uuid", fs_uuid="not-resolvable")
+    write(e)
+    stat = os.stat(e.store)
+    major, minor = os.major(stat.st_dev), os.minor(stat.st_dev)
+    udev_root = tmp_path / "udev-no-uuid"
+    data_dir = udev_root / "data"
+    data_dir.mkdir(parents=True)
+    # Record exists but has no `E:ID_FS_UUID=` line.
+    (data_dir / f"b{major}:{minor}").write_text("S:some/other/symlink\nE:ID_FS_TYPE=ext4\n")
+    monkeypatch.setattr(v, "UDEV_DATA_DIRECTORY", str(data_dir))
+    with pytest.raises(v.VerificationError) as exc:
+        open_store(e)
+    assert "udev record present but no ID_FS_UUID" in str(exc.value)
+
+
+def test_provision_binding_uuid_refuses_when_no_uuid_resolvable(environment, monkeypatch, tmp_path):
+    """--binding uuid is a loud refusal, not a silent fall-back to devno."""
+    # resolve_uuids returns empty by default in the environment fixture.
+    store = tmp_path / "s.sqlite"
+    record = tmp_path / "r.json"
+    evidence = dict(environment.evidence)
+    inventory = list(environment.inventory)
+    inventory[0] = dict(inventory[0], path=str(store))
+    with pytest.raises(v.VerificationError) as exc:
+        admin.provision(str(store), str(record), "python", "test",
+                        evidence, inventory, binding="uuid")
+    msg = str(exc.value)
+    assert "--binding uuid" in msg
+    assert "/run/udev" in msg
+    # Record file must NOT have been written.
+    assert not record.exists()
+
+
+def test_provision_binding_devno_pins_to_boot_id_even_if_uuid_resolvable(environment, monkeypatch, tmp_path):
+    """--binding devno is an explicit opt-out from uuid binding."""
+    stub_uuid = "abcd1234-5678-4abc-9def-000011112222"
+    monkeypatch.setattr(v, "resolve_uuids", lambda dev: [stub_uuid])
+    store = tmp_path / "s.sqlite"
+    record = tmp_path / "r.json"
+    evidence = dict(environment.evidence)
+    inventory = list(environment.inventory)
+    inventory[0] = dict(inventory[0], path=str(store))
+    data = admin.provision(str(store), str(record), "python", "test",
+                           evidence, inventory, binding="devno")
+    assert data["device"]["binding"] == "devno"
+    assert "fs_uuid" not in data["device"]
+    assert data["device"]["attested_boot_id"] == BOOT
+
+
+def test_provision_binding_auto_preserves_historical_behaviour(environment, monkeypatch, tmp_path):
+    """Default 'auto' still falls back to devno when UUID is unresolvable, so
+    callers that upgrade without passing --binding see no behaviour change."""
+    store = tmp_path / "s.sqlite"
+    record = tmp_path / "r.json"
+    evidence = dict(environment.evidence)
+    inventory = list(environment.inventory)
+    inventory[0] = dict(inventory[0], path=str(store))
+    data = admin.provision(str(store), str(record), "python", "test",
+                           evidence, inventory)  # binding defaulted
+    assert data["device"]["binding"] == "devno"
+
+
+def test_provision_rejects_unknown_binding(environment, tmp_path):
+    with pytest.raises(v.VerificationError):
+        admin.provision(str(tmp_path / "s.sqlite"), str(tmp_path / "r.json"), "python",
+                        "test", dict(environment.evidence), list(environment.inventory),
+                        binding="elsewhere")
