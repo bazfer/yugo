@@ -220,9 +220,25 @@ def migrate(store: str, backup: str, port: str) -> None:
 
 
 def provision(store: str, record_path: str, port: str, attested_by: str,
-              evidence: dict, inventory: list[dict], *, record_only: bool = False) -> dict:
-    """Operator supplies inspected evidence, never a consumer assertion."""
+              evidence: dict, inventory: list[dict], *, record_only: bool = False,
+              binding: str = "auto") -> dict:
+    """Operator supplies inspected evidence, never a consumer assertion.
+
+    `binding` selects the attestation shape explicitly:
+      - "auto": existing behaviour. Try uuid; fall back to devno if
+        resolve_uuids() returns empty. Kept default so old callers
+        are unaffected.
+      - "uuid": refuse to provision if resolve_uuids() returns empty.
+        Never silently falls back to devno. Use this when you
+        intend a reboot-stable record and want to KNOW at
+        provisioning time if that intent is unattainable
+        (missing /run/udev bind in the sidecar, filesystem with
+        no UUID, udev not yet settled).
+      - "devno": pin to (major, minor, boot_id) even if a UUID is
+        resolvable. Explicit opt-in to per-boot binding.
+    """
     require(port in SCHEMAS, "explicit supported port required")
+    require(binding in ("auto", "uuid", "devno"), "binding must be one of: auto, uuid, devno")
     resolved_store = Path(store).resolve()
     resolved_record = Path(record_path).resolve()
     # Publishing the record is an `os.replace`, so a `--record` aimed at the store
@@ -315,14 +331,34 @@ def provision(store: str, record_path: str, port: str, attested_by: str,
         stat = os.stat(canonical)
         try:
             uuids = sorted(resolve_uuids(stat.st_dev))
-            resolution = "resolved via /dev/disk/by-uuid" if uuids else "no by-uuid target matches st_dev"
+            resolution = (
+                "resolved via /dev/disk/by-uuid or /run/udev"
+                if uuids
+                else "no by-uuid target matches st_dev and /run/udev has no ID_FS_UUID"
+            )
         except OSError as exc:
             uuids = []
             resolution = f"by-uuid unavailable: {exc}"
-        device = ({"binding": "uuid", "fs_uuid": uuids[0]} if uuids else {
-            "binding": "devno", "major": os.major(stat.st_dev), "minor": os.minor(stat.st_dev),
-            "attested_boot_id": read_boot_id(),
-        })
+        # --binding selects the attestation shape explicitly. See the
+        # docstring on provision() for rationale.
+        if binding == "uuid":
+            require(uuids, "--binding uuid requested but filesystem UUID is not resolvable: "
+                           + resolution
+                           + ". If this is a container, bind-mount /run/udev:/run/udev:ro so the "
+                             "resolver can read /run/udev/data/b<major>:<minor>.")
+            device = {"binding": "uuid", "fs_uuid": uuids[0]}
+        elif binding == "devno":
+            device = {
+                "binding": "devno",
+                "major": os.major(stat.st_dev),
+                "minor": os.minor(stat.st_dev),
+                "attested_boot_id": read_boot_id(),
+            }
+        else:  # auto — the historical behaviour, preserved for back-compat.
+            device = ({"binding": "uuid", "fs_uuid": uuids[0]} if uuids else {
+                "binding": "devno", "major": os.major(stat.st_dev), "minor": os.minor(stat.st_dev),
+                "attested_boot_id": read_boot_id(),
+            })
         record = {
             "record_version": 1, "canonical_path": canonical, "device": device,
             "inode": str(stat.st_ino), "port": port, "schema_fingerprint": fingerprint(db),
@@ -388,6 +424,18 @@ def run() -> None:
     provision_parser.add_argument("--port", choices=tuple(SCHEMAS), required=True)
     provision_parser.add_argument("--record-only", action="store_true")
     provision_parser.add_argument("--attested-by", required=True)
+    provision_parser.add_argument(
+        "--binding",
+        choices=("auto", "uuid", "devno"),
+        default="auto",
+        help=(
+            "Attestation binding. 'auto' (default): uuid if resolvable, else "
+            "devno (historical behaviour). 'uuid': refuse if filesystem UUID "
+            "cannot be resolved — use this to guarantee a reboot-stable "
+            "record and surface missing /run/udev at provisioning time. "
+            "'devno': always pin to (major, minor, boot_id)."
+        ),
+    )
     migration = commands.add_parser("migrate")
     migration.add_argument("--store", required=True)
     migration.add_argument("--backup", required=True)
@@ -418,7 +466,8 @@ def run() -> None:
     inventory = json.loads(input())
     require(input("Type ATTEST to attest this inspected evidence: ") == "ATTEST", "operator did not attest")
     record = provision(args.store, args.record, args.port, args.attested_by,
-                       evidence, inventory, record_only=args.record_only)
+                       evidence, inventory, record_only=args.record_only,
+                       binding=args.binding)
     print(f"Record written ({record['device']['binding']} binding). This is attestation, not proof of locality.")
 
 
