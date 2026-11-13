@@ -206,7 +206,12 @@ def resolve_uuids(device: int) -> list[str]:
     major, minor = os.major(device), os.minor(device)
     udev_record = Path(UDEV_DATA_DIRECTORY) / f"b{major}:{minor}"
     try:
-        content = udev_record.read_text()
+        # `errors="replace"` keeps the failure mode "closed and
+        # legible" per Deet's PR #101 note: a udev data file that
+        # isn't UTF-8 would otherwise raise UnicodeDecodeError
+        # (ValueError, not OSError) and escape both this handler
+        # and the one in check_device, surfacing as a traceback.
+        content = udev_record.read_text(errors="replace")
     except (FileNotFoundError, PermissionError):
         return matches  # empty; check_device will pick the right message
     for line in content.splitlines():
